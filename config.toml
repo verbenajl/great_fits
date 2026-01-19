@@ -1,0 +1,30 @@
+[input]
+#fits_file = "/home/diskB/data_soft/tests/SKYCHOPDIFF/cycle6.fits"
+#fits_file = "/home/diskB/data_soft/oi_zeigt/clean_data.fits"
+#fits_file = "/home/diskB/data_soft/oi_zeigt/rejected_data.fits"
+#fits_file="/home/diskB/sofiaobsdata/m51/m51_central_region/kalibrated_all/m51_central_tile_singlehdu.fits"
+fits_file="/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/clean_data.fits"
+#fits_file="/home/diskB/sofiaobsdata/m51/m51_central_region/kalibrate_d/M51CENTER_UNKNOWN_central_tile_CB_GR_01_2016_05_12.fits"
+
+[parameters]
+object="M51"
+
+[filters]
+blank_fraction = 0.20
+
+[reduction]
+baseline=3
+window=[450, 500]
+group_by = "OBJECT"
+
+[gridding]
+method = "cygrid"  # Options: "cygrid" or "scipy"
+beamsize_arcsec = 14.1  # Beam size in arcseconds
+#pixel_size_arcsec = 14.0  # Pixel size in arcseconds (will be calculated from beamsize if not specified)
+
+[output]
+clean_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/clean_data.fits"
+rejected_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/rejected_data.fits"
+reduced_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/reduced_data.fits"
+averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/averaged_data.fits"
+datacube = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/datacube.fits"

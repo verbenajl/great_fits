@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oi-zeigt"
+version = "0.1.0"
+description = "Tools to analyze the OI 63mu GREAT archive"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+license = {text = "MIT"}  # or your preferred license
+
+dependencies = [
+    "astropy",
+    "numpy",
+    "scipy",
+    "pandas",
+    "matplotlib",
+    "click>=8.0",
+    "tomli >= 1.1.0 ; python_version < '3.11'",
+    # Add other dependencies as needed
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/oi_zeigt"
+Documentation = "https://oi-zeigt.readthedocs.io"
+
+[tool.setuptools]
+packages = ["oi_zeigt"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+# Command-line entry points
+[project.scripts]
+print_oifits_info = "oi_zeigt.cli:print_fits_info"
+plot_sample_spectra = "oi_zeigt.cli:plot_sample_spectra"
+plot_skies = "oi_zeigt.cli:plot_skies"
+analyze_blanks = "oi_zeigt.cli:analyze_blanks"
+filter_fits = "oi_zeigt.cli:filter_fits"
+apply_baseline = "oi_zeigt.cli:apply_baseline"
+reduce_spectra = "oi_zeigt.cli:reduce_spectra_cmd"
+average = "oi_zeigt.cli:average_cmd"
+spechistogram = "oi_zeigt.cli:spechistogram_cmd"
+rmsratio = "oi_zeigt.cli:rmsratio_cmd"
+map_column = "oi_zeigt.cli:map_column_cmd"
+map_integrated = "oi_zeigt.cli:map_integrated_cmd"
+create_datacube = "oi_zeigt.cli:create_datacube_cmd"
+combine_fits = "oi_zeigt.cli:combine_fits"
