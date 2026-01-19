@@ -1,0 +1,140 @@
+# # **README**
+# # This file is a template for the config file for the pca reduction algorithm
+# # it has three sections:
+# #  - [common]
+# #  - [decompose]
+# #  - [correct]
+# # you only have to comment in what you want to control. If you do not comment
+# # an option it will have its default value. This config file overrides the
+# # values specified in during the command call.
+# # If you want to alter a value please also comment in the section header
+# # e.g. [common], [decompose] or [correct]
+
+[common]
+#   # Controls the source name of the spectra to be used for the
+#   # derivation of the PCA components (DEFAULT=SKY-DIFF).
+    pca_source = "SKYCHOPDIFF"
+#   pca_source = "SKY-DIFF"
+#
+#   # The input file has to be given to the algorithm because it can not
+#   # be read from a class variable. This might be best controlled in the
+#   # command call in gildas but can be hardcoded here
+#   input_file = ""
+#    final_res = false
+#    x_ref_user = "*"
+#    nx_user = "*"
+#    extract_range = false
+#
+#   # Set a line window. This window is used in multiple places. The line
+#   # detection in the PCA decompositon input data as well as the line
+#   # detection in the corrected data.
+    line_window = [450, 550]
+#    look_ahead = false
+#    channel_line_width = 1
+#
+#   # Select a velocity window that will be ignored by the pca algorithm
+#   # the data in this range will be untouched by the algorithm, only a bas 0
+#   # will be applied
+#    pca_exclude_range = false
+#
+#   # This can be used to match a decomposition with a correction step.
+#   # By default the code takes care of matching up decompositions with the
+#   # correction steps and will use the latest decomposition that has been
+#   # automatically tagged. Use only if you have a specific use case.
+    tag = "snakemake_decomposition"
+#
+#   # For debugging limit the reduction to a single scan
+    limit_to_scan = false
+#   # For debugging limit the reduction to a single frontend
+    limit_to_telescope = false
+#
+#   # Choose to smooth the components in frequency space by a box car with a
+#   # a kernel length of:
+    smoothing_kernel_size = 3
+#
+#   # Set the channel window for the rolling noise estimate for the components
+    rolling_noise_window = 11
+#
+#   # Select the type of decomposition can be one of
+#   #  - PCA (Default)
+#   #  - SparsePCA
+#   #  - ICA
+    decomposition_type = "PCA"
+#
+#   # Controls if the spectra are scaled by dividing by the standard deviation
+#   # bevor pca reduction
+    do_scale = false
+#
+#   # Z score cutoff defines the Signal to Noise for a Spike channel to be 
+#   # ignored in the PCA correction
+#    z_score_cutoff = false
+#
+#   # This option writes out line free spectra with a new line name
+#   # "SELF-PCA" to be used in a second decompose/correct step
+#    create_self_pca = false
+
+
+[decompose]
+#   # Controls the number of pca components that are derived from
+#   # the spectra that are to be used to derive the pca components. The default
+#   # are the spectra with source name SKY-DIFF but the input can be controlled
+#   # with the /pca_source option
+    number_components = 5
+#
+#   # BOOLEAN option. Add SKY-DIFF data to the PCA input spectra.
+#   # Can be used if /pca_source is set to another source than SKY-DIFF to
+#   # use the SKY-DIFF data in addition to derive pca components
+#   # (Experimental option).
+#    add_sky_diff = false
+#
+#   # INTEGER value. The integer cutoff value that controls
+#   # until which maximum value a channel inside the input spectra to the pca
+#   # decomposition are considered emission free
+    noise_cutoff = false
+#
+#   #
+    scramble = false
+
+[correct]
+#   # The PCA algorithm in astroML derives an
+#   # explained_variance_ratio for each component. The cutoff controls down to
+#   # which number a component should be taken into account.
+#   # Can be false (default), in that case all components are taken into account
+    cutoff = false
+#
+#   # The pca reduction algorithm can create diagnostic plots the
+#   # output option controls where and if this data is written.
+#    output_folder = false
+    output_folder = "pca_plots"
+#
+#   #  BOOLEAN FLAG. If the flag is set the component spectra are written
+#   # as well to the output file.
+    export_components = false
+#
+#   # FLOAT or INTEGER. Controls the selection threshold for components based 
+#   # the ratio between intrinsic noise of the spectra and the scaled component
+#   # This cutoff value defined the value the first peak of the KDE distribution
+#   # of noise ratio values 
+    global_noise_ratio_cutoff = 15
+
+#   # Active only if global_noise_ratio_cutoff is active. Can overwrite the 
+#   # automatic cutoff value derived from the global_noise_ratio_cutoff and the
+#   # gaussian fit to the first peak of the KDE distribution of the noise_ratio
+#   # values
+    noise_ratio_cutoff = false
+#
+#   # The line kernel size controls the smoothing that is used for blurring the 
+#   # Waterfall plot (class: "plot /index") that is used to detect the line 
+#   # windows using open cv [DEFAULT=51] 
+
+    line_kernel_size = 61
+#   # STRING - FILENAME. If defined writes out the explained variance 
+#   # ratios of the components in a file with the name given to this option.
+    dump_exp_variance = false
+#
+#   # EXPERIMENTAL Value of the linear coefficient above which component is not
+#   # used any more.
+    cut_coefficients = false
+#
+#   # EXPERIMENTAL BOOLEAN flag. Write out the original spectra to a text file as ASCII
+    dump_original_spec_array = false
