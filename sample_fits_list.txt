@@ -1,0 +1,13 @@
+# Sample FITS file list for combining
+# Lines starting with '#' are comments and will be ignored
+# Empty lines are also ignored
+# List one FITS file path per line
+
+# Example FITS files (replace with actual paths to your FITS files):
+/path/to/fits_file_1.fits
+/path/to/fits_file_2.fits
+/path/to/fits_file_3.fits
+
+# You can also use absolute paths:
+# /home/diskB/data_soft/tests/SKYCHOPDIFF/cycle6_part1.fits
+# /home/diskB/data_soft/tests/SKYCHOPDIFF/cycle6_part2.fits
