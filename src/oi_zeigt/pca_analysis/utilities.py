@@ -342,12 +342,22 @@ def safe_pickle_save(obj: object, filepath: Union[str, Path]) -> None:
         Object to save
     filepath : str or Path
         Output pickle file path
+        
+    Notes
+    -----
+    If the file already exists, it will be completely overwritten.
     """
     try:
         import pickle
         filepath = Path(filepath)
         ensure_directory(filepath.parent)
         
+        # Remove existing file to ensure complete overwrite (defensive approach)
+        # The 'wb' mode would truncate anyway, but this is explicit
+        if filepath.exists():
+            filepath.unlink()
+        
+        # Write new file
         with open(filepath, 'wb') as f:
             pickle.dump(obj, f)
         

@@ -3,10 +3,13 @@
 #fits_file = "/home/diskB/data_soft/oi_zeigt/clean_data.fits"
 #fits_file = "/home/diskB/data_soft/oi_zeigt/rejected_data.fits"
 #fits_file="/home/diskB/sofiaobsdata/m51/m51_central_region/kalibrated_all/m51_central_tile_singlehdu.fits"
-fits_file="/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/clean_data.fits"
+#fits_file="/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/clean_data.fits"
 #fits_file="/home/diskB/sofiaobsdata/m51/m51_central_region/kalibrate_d/M51CENTER_UNKNOWN_central_tile_CB_GR_01_2016_05_12.fits"
+fits_file="/home/diskB/sofiaobsdata/m51/m51_central_region/kalibrate_d/M51CENTER_UNKNOWN_central_tile_CB_flight1_20170201_LFA_L1.fits"
 
 [parameters]
+# Object name substring for filtering (PCA correction will only process spectra containing this substring)
+# Example: "M51" will match "M51CENTER_UNKNOWN_...", "M51EDGE_...", etc.
 object="M51"
 
 [filters]
@@ -14,7 +17,8 @@ blank_fraction = 0.20
 
 [reduction]
 baseline=3
-window=[450, 500]
+line_window=[450, 550]
+extract=[350,700]
 group_by = "OBJECT"
 
 [gridding]
@@ -22,9 +26,25 @@ method = "cygrid"  # Options: "cygrid" or "scipy"
 beamsize_arcsec = 14.1  # Beam size in arcseconds
 #pixel_size_arcsec = 14.0  # Pixel size in arcseconds (will be calculated from beamsize if not specified)
 
+[pca]
+n_components = 5
+pca_source="SKYCHOPDIFF"
+# smooth the components in frequency space by a box car with a
+# a kernel length of
+smoothing_kernel_size=5
+rolling_noise_window = 11
+noise_cutoff = false
+cutoff = false
+global_noise_ratio_cutoff = 30
+noise_ratio_cutoff = false
+line_kernel_size = 51
+
+
 [output]
 clean_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/clean_data.fits"
 rejected_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/rejected_data.fits"
 reduced_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/reduced_data.fits"
 averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/averaged_data.fits"
 datacube = "/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/datacube.fits"
+pcad_fits="/home/diskB/sofiaobsdata/m51/m51_central_fits/fits_files_processed/pca_corrected.fits"
+pca_plots_dir="/home/diskB/sofiaobsdata/m51/m51_central_fits/pca_plots"

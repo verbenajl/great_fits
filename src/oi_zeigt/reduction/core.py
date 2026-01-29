@@ -71,6 +71,106 @@ def detect_nan_channels(spectrum: np.ndarray) -> Tuple[np.ndarray, float]:
     return nan_mask, fraction_nan
 
 
+def detect_missing_channels(spectrum: np.ndarray, 
+                           include_blanks: bool = True,
+                           blank_value: float = 0.0,
+                           blank_tolerance: float = 1e-10,
+                           gildas_blank: bool = False) -> Tuple[np.ndarray, float]:
+    """
+    Detect missing/blank channels in a spectrum using multiple detection methods.
+    
+    This function detects channels that are marked as missing/blank using various
+    astronomical software conventions:
+    
+    - **NaN (IEEE standard)**: Used by NumPy, FITS, and most modern software
+    - **Zero values**: Sometimes used as blanks in older data or specific archives
+    - **GILDAS/CLASS blanks**: Values near -9.99e30 (GILDAS/CLASS convention)
+    - **Infinity**: Sometimes used for invalid/missing data
+    
+    Parameters
+    ----------
+    spectrum : np.ndarray
+        Input spectrum array.
+    include_blanks : bool, optional
+        If True, also detect blank/zero values (default: True).
+        If False, only detect NaNs.
+    blank_value : float, optional
+        Value to consider as blank (default: 0.0).
+        Only used if include_blanks=True.
+    blank_tolerance : float, optional
+        Tolerance for blank value detection (default: 1e-10).
+        Only used if include_blanks=True.
+    gildas_blank : bool, optional
+        If True, also detect GILDAS-style blanks near -9.99e30 (default: False).
+    
+    Returns
+    -------
+    tuple
+        - missing_mask : np.ndarray (bool)
+            Boolean array indicating missing/blank channels (True = missing).
+        - fraction_missing : float
+            Fraction of missing/blank channels (0.0 to 1.0).
+    
+    Notes
+    -----
+    This function combines multiple blank detection methods:
+    
+    1. **NaN detection** (always applied):
+       - Uses np.isnan() - catches IEEE NaN values
+    
+    2. **Blank/zero detection** (if include_blanks=True):
+       - Detects values near blank_value within blank_tolerance
+       - Useful for data that marks blanks as 0.0 or similar
+    
+    3. **GILDAS blank detection** (if gildas_blank=True):
+       - Detects values near -9.99e30 (GILDAS/CLASS convention)
+       - Catches extreme negative values used as missing markers
+    
+    4. **Infinity detection** (always applied):
+       - Uses np.isinf() - catches infinite values
+    
+    Examples
+    --------
+    >>> # Basic usage - only detect NaNs
+    >>> mask, frac = detect_missing_channels(spectrum)
+    >>> print(f"Missing fraction: {frac:.2%}")
+    
+    >>> # Include zero-value blanks
+    >>> mask, frac = detect_missing_channels(spectrum, include_blanks=True)
+    
+    >>> # Include GILDAS blanks
+    >>> mask, frac = detect_missing_channels(spectrum, gildas_blank=True)
+    
+    >>> # Full detection - all methods
+    >>> mask, frac = detect_missing_channels(
+    ...     spectrum, 
+    ...     include_blanks=True, 
+    ...     gildas_blank=True
+    ... )
+    """
+    # Start with NaN detection (always applied)
+    missing_mask = np.isnan(spectrum)
+    
+    # Add infinity detection
+    missing_mask |= np.isinf(spectrum)
+    
+    # Add blank/zero value detection if requested
+    if include_blanks:
+        blank_mask = np.abs(spectrum - blank_value) < blank_tolerance
+        missing_mask |= blank_mask
+    
+    # Add GILDAS blank detection if requested
+    if gildas_blank:
+        # GILDAS uses -9.99e30 as blank marker
+        # Use relative tolerance for very large numbers
+        gildas_blank_mask = np.abs(spectrum) > 1e30
+        missing_mask |= gildas_blank_mask
+    
+    fraction_missing = np.sum(missing_mask) / len(spectrum)
+    
+    return missing_mask, fraction_missing
+
+
 def split_spectra_by_blanks(hdul: fits.HDUList, 
                             blank_threshold: float = 0.20,
                             blank_value: float = 0.0,
@@ -363,18 +463,21 @@ def filter_and_save_fits(hdul: fits.HDUList,
                         output_clean: Optional[Union[str, Path]] = None,
                         output_rejected: Optional[Union[str, Path]] = None,
                         remove_column: Optional[str] = None,
-                        remove_values: Optional[list] = None) -> Tuple[Path, Path]:
+                        remove_values: Optional[list] = None,
+                        apply_to_all: bool = False) -> Tuple[Path, Path]:
     """
     Filter FITS data by object and NaN content, with optional column value removal.
     
     This function:
     1. Processes ALL HDUs with SPECTRUM columns (important for combined files)
-    2. Separates data into target object and other objects
-    3. Filters target object spectra to keep only those with < nan_threshold NaN channels
+    2. Optionally separates data into target object and other objects (unless apply_to_all=True)
+    3. Filters spectra to keep only those with < nan_threshold NaN channels
+       - If apply_to_all=False: Only filters target object spectra (default behavior)
+       - If apply_to_all=True: Filters ALL spectra regardless of object
     4. Optionally removes rows where a specified column matches given values
     5. Saves two FITS files:
-       - output_clean: All non-target objects + filtered target object spectra
-       - output_rejected: Target object spectra that were filtered out or removed
+       - output_clean: Filtered spectra (clean data)
+       - output_rejected: Spectra that were filtered out or removed
     
     Parameters
     ----------
@@ -382,16 +485,16 @@ def filter_and_save_fits(hdul: fits.HDUList,
         Input FITS HDU list containing the data.
     object_name : str
         Name of the object to filter (e.g., "M51").
-        Spectra with this string in OBJECT column will be filtered by NaN content.
+        Only used when apply_to_all=False.
     nan_threshold : float, optional
         Maximum acceptable NaN fraction (default: 0.20 = 20%).
         Keep spectra with NaN fraction < threshold.
         Reject spectra with NaN fraction >= threshold.
     output_clean : str or Path, optional
-        Output path for clean FITS file (non-target + filtered target objects).
+        Output path for clean FITS file.
         If None, uses "clean_data.fits".
     output_rejected : str or Path, optional
-        Output path for rejected FITS file (filtered out target objects).
+        Output path for rejected FITS file.
         If None, uses "rejected_data.fits".
     remove_column : str, optional
         Column name to check for removal (e.g., "AOR_ID").
@@ -399,6 +502,9 @@ def filter_and_save_fits(hdul: fits.HDUList,
     remove_values : list, optional
         List of values to remove from remove_column.
         Rows with these values will be moved to rejected file.
+    apply_to_all : bool, optional
+        If True, apply NaN filtering to ALL spectra (regardless of object).
+        If False (default), apply NaN filtering only to target object spectra.
     
     Returns
     -------
@@ -411,14 +517,24 @@ def filter_and_save_fits(hdul: fits.HDUList,
     Examples
     --------
     >>> hdul = fits.open('original.fits')
+    >>> # Filter only M51 spectra (default)
     >>> clean_path, rejected_path = filter_and_save_fits(
     ...     hdul, 
     ...     object_name="M51",
     ...     nan_threshold=0.20,
     ...     output_clean="m51_clean.fits",
     ...     output_rejected="m51_rejected.fits",
-    ...     remove_column="AOR_ID",
-    ...     remove_values=["04_0116_0020609", "04_0116_0020506"]
+    ...     apply_to_all=False  # Default: only M51 filtered by NaN
+    ... )
+    
+    >>> # Filter ALL spectra by NaN content
+    >>> clean_path, rejected_path = filter_and_save_fits(
+    ...     hdul, 
+    ...     object_name="M51",  # Still needed for other logic
+    ...     nan_threshold=0.20,
+    ...     output_clean="all_clean.fits",
+    ...     output_rejected="all_rejected.fits",
+    ...     apply_to_all=True  # Filter ALL spectra
     ... )
     >>> print(f"Clean: {clean_path}, Rejected: {rejected_path}")
     """
@@ -463,33 +579,56 @@ def filter_and_save_fits(hdul: fits.HDUList,
         removed_data = data[~keep_mask]
         data = data[keep_mask]
     
-    # Separate data by object
-    target_mask = np.array([object_name.lower() in str(obj).lower() 
-                           for obj in data['OBJECT']])
-    other_mask = ~target_mask
-    
-    other_data = data[other_mask]
-    target_data = data[target_mask]
-    
-    # Filter target object by NaN content
-    nan_fractions = []
-    for spectrum in target_data['SPECTRUM']:
-        _, frac = detect_nan_channels(spectrum)
-        nan_fractions.append(frac)
-    
-    nan_fractions = np.array(nan_fractions)
-    clean_target_mask = nan_fractions < nan_threshold
-    rejected_target_mask = ~clean_target_mask
-    
-    target_clean = target_data[clean_target_mask]
-    target_rejected = target_data[rejected_target_mask]
-    
-    # Add the removed data to rejected
-    if len(removed_data) > 0:
-        target_rejected = np.concatenate([target_rejected, removed_data])
-    
-    # Combine other objects with clean target objects
-    clean_combined = np.concatenate([other_data, target_clean])
+    # Separate data by object (or use all data if apply_to_all)
+    if apply_to_all:
+        # Apply NaN filtering to ALL spectra
+        all_data = data
+        
+        # Filter all data by NaN content
+        nan_fractions = []
+        for spectrum in all_data['SPECTRUM']:
+            _, frac = detect_nan_channels(spectrum)
+            nan_fractions.append(frac)
+        
+        nan_fractions = np.array(nan_fractions)
+        clean_mask = nan_fractions < nan_threshold
+        rejected_mask = ~clean_mask
+        
+        clean_combined = all_data[clean_mask]
+        all_rejected = all_data[rejected_mask]
+        
+        # Add the removed data to rejected
+        if len(removed_data) > 0:
+            all_rejected = np.concatenate([all_rejected, removed_data])
+    else:
+        # Apply NaN filtering only to target object (default behavior)
+        target_mask = np.array([object_name.lower() in str(obj).lower() 
+                               for obj in data['OBJECT']])
+        other_mask = ~target_mask
+        
+        other_data = data[other_mask]
+        target_data = data[target_mask]
+        
+        # Filter target object by NaN content
+        nan_fractions = []
+        for spectrum in target_data['SPECTRUM']:
+            _, frac = detect_nan_channels(spectrum)
+            nan_fractions.append(frac)
+        
+        nan_fractions = np.array(nan_fractions)
+        clean_target_mask = nan_fractions < nan_threshold
+        rejected_target_mask = ~clean_target_mask
+        
+        target_clean = target_data[clean_target_mask]
+        target_rejected = target_data[rejected_target_mask]
+        
+        # Add the removed data to rejected
+        if len(removed_data) > 0:
+            target_rejected = np.concatenate([target_rejected, removed_data])
+        
+        # Combine other objects with clean target objects
+        clean_combined = np.concatenate([other_data, target_clean])
+        all_rejected = target_rejected
     
     # Set default output paths
     if output_clean is None:
@@ -527,8 +666,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
     hdul_clean.writeto(output_clean, overwrite=True)
     
     # Create binary table HDU for rejected data (only if there are rejected spectra)
-    if len(target_rejected) > 0:
-        table_rejected = Table(target_rejected)
+    if len(all_rejected) > 0:
+        table_rejected = Table(all_rejected)
         hdu_rejected = fits.BinTableHDU(table_rejected)
         hdu_rejected.name = matrix_hdus[0][1].name
         
@@ -860,6 +999,183 @@ def smooth_spectrum(spectrum: np.ndarray, window_size: int = 5) -> np.ndarray:
     return smoothed
 
 
+def _extract_spectral_params(hdul: fits.HDUList) -> dict:
+    """
+    Extract spectral axis parameters from FITS file.
+    
+    Extracts velocity reference, velocity spacing per channel, and reference pixel
+    information needed to reconstruct the velocity axis.
+    
+    Parameters
+    ----------
+    hdul : astropy.io.fits.HDUList
+        FITS HDUList with spectral data.
+    
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'velo_ref': Reference velocity in m/s (from VELOCITY column)
+        - 'deltav': Velocity spacing per channel in m/s (from DELTAV column)
+        - 'crpix1_spec': Reference pixel index, 1-indexed (from CRPIX1 header)
+        - 'nchans': Number of spectral channels (from SPECTRUM column)
+    
+    Notes
+    -----
+    Parameters are extracted from the first spectrum, assuming they're constant
+    across all observations in the FITS file.
+    """
+    # Locate binary table HDU
+    table = None
+    table_hdu = None
+    for hdu in hdul[1:]:
+        if hasattr(hdu, 'data') and hdu.data is not None:
+            if 'SPECTRUM' in hdu.data.dtype.names:
+                table = hdu.data
+                table_hdu = hdu
+                break
+    
+    if table is None:
+        raise ValueError("No SPECTRUM column found in FITS table")
+    
+    # Extract velocity parameters from first spectrum
+    velo_ref = float(table['VELOCITY'][0]) if 'VELOCITY' in table.dtype.names else 0.0
+    deltav = float(table['DELTAV'][0]) if 'DELTAV' in table.dtype.names else 1.0
+    
+    # Extract reference pixel from header
+    crpix1_spec = 1.0  # Default
+    if table_hdu is not None and 'CRPIX1' in table_hdu.header:
+        crpix1_spec = float(table_hdu.header['CRPIX1'])
+    elif len(hdul) > 0 and 'CRPIX1' in hdul[0].header:
+        crpix1_spec = float(hdul[0].header['CRPIX1'])
+    
+    # Get number of spectral channels
+    nchans = table['SPECTRUM'].shape[1]
+    
+    return {
+        'velo_ref': velo_ref,
+        'deltav': deltav,
+        'crpix1_spec': crpix1_spec,
+        'nchans': nchans,
+    }
+
+
+def _create_velocity_axis(velo_ref: float, deltav: float, crpix1_spec: float,
+                         nchans: int) -> np.ndarray:
+    """
+    Create velocity axis array for spectral data.
+    
+    Constructs a velocity axis based on FITS WCS spectral parameters.
+    The velocity at each channel is calculated as:
+        v[i] = velo_ref + (i - (crpix1_spec - 1)) * deltav
+    
+    Parameters
+    ----------
+    velo_ref : float
+        Reference velocity in m/s
+    deltav : float
+        Velocity spacing per channel in m/s
+    crpix1_spec : float
+        Reference pixel (1-indexed, FITS convention)
+    nchans : int
+        Number of spectral channels
+    
+    Returns
+    -------
+    np.ndarray
+        Velocity axis array of shape (nchans,) in m/s
+    
+    Examples
+    --------
+    >>> vel = _create_velocity_axis(470000.0, 500.0, 506.0, 1264)
+    >>> print(f"Channel 0: {vel[0]:.1f} m/s")
+    >>> print(f"Channel 505: {vel[505]:.1f} m/s")  # Reference pixel
+    """
+    channel_indices = np.arange(nchans, dtype=np.float64)
+    velocity_axis = velo_ref + (channel_indices - (crpix1_spec - 1.0)) * deltav
+    return velocity_axis
+
+
+def _velocity_to_channel_index(velocity: float, velo_ref: float, deltav: float,
+                               crpix1_spec: float) -> int:
+    """
+    Convert a velocity value to the nearest channel index.
+    
+    Inverse of the velocity axis formula:
+        v = velo_ref + (i - (crpix1_spec - 1)) * deltav
+    Solving for i:
+        i = (v - velo_ref) / deltav + (crpix1_spec - 1)
+    
+    Parameters
+    ----------
+    velocity : float
+        Velocity in m/s
+    velo_ref : float
+        Reference velocity in m/s
+    deltav : float
+        Velocity spacing per channel in m/s
+    crpix1_spec : float
+        Reference pixel (1-indexed, FITS convention)
+    
+    Returns
+    -------
+    int
+        Channel index (0-indexed)
+    """
+    channel_float = (velocity - velo_ref) / deltav + (crpix1_spec - 1.0)
+    channel_index = int(np.round(channel_float))
+    return channel_index
+
+
+def _extract_velocity_range(spectra: np.ndarray, velocity_axis: np.ndarray,
+                           velo_min: float, velo_max: float) -> Tuple[np.ndarray, int, int]:
+    """
+    Extract spectra in a given velocity range.
+    
+    Parameters
+    ----------
+    spectra : np.ndarray
+        Spectra array [n_spectra, n_channels]
+    velocity_axis : np.ndarray
+        Velocity axis [n_channels]
+    velo_min : float
+        Minimum velocity in m/s
+    velo_max : float
+        Maximum velocity in m/s
+    
+    Returns
+    -------
+    extracted_spectra : np.ndarray
+        Spectra trimmed to velocity range
+    ch_min : int
+        Starting channel index
+    ch_max : int
+        Ending channel index (inclusive)
+    
+    Raises
+    ------
+    ValueError
+        If velocity range is invalid or outside data range
+    """
+    # Find channels corresponding to velocity range
+    mask = (velocity_axis >= velo_min) & (velocity_axis <= velo_max)
+    indices = np.where(mask)[0]
+    
+    if len(indices) == 0:
+        raise ValueError(
+            f"No channels found in velocity range [{velo_min}, {velo_max}]. "
+            f"Valid range: [{velocity_axis.min():.0f}, {velocity_axis.max():.0f}]"
+        )
+    
+    ch_min = indices[0]
+    ch_max = indices[-1]
+    
+    # Extract spectra
+    extracted = spectra[:, ch_min:ch_max+1]
+    
+    return extracted, ch_min, ch_max
+
+
 def reduce_spectra(hdul: fits.HDUList,
                    spectrum_column: str = 'SPECTRUM',
                    methods: Optional[dict] = None) -> fits.HDUList:
@@ -944,11 +1260,116 @@ def reduce_spectra(hdul: fits.HDUList,
         keep_mask = nan_fractions < nan_threshold
         spectra = filtered_spectra
 
+    # Extract velocity range BEFORE baseline (so baseline window uses extracted channels)
+    if 'extract' in methods:
+        try:
+            extract_range = methods['extract']
+            extract_mode = methods.get('extract_mode', 'velocity')
+            
+            # Extract by velocity range (m/s)
+            spectral_params = _extract_spectral_params(hdul)
+            velocity_axis_full = _create_velocity_axis(
+                spectral_params['velo_ref'],
+                spectral_params['deltav'],
+                spectral_params['crpix1_spec'],
+                spectral_params['nchans']
+            )
+            
+            velo_min, velo_max = extract_range[0], extract_range[1]
+            spectra, ch_min, ch_max = _extract_velocity_range(
+                spectra, velocity_axis_full, velo_min, velo_max
+            )
+            
+            # Store channel range for later use with baseline window
+            methods['_extract_ch_min'] = ch_min
+            methods['_extract_ch_max'] = ch_max
+            
+            print(f"Extracted velocity range [{velo_min/1000:.0f}, {velo_max/1000:.0f}] km/s "
+                  f"({velo_min:.0f}-{velo_max:.0f} m/s) "
+                  f"→ channels [{ch_min}, {ch_max}] ({ch_max - ch_min + 1} channels)")
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Could not extract spectrum range: {e}", UserWarning)
+
+    # Calculate RMS outside baseline window (after baseline subtraction)
+    rms_baseline_values = None
+    baseline_window_info = None
+    
     if 'baseline' in methods:
         params = methods['baseline']
         order = params.get('order', 1)
-        window = params.get('window', None)
+        window = None
+        
+        # Handle window parameter - could be in velocity (m/s) or channel format
+        if 'window_m_s' in params:
+            # Window is in m/s (from config, absolute velocities)
+            velo_min_window, velo_max_window = params['window_m_s']
+            
+            # Get full velocity axis to map velocities to channels
+            spectral_params = _extract_spectral_params(hdul)
+            velocity_axis_full = _create_velocity_axis(
+                spectral_params['velo_ref'],
+                spectral_params['deltav'],
+                spectral_params['crpix1_spec'],
+                spectral_params['nchans']
+            )
+            
+            # Find channels corresponding to baseline window velocities
+            ch_min_window_idx = _velocity_to_channel_index(
+                velo_min_window, spectral_params['velo_ref'], 
+                spectral_params['deltav'], spectral_params['crpix1_spec']
+            )
+            ch_max_window_idx = _velocity_to_channel_index(
+                velo_max_window, spectral_params['velo_ref'],
+                spectral_params['deltav'], spectral_params['crpix1_spec']
+            )
+            
+            ch_min_window = int(np.clip(ch_min_window_idx, 0, spectral_params['nchans'] - 1))
+            ch_max_window = int(np.clip(ch_max_window_idx, 0, spectral_params['nchans'] - 1))
+            
+            # If we extracted, adjust window to extracted coordinate system
+            if '_extract_ch_min' in methods:
+                extract_ch_min = methods['_extract_ch_min']
+                ch_min_window = max(0, ch_min_window - extract_ch_min)
+                ch_max_window = max(0, ch_max_window - extract_ch_min)
+            
+            window = (ch_min_window, ch_max_window)
+            print(f"Baseline window: [{velo_min_window/1000:.0f}, {velo_max_window/1000:.0f}] km/s "
+                  f"→ channels [{ch_min_window}, {ch_max_window}]")
+            
+            # Store window info for RMS calculation after baseline subtraction
+            baseline_window_info = (ch_min_window, ch_max_window)
+        elif 'window' in params:
+            window = params['window']
+        
+        if window is not None:
+            # Final validation and clamping
+            window = (
+                max(0, window[0]),
+                min(spectra.shape[1] - 1, window[1])
+            )
+        
         spectra = _reduce_baseline(spectra, order=order, window=window)
+        
+        # Calculate RMS of channels OUTSIDE the baseline window
+        # This is done AFTER baseline subtraction on the baselined spectra
+        if baseline_window_info is not None:
+            ch_min_window, ch_max_window = baseline_window_info
+            rms_baseline_values = np.zeros(spectra.shape[0], dtype=np.float32)
+            for i in range(spectra.shape[0]):
+                spec = spectra[i]
+                # Create mask for channels outside window
+                outside_mask = np.concatenate([
+                    np.ones(ch_min_window, dtype=bool),
+                    np.zeros(ch_max_window - ch_min_window + 1, dtype=bool),
+                    np.ones(spectra.shape[1] - ch_max_window - 1, dtype=bool)
+                ])
+                # Calculate standard deviation of channels outside window (on baselined spectrum)
+                outside_channels = spec[outside_mask]
+                if len(outside_channels) > 0:
+                    rms_baseline_values[i] = np.nanstd(outside_channels)
+                else:
+                    rms_baseline_values[i] = np.nan
 
     if 'smooth' in methods:
         params = methods['smooth']
@@ -968,8 +1389,43 @@ def reduce_spectra(hdul: fits.HDUList,
         filtered_data = data
     
     table = Table(filtered_data)
-    # Update the spectrum column with reduced spectra (now in original dtype)
+    
+    # Replace the spectrum column with reduced spectra (now in original dtype)
+    # After extraction+baseline, the spectrum is reduced and extracted
     table[spectrum_column] = spectra
+    
+    # Keep all columns including VELOCITY, DELTAV, CRPIX1
+    # These are preserved for reference and downstream analysis
+    # (They refer to the original full spectrum, not the extracted range)
+    
+    # Add velocity axis column for easier plotting and calculations
+    # This will correspond to the extracted velocity range (or full range if no extraction)
+    try:
+        spectral_params = _extract_spectral_params(hdul)
+        velocity_axis = _create_velocity_axis(
+            spectral_params['velo_ref'],
+            spectral_params['deltav'],
+            spectral_params['crpix1_spec'],
+            spectral_params['nchans']
+        )
+        
+        # If extraction was done, use only the extracted velocity range
+        if '_extract_ch_min' in methods:
+            ch_min = methods['_extract_ch_min']
+            ch_max = methods['_extract_ch_max']
+            velocity_axis = velocity_axis[ch_min:ch_max+1]
+        
+        # Create velocity axis column (repeat for all spectra)
+        velocity_axis_column = np.tile(velocity_axis, (len(spectra), 1))
+        table['VELOCITY_AXIS'] = velocity_axis_column
+    except (ValueError, KeyError) as e:
+        # If spectral parameters cannot be extracted, skip adding velocity axis
+        import warnings
+        warnings.warn(f"Could not add VELOCITY_AXIS column: {e}", UserWarning)
+    
+    # Add RMS_BASELINE column if it was calculated during baseline subtraction
+    if rms_baseline_values is not None:
+        table['RMS_BASELINE'] = rms_baseline_values
 
     # Build new HDUList
     primary = hdul[0].copy()
@@ -1130,11 +1586,52 @@ def reduce_spectra_from_config(config_path: Optional[Union[str, Path]] = None,
 
     output_path = Path(output_path)
 
+    # Build methods dict from config if not provided
+    if methods is None:
+        methods = {}
+        reduction_config = cfg.get('reduction', {})
+        
+        # Parse baseline parameters
+        # window: [velo_min, velo_max] in km/s (absolute velocities)
+        # Example: window=[450, 500] → 450,000 to 500,000 m/s
+        if 'baseline' in reduction_config and reduction_config['baseline'] is not None:
+            baseline_order = reduction_config['baseline']
+            baseline_window = reduction_config.get('window', None)
+            methods['baseline'] = {'order': baseline_order}
+            if baseline_window is not None:
+                # Store as-is; will be converted to channel indices in reduce_spectra
+                # Store original values in km/s for reference
+                methods['baseline']['window_km_s'] = tuple(baseline_window)
+                # Also convert to m/s for internal use
+                window_ms = [baseline_window[0] * 1000.0, baseline_window[1] * 1000.0]
+                methods['baseline']['window_m_s'] = window_ms
+        
+        # Parse extraction parameters
+        # extract: [velo_min, velo_max] in km/s (will be converted to m/s)
+        # Example: extract=[350, 700] → 350,000 to 700,000 m/s
+        if 'extract' in reduction_config and reduction_config['extract'] is not None:
+            extract_range = reduction_config['extract']
+            if len(extract_range) == 2:
+                # Convert from km/s to m/s
+                velo_min_ms = extract_range[0] * 1000.0
+                velo_max_ms = extract_range[1] * 1000.0
+                methods['extract'] = [velo_min_ms, velo_max_ms]
+                methods['extract_mode'] = 'velocity'
+        
+        # Parse smooth parameters if present
+        if 'smooth' in reduction_config and reduction_config['smooth'] is not None:
+            smooth_window = reduction_config['smooth']
+            methods['smooth'] = {'window_size': smooth_window}
+        
+        # Parse unblank parameters if present
+        if 'unblank' in reduction_config and reduction_config['unblank'] is not None:
+            methods['unblank'] = reduction_config['unblank']
+
     # Apply reduction
     reduced_hdul = reduce_spectra(hdul, methods=methods)
 
-    # Write output
-    reduced_hdul.writeto(output_path, overwrite=overwrite)
+    # Write output (always overwrite)
+    reduced_hdul.writeto(output_path, overwrite=True)
 
     return output_path
 

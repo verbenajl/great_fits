@@ -9,10 +9,232 @@ import numpy as np
 import logging
 from typing import Tuple, Optional, Union
 from pathlib import Path
+from astropy.io import fits
 
 from .errors import LineDetectionError
 
 logger = logging.getLogger(__name__)
+
+
+def velocity_to_channel(velocity_km_s: float, crval1: float, cdelt1: float, 
+                       crpix1: float = 1.0) -> float:
+    """
+    Convert velocity (km/s) to channel number using WCS parameters.
+    
+    Uses the standard FITS WCS formula:
+    channel = crpix1 - (velocity - crval1) / cdelt1
+    
+    Parameters
+    ----------
+    velocity_km_s : float
+        Velocity value in km/s
+    crval1 : float
+        Reference velocity (CRVAL1) in km/s
+    cdelt1 : float
+        Velocity step per channel (CDELT1) in km/s/channel
+        (usually negative for increasing velocity with decreasing channel)
+    crpix1 : float, optional
+        Reference pixel (CRPIX1), default=1.0 (FITS convention)
+        
+    Returns
+    -------
+    float
+        Channel number (0-indexed)
+        
+    Raises
+    ------
+    ValueError
+        If cdelt1 is zero or if inputs are invalid
+    """
+    if cdelt1 == 0:
+        raise ValueError("CDELT1 (velocity step) cannot be zero")
+    
+    # WCS formula: channel = crpix1 - (velocity - crval1) / cdelt1
+    # Subtract 1 to convert from FITS (1-indexed) to Python (0-indexed)
+    channel = (crpix1 - 1.0) - (velocity_km_s - crval1) / cdelt1
+    
+    return channel
+
+
+def velocity_range_to_channels(velocity_center_km_s: float, velocity_width_km_s: float,
+                               crval1: float, cdelt1: float, crpix1: float = 1.0,
+                               n_channels: Optional[int] = None) -> Tuple[int, int]:
+    """
+    Convert velocity range (center ± width/2) to channel range.
+    
+    Parameters
+    ----------
+    velocity_center_km_s : float
+        Center velocity in km/s
+    velocity_width_km_s : float
+        Full width of range in km/s (will use ±width/2)
+    crval1 : float
+        Reference velocity (CRVAL1) in km/s
+    cdelt1 : float
+        Velocity step per channel (CDELT1) in km/s/channel
+    crpix1 : float, optional
+        Reference pixel (CRPIX1), default=1.0
+    n_channels : int, optional
+        Total number of channels (for bounds checking)
+        
+    Returns
+    -------
+    ch_start : int
+        Start channel (clipped to valid range)
+    ch_end : int
+        End channel (clipped to valid range)
+        
+    Raises
+    ------
+    ValueError
+        If cdelt1 is zero or if inputs are invalid
+    """
+    # Calculate velocity range
+    v_min = velocity_center_km_s - velocity_width_km_s / 2.0
+    v_max = velocity_center_km_s + velocity_width_km_s / 2.0
+    
+    # Convert to channels
+    ch_min = velocity_to_channel(v_min, crval1, cdelt1, crpix1)
+    ch_max = velocity_to_channel(v_max, crval1, cdelt1, crpix1)
+    
+    # Handle negative cdelt (velocity increases with decreasing channel)
+    ch_start = int(np.floor(min(ch_min, ch_max)))
+    ch_end = int(np.ceil(max(ch_min, ch_max))) + 1
+    
+    # Clip to valid range
+    if n_channels is not None:
+        ch_start = max(0, ch_start)
+        ch_end = min(n_channels, ch_end)
+    else:
+        ch_start = max(0, ch_start)
+        ch_end = max(ch_end, 0)
+    
+    return ch_start, ch_end
+
+
+def extract_wcs_from_header(header: Union[fits.Header, dict]) -> Tuple[float, float, float]:
+    """
+    Extract WCS parameters from FITS header.
+    
+    Parameters
+    ----------
+    header : fits.Header or dict
+        FITS header or dictionary-like object
+        
+    Returns
+    -------
+    crval1 : float
+        Reference velocity (CRVAL1) in km/s
+    cdelt1 : float
+        Velocity step (CDELT1) in km/s/channel
+    crpix1 : float
+        Reference pixel (CRPIX1)
+        
+    Raises
+    ------
+    ValueError
+        If required WCS keywords are missing
+    KeyError
+        If header doesn't support dictionary-like access
+    """
+    try:
+        crval1 = float(header['CRVAL1'])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("CRVAL1 (reference velocity) not found in header")
+    
+    try:
+        cdelt1 = float(header['CDELT1'])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("CDELT1 (velocity step) not found in header")
+    
+    try:
+        crpix1 = float(header.get('CRPIX1', 1.0))
+    except (TypeError, ValueError):
+        crpix1 = 1.0
+    
+    if cdelt1 == 0:
+        raise ValueError("CDELT1 cannot be zero")
+    
+    return crval1, cdelt1, crpix1
+
+
+def find_channels_from_velocity_axis(velocity_center_km_s: float, velocity_width_km_s: float,
+                                      velocity_axis: np.ndarray) -> Tuple[int, int]:
+    """
+    Find channel range for velocity region using actual velocity axis from FITS.
+    
+    This is more accurate than WCS conversion because it uses the actual velocity
+    values stored in the FITS file, which may have been resampled or shifted.
+    
+    Parameters
+    ----------
+    velocity_center_km_s : float
+        Center velocity in km/s
+    velocity_width_km_s : float
+        Full width of range in km/s (will use ±width/2)
+    velocity_axis : np.ndarray
+        1D array of velocity values for each channel
+        Can be in either m/s or km/s (auto-detected based on magnitude)
+        
+    Returns
+    -------
+    ch_start : int
+        Start channel (inclusive)
+    ch_end : int
+        End channel (exclusive)
+        
+    Raises
+    ------
+    ValueError
+        If velocity_axis is invalid or telluric range doesn't overlap with data
+    """
+    if velocity_axis is None or len(velocity_axis) == 0:
+        raise ValueError("velocity_axis is empty or None")
+    
+    velocity_axis = np.asarray(velocity_axis).flatten()
+    
+    # Auto-detect if velocity_axis is in m/s or km/s
+    # If max value > 10000, assume m/s and convert to km/s
+    v_max = np.nanmax(np.abs(velocity_axis))
+    if v_max > 10000:  # Likely in m/s
+        velocity_axis_km_s = velocity_axis / 1000.0
+        logger.debug(f"VELOCITY_AXIS detected as m/s, converting to km/s (max: {v_max/1000:.1f} km/s)")
+    else:
+        velocity_axis_km_s = velocity_axis
+        logger.debug(f"VELOCITY_AXIS detected as km/s (max: {v_max:.1f} km/s)")
+    
+    # Calculate velocity range
+    v_min = velocity_center_km_s - velocity_width_km_s / 2.0
+    v_max_range = velocity_center_km_s + velocity_width_km_s / 2.0
+    
+    # Find indices where velocity falls within range
+    # Use searchsorted for efficient lookup
+    
+    # Handle both increasing and decreasing velocity arrays
+    if velocity_axis_km_s[0] < velocity_axis_km_s[-1]:
+        # Increasing velocity (typical)
+        ch_start = np.searchsorted(velocity_axis_km_s, v_min, side='left')
+        ch_end = np.searchsorted(velocity_axis_km_s, v_max_range, side='right')
+    else:
+        # Decreasing velocity
+        ch_end_temp = np.searchsorted(velocity_axis_km_s[::-1], v_min, side='right')
+        ch_start_temp = np.searchsorted(velocity_axis_km_s[::-1], v_max_range, side='left')
+        ch_end = len(velocity_axis_km_s) - ch_end_temp
+        ch_start = len(velocity_axis_km_s) - ch_start_temp
+        ch_start, ch_end = min(ch_start, ch_end), max(ch_start, ch_end)
+    
+    # Ensure valid range
+    ch_start = max(0, ch_start)
+    ch_end = min(len(velocity_axis_km_s), ch_end)
+    
+    if ch_start >= ch_end:
+        logger.warning(
+            f"Telluric velocity range [{v_min:.1f}, {v_max_range:.1f}] km/s "
+            f"does not overlap with available velocity range "
+            f"[{velocity_axis_km_s.min():.1f}, {velocity_axis_km_s.max():.1f}] km/s"
+        )
+    
+    return ch_start, ch_end
 
 
 def detect_science_line_waterfall(spectrum_2d: np.ndarray, kernel_size: int = 5,
@@ -346,18 +568,35 @@ def create_science_line_mask(spectrum: np.ndarray, center: int,
 
 
 def create_artifact_mask(n_channels: int, artifact_center: int,
-                        artifact_width: int) -> np.ndarray:
+                        artifact_width: int, 
+                        header: Optional[Union[fits.Header, dict]] = None,
+                        velocity_axis: Optional[np.ndarray] = None,
+                        use_velocity: bool = True) -> np.ndarray:
     """
-    Create boolean mask for instrumental artifact region.
+    Create boolean mask for instrumental artifact region (e.g., telluric lines).
+    
+    Can work in multiple modes, with preference given to:
+    1. VELOCITY_AXIS column (if provided) - most accurate, uses actual velocity data
+    2. WCS parameters (CRVAL1, CDELT1, CRPIX1 from header) - standard conversion
+    3. Channel mode (default) - artifact_center and artifact_width in channels
     
     Parameters
     ----------
     n_channels : int
         Total number of channels
-    artifact_center : int
-        Center channel of artifact
-    artifact_width : int
-        Full width of artifact region
+    artifact_center : float
+        Center of artifact region (in channels or km/s depending on use_velocity)
+    artifact_width : float
+        Full width of artifact region (in channels or km/s depending on use_velocity)
+    header : fits.Header or dict, optional
+        FITS header with WCS information (CRVAL1, CDELT1, CRPIX1)
+        If provided with use_velocity=True, input values are treated as km/s
+    velocity_axis : np.ndarray, optional
+        1D array of velocity values (from VELOCITY_AXIS column in FITS file)
+        If provided, this is used preferentially over WCS conversion
+    use_velocity : bool, optional
+        If True and header/velocity_axis is provided, treat artifact_center/width as km/s
+        Default: True
         
     Returns
     -------
@@ -365,11 +604,70 @@ def create_artifact_mask(n_channels: int, artifact_center: int,
         Boolean mask (True = artifact, False = valid)
     """
     mask = np.zeros(n_channels, dtype=bool)
+    ch_start = None
+    ch_end = None
     
-    ch_start = max(0, artifact_center - artifact_width // 2)
-    ch_end = min(n_channels, artifact_center + artifact_width // 2 + 1)
+    # Method 1: Use VELOCITY_AXIS from FITS if available (most accurate)
+    if velocity_axis is not None and use_velocity:
+        try:
+            velocity_axis = np.asarray(velocity_axis).flatten()
+            
+            # Find channels corresponding to telluric velocity range
+            ch_start, ch_end = find_channels_from_velocity_axis(
+                velocity_center_km_s=artifact_center,
+                velocity_width_km_s=artifact_width,
+                velocity_axis=velocity_axis
+            )
+            
+            logger.info(
+                f"✓ Telluric mask: {artifact_center:.1f}±{artifact_width/2:.1f} km/s "
+                f"→ channels {ch_start}-{ch_end} "
+                f"(from VELOCITY_AXIS column, {len(velocity_axis)} channels)"
+            )
+        
+        except (ValueError, IndexError, TypeError) as e:
+            logger.warning(
+                f"Could not use VELOCITY_AXIS: {e}. "
+                f"Falling back to WCS conversion..."
+            )
+            velocity_axis = None  # Fall through to WCS method
     
-    mask[ch_start:ch_end] = True
+    # Method 2: Use WCS parameters from header if VELOCITY_AXIS not available
+    if ch_start is None and velocity_axis is None and header is not None and use_velocity:
+        try:
+            # Extract WCS parameters from header
+            crval1, cdelt1, crpix1 = extract_wcs_from_header(header)
+            
+            # Convert velocity range to channel range
+            ch_start, ch_end = velocity_range_to_channels(
+                velocity_center_km_s=artifact_center,
+                velocity_width_km_s=artifact_width,
+                crval1=crval1,
+                cdelt1=cdelt1,
+                crpix1=crpix1,
+                n_channels=n_channels
+            )
+            
+            logger.info(
+                f"Telluric mask: velocity {artifact_center:.1f}±{artifact_width/2:.1f} km/s "
+                f"→ channels {ch_start}-{ch_end} "
+                f"(using WCS: CRVAL1={crval1:.1f}, CDELT1={cdelt1:.3f}, CRPIX1={crpix1:.1f})"
+            )
+        
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning(
+                f"Could not convert velocity to channels: {e}. "
+                f"Falling back to channel-based interpretation."
+            )
+            ch_start = None  # Fall through to channel-based mode
+    
+    # Method 3: Channel-based mode (fallback if both velocity methods failed)
+    if ch_start is None:
+        ch_start = max(0, int(artifact_center - artifact_width / 2))
+        ch_end = min(n_channels, int(artifact_center + artifact_width / 2) + 1)
+    
+    if ch_start is not None and ch_end is not None:
+        mask[ch_start:ch_end] = True
     
     return mask
 

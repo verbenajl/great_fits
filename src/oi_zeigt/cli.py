@@ -143,6 +143,50 @@ def print_fits_info(config: Optional[str], fits: Optional[str]):
         sys.exit(1)
 
 
+def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) -> Optional[np.ndarray]:
+    """
+    Create velocity axis on-the-fly from FITS header parameters if available.
+    
+    Attempts to extract VELOCITY, DELTAV, and CRPIX1 parameters from the FITS
+    header and create a velocity axis. Returns None if parameters are missing.
+    
+    Parameters
+    ----------
+    table_hdu : fits.BinTableHDU
+        FITS binary table HDU containing spectral data
+    nchans : int
+        Number of spectral channels
+    
+    Returns
+    -------
+    np.ndarray or None
+        Velocity axis in m/s (shape: nchans), or None if parameters unavailable
+    """
+    try:
+        # Try to get parameters from the table's data first
+        if (hasattr(table_hdu, 'data') and table_hdu.data is not None and
+            'VELOCITY' in table_hdu.data.dtype.names and 
+            'DELTAV' in table_hdu.data.dtype.names):
+            velo_ref = float(table_hdu.data['VELOCITY'][0])
+            deltav = float(table_hdu.data['DELTAV'][0])
+        else:
+            return None
+        
+        # Get reference pixel from header
+        crpix1_spec = 1.0
+        if 'CRPIX1' in table_hdu.header:
+            crpix1_spec = float(table_hdu.header['CRPIX1'])
+        
+        # Create velocity axis
+        channel_indices = np.arange(nchans, dtype=np.float64)
+        velocity_axis = velo_ref + (channel_indices - (crpix1_spec - 1.0)) * deltav
+        
+        return velocity_axis
+        
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
 @click.command()
 @click.option(
     "--config",
@@ -164,8 +208,8 @@ def print_fits_info(config: Optional[str], fits: Optional[str]):
 @click.option(
     "--num-spectra",
     type=int,
-    default=20,
-    help="Number of spectra to plot (default: 20)"
+    default=10,
+    help="Number of spectra to plot (default: 10)"
 )
 @click.option(
     "--output",
@@ -173,12 +217,16 @@ def print_fits_info(config: Optional[str], fits: Optional[str]):
     default=None,
     help="Output file for the plot (PNG or PDF). If not specified, show plot."
 )
+
+
 def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Optional[str],
                        num_spectra: int, output: Optional[str]):
     """
     Plot a sample of spectra from a FITS file.
     
     Optionally filter by object name and limit the number of spectra plotted.
+    If VELOCITY_AXIS column is not present, attempts to create one on-the-fly
+    from FITS header parameters (VELOCITY, DELTAV, CRPIX1).
     
     Examples:
     
@@ -213,15 +261,15 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Opti
         else:
             hdul = read_fits_from_config()
         
-        # Get object name from argument or config
-        if object is None and config:
+        # Get object name: priority is --object argument, then config file
+        if object is None:
             try:
                 object = config_data.get("parameters", {}).get("object")
             except (NameError, KeyError):
                 pass
         
         if object is None:
-            raise ValueError("Object name not specified. Use --object or set in config file.")
+            raise ValueError("Object name not specified. Use --object or set 'object' in [parameters] section of config file.")
         
         # Find binary table HDU with spectra
         matrix_hdu = None
@@ -257,6 +305,21 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Opti
         click.echo(f"Plotting {sample_size} spectra for object '{object}'")
         click.echo(f"Original FITS row indices (for reference): {original_indices}\n")
         
+        # Check if VELOCITY_AXIS column exists, or create one on-the-fly
+        velocity_axis_from_fits = None
+        has_velocity_axis_column = 'VELOCITY_AXIS' in data.dtype.names
+        
+        if not has_velocity_axis_column:
+            # Try to create velocity axis on-the-fly
+            nchans = data['SPECTRUM'][0].shape[0]
+            velocity_axis_from_fits = _create_velocity_axis_from_fits(matrix_hdu, nchans)
+            if velocity_axis_from_fits is not None:
+                click.echo("✓ Created velocity axis on-the-fly from FITS parameters")
+            else:
+                click.echo("  No velocity axis column; using channel indices for x-axis")
+        else:
+            click.echo("✓ Using velocity axis from FITS column")
+        
         # Create plot
         num_to_plot = len(spectra_to_plot)
         cols = 4
@@ -275,10 +338,31 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Opti
             spectrum = spectrum_data['SPECTRUM']
             obj_name = spectrum_data['OBJECT'].decode().strip() if isinstance(spectrum_data['OBJECT'], bytes) else str(spectrum_data['OBJECT']).strip()
             
+            # Determine x-axis: priority is VELOCITY_AXIS column, then on-the-fly creation
+            x_axis = None
+            x_label = "Channel"
+            
+            if has_velocity_axis_column:
+                try:
+                    velocity_axis = spectrum_data['VELOCITY_AXIS']
+                    if velocity_axis is not None and len(velocity_axis) == len(spectrum):
+                        x_axis = velocity_axis / 1000.0  # Convert m/s to km/s
+                        x_label = "Velocity (km/s)"
+                except (IndexError, TypeError):
+                    pass
+            elif velocity_axis_from_fits is not None:
+                # Use the on-the-fly created axis
+                x_axis = velocity_axis_from_fits / 1000.0  # Convert m/s to km/s
+                x_label = "Velocity (km/s)"
+            
             # Calculate NaN fraction for this spectrum
             nan_mask, nan_frac = detect_nan_channels(spectrum)
             
-            ax.plot(spectrum, linewidth=0.8)
+            # Plot with x-axis (velocity if available, channel index otherwise)
+            if x_axis is not None:
+                ax.plot(x_axis, spectrum, linewidth=0.8)
+            else:
+                ax.plot(spectrum, linewidth=0.8)
             
             # Color code the title based on NaN fraction
             if nan_frac == 0:
@@ -300,7 +384,7 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Opti
                 color=title_color,
                 weight='bold'
             )
-            ax.set_xlabel("Channel")
+            ax.set_xlabel(x_label)
             ax.set_ylabel("Intensity")
             ax.grid(True, alpha=0.3)
         
@@ -625,30 +709,42 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     help="Values to remove from the column (can be used multiple times). "
          "Example: --remove-values 04_0116_0010 --remove-values 04_0116_0020"
 )
+@click.option(
+    "--apply-only-to-object",
+    is_flag=True,
+    default=False,
+    help="Apply NaN filtering only to target object (not to all spectra)"
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
                 nan_threshold: float, output_clean: Optional[str], 
                 output_rejected: Optional[str], remove: Optional[str],
-                remove_values: tuple):
+                remove_values: tuple, apply_only_to_object: bool):
     """
     Filter FITS data by object, NaN content, and/or column values.
     
     Creates two FITS files:
-    1. Clean file: All non-target objects + target object spectra with < nan_threshold NaNs
-    2. Rejected file: Target object spectra with >= nan_threshold NaNs or matching remove criteria
+    1. Clean file: Spectra passing NaN threshold filter
+    2. Rejected file: Spectra failing NaN threshold filter or matching removal criteria
+    
+    By default, NaN filtering is applied to ALL spectra. Use --apply-only-to-object
+    to filter only the target object and keep all other objects regardless of NaN content.
     
     Examples:
     
-        # Filter using config file (reads object name from config)
+        # Filter ALL spectra by NaN threshold (default)
         filter_fits --config config.toml
         
-        # Filter with custom thresholds
+        # Filter only M51 spectra, keep all other objects
+        filter_fits --config config.toml --apply-only-to-object
+        
+        # Filter all with custom thresholds
         filter_fits --config config.toml --nan-threshold 0.75
         
         # Filter specific object and specify output files
         filter_fits --config config.toml --object "M51" \\
             --output-clean m51_clean.fits --output-rejected m51_rejected.fits
         
-        # Remove specific AOR_ID values
+        # Remove specific AOR_ID values AND filter all spectra
         filter_fits --config config.toml --remove AOR_ID \\
             --remove-values 04_0116_0020609 --remove-values 04_0116_0020506
     """
@@ -714,6 +810,10 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         
         click.echo(f"\nFiltering data for object: {object}")
         click.echo(f"NaN threshold: {nan_threshold:.1%}")
+        if apply_only_to_object:
+            click.echo(f"Applying NaN filter to {object} spectra only")
+        else:
+            click.echo(f"Applying NaN filter to ALL spectra")
         click.echo(f"Keeping spectra with < {nan_threshold:.1%} NaN channels")
         click.echo(f"Rejecting spectra with >= {nan_threshold:.1%} NaN channels\n")
         
@@ -729,7 +829,8 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             output_clean=output_clean,
             output_rejected=output_rejected,
             remove_column=remove,
-            remove_values=list(remove_values) if remove_values else None
+            remove_values=list(remove_values) if remove_values else None,
+            apply_to_all=not apply_only_to_object
         )
         
         # Get statistics before closing
@@ -928,6 +1029,20 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
         if unblank:
             methods['unblank'] = {}
         
+        # Add extraction from config if available
+        reduction_cfg = cfg.get('reduction', {})
+        extract_cfg = reduction_cfg.get('extract', None)
+        if extract_cfg is not None:
+            try:
+                if isinstance(extract_cfg, (list, tuple)) and len(extract_cfg) == 2:
+                    # Extract range from config is in km/s
+                    extract_km_s = [float(extract_cfg[0]), float(extract_cfg[1])]
+                    extract_m_s = [extract_km_s[0] * 1000.0, extract_km_s[1] * 1000.0]
+                    methods['extract'] = extract_m_s
+                    methods['extract_mode'] = 'velocity'
+            except (ValueError, TypeError, IndexError):
+                pass
+        
         if baseline:
             # Get baseline order
             if baseline_order is None:
@@ -946,7 +1061,8 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
                 if window_cfg is not None:
                     try:
                         if isinstance(window_cfg, (list, tuple)) and len(window_cfg) == 2:
-                            baseline_window = (int(window_cfg[0]), int(window_cfg[1]))
+                            # Window from config is in km/s
+                            baseline_window = window_cfg
                     except (ValueError, TypeError, IndexError):
                         baseline_window = None
             
@@ -954,6 +1070,18 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
                 'order': baseline_order,
                 'window': baseline_window
             }
+            
+            # If window is in km/s (from config), convert to m/s for internal use
+            if baseline_window is not None and len(baseline_window) == 2:
+                try:
+                    # Check if values look like km/s (< 1000 typically means km/s)
+                    if baseline_window[0] < 1000 and baseline_window[1] < 1000:
+                        # Convert km/s to m/s
+                        window_ms = [baseline_window[0] * 1000.0, baseline_window[1] * 1000.0]
+                        methods['baseline']['window_m_s'] = window_ms
+                        methods['baseline']['window_km_s'] = baseline_window
+                except (ValueError, TypeError):
+                    pass
         
         if smooth:
             methods['smooth'] = {

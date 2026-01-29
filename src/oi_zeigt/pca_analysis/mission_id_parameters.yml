@@ -1,4 +1,9 @@
 ---
+# Mission-specific parameters for PCA decomposition
+#
+# Note: telluric_line_center and telluric_line_width are in km/s (velocity units)
+# They will be automatically converted to channel numbers using the FITS WCS parameters
+# (CRVAL1, CDELT1, CRPIX1) from each spectrum's FITS header
 
 2016-05-12_GR_F296:
   telluric_line_center: 566
@@ -42,8 +47,8 @@
   telluric_line_width: 30
 
 2017-02-01_GR_F367:
-  telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_center: 593
+  telluric_line_width: 60
   drop:
     telescope:
       - LFAV_4  # remove this for large dataset
