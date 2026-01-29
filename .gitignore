@@ -58,3 +58,9 @@ venv/
 ENV/
 env/
 .venv
+
+# Diagnostic plots
+*.png
+
+# Test files
+tests/

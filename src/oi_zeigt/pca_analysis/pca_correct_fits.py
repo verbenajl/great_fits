@@ -50,12 +50,16 @@ if not logging.getLogger().hasHandlers():
     )
 
 
-def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel=None):
+def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel=None, 
+                       velocity_axis_kms=None, velocity_window_kms=None):
     """
-    Detect science lines in spectra using OpenCV edge detection.
+    Detect science lines in spectra using 2D OpenCV image processing.
     
-    This uses Gaussian blur and threshold detection to identify emission/absorption lines.
-    Follows the same algorithm as pca_utilities.find_lines().
+    Treats the 2D array of spectra as a 2D image and applies Gaussian blur
+    and threshold detection. This is similar to pca_utilities.find_lines().
+    
+    If velocity_window_kms is provided, detection is restricted to channels
+    within that velocity range, masking out other regions before processing.
     
     Parameters
     ----------
@@ -66,81 +70,141 @@ def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel
     cutoff_std : float
         Threshold in units of standard deviation (default: 2.0)
     smoothing_kernel : int, optional
-        Smoothing kernel size (separate from detection kernel)
+        Smoothing kernel size (not used, for API compatibility)
+    velocity_axis_kms : ndarray, optional
+        Velocity axis in km/s for each channel (shape: n_channels)
+    velocity_window_kms : tuple, optional
+        (v_min, v_max) velocity range in km/s to constrain detection
     
     Returns
     -------
-    ndarray
+    ndarray or None
         2D boolean mask (n_spectra, n_channels) indicating detected lines
+        Returns None if no lines detected in any spectrum
     """
     if cv is None:
         logger.warning("OpenCV not available, skipping line detection")
         return None
     
-    # Ensure kernel_size is positive odd integer
-    if kernel_size <= 0 or kernel_size % 2 == 0:
-        kernel_size = max(1, kernel_size - 1)
-    
     spectra = np.asarray(spectra)
     if len(spectra.shape) == 1:
         spectra = spectra.reshape(1, -1)
     
+    n_spectra, n_channels = spectra.shape
+    logger.debug(f"Line detection: input shape {n_spectra}x{n_channels}, kernel_size={kernel_size}, cutoff_std={cutoff_std}")
+    
+    # Ensure kernel_size is positive odd integer
+    if kernel_size <= 0 or kernel_size % 2 == 0:
+        kernel_size = max(1, kernel_size - 1)
+    if kernel_size < 3:
+        kernel_size = 3
+    
+    logger.debug(f"  Using kernel_size={kernel_size}")
+    
+    # Determine velocity window mask if provided
+    velocity_mask = np.ones(n_channels, dtype=bool)
+    if velocity_axis_kms is not None and velocity_window_kms is not None:
+        v_min, v_max = velocity_window_kms
+        velocity_mask = (velocity_axis_kms >= v_min) & (velocity_axis_kms <= v_max)
+        n_channels_in_window = np.sum(velocity_mask)
+        logger.debug(f"  Velocity window: {v_min}-{v_max} km/s, {n_channels_in_window}/{n_channels} channels in window")
+    
+    # Use FULL spectra for detection (don't mask before OpenCV processing)
+    spectra_for_detection = spectra
+    
     # Normalize spectra to 8-bit range for OpenCV
-    data_min = np.min(spectra)
-    data_max = np.max(spectra)
+    data_min = np.min(spectra_for_detection)
+    data_max = np.max(spectra_for_detection)
+    
+    logger.debug(f"  Data range: [{data_min:.6f}, {data_max:.6f}]")
     
     if data_max > data_min:
-        data_8uc = 255 * (spectra - data_min) / (data_max - data_min)
+        data_8uc = 255 * (spectra_for_detection - data_min) / (data_max - data_min)
     else:
-        data_8uc = np.zeros_like(spectra)
+        data_8uc = np.zeros_like(spectra_for_detection)
     
     img = data_8uc.astype(np.uint8)
     img = cv.normalize(img, None, 0, 100, cv.NORM_MINMAX)
     
+    logger.debug(f"  Normalized image range: [{np.min(img)}, {np.max(img)}]")
+    
     # Apply Gaussian blur
     gray = cv.GaussianBlur(img, (kernel_size, kernel_size), 0)
     
-    # Detect threshold
-    mean = gray[np.where(gray != 0)].mean() if np.any(gray != 0) else 0
-    std = gray[np.where(gray != 0)].std() if np.any(gray != 0) else 1
-    threshold_val = mean + cutoff_std * std
+    # Calculate initial threshold
+    valid_pixels = gray[np.where(gray != 0)]
+    if len(valid_pixels) > 0:
+        mean = valid_pixels.mean()
+        std = valid_pixels.std()
+    else:
+        mean = 0
+        std = 1
     
-    _, threshold = cv.threshold(
-        gray, threshold_val, 1, cv.THRESH_BINARY
-    )
+    threshold_val = mean + cutoff_std * std
+    logger.debug(f"  Initial: mean={mean:.2f}, std={std:.2f}, threshold={threshold_val:.2f}")
+    
+    _, threshold = cv.threshold(gray, threshold_val, 1, cv.THRESH_BINARY)
     
     initial_detections = np.sum(threshold > 0)
+    logger.debug(f"  Initial detections: {initial_detections} pixels")
     
-    # Iterative refinement
+    # Iterative refinement: recalculate threshold excluding detected regions
     new_mean = 0
     new_std = 0
     iterations = 0
     max_iterations = 10
     
-    while (not np.isclose(new_mean, mean) or not np.isclose(new_std, std)) and iterations < max_iterations:
+    while ((not np.isclose(new_mean, mean)) or (not np.isclose(new_std, std))) and iterations < max_iterations:
         new_mean = mean
         new_std = std
+        
+        # Mask out detected regions
         new_gray = gray.copy()
         new_gray[np.where(threshold == 1)] = 0
-        mean = new_gray[np.where(new_gray != 0)].mean() if np.any(new_gray != 0) else 0
-        std = new_gray[np.where(new_gray != 0)].std() if np.any(new_gray != 0) else 1
+        
+        # Recalculate statistics on remaining data
+        valid_pixels = new_gray[np.where(new_gray != 0)]
+        if len(valid_pixels) > 0:
+            mean = valid_pixels.mean()
+            std = valid_pixels.std()
+        else:
+            mean = 0
+            std = 1
+        
+        # Recalculate threshold
         threshold_val = mean + cutoff_std * std
-        _, threshold = cv.threshold(
-            gray, threshold_val, 1, cv.THRESH_BINARY
-        )
+        _, threshold = cv.threshold(gray, threshold_val, 1, cv.THRESH_BINARY)
+        
         iterations += 1
     
     final_detections = np.sum(threshold > 0)
-    logger.debug(f"Line detection converged after {iterations} iterations: {initial_detections} → {final_detections} pixels")
+    logger.debug(f"  After {iterations} iterations: {final_detections} pixels detected")
     
-    # Log per-spectrum statistics
+    # Convert to boolean mask
     mask = threshold.astype(bool)
-    line_channels = np.any(mask, axis=0)
-    if np.any(line_channels):
-        line_indices = np.where(line_channels)[0]
-        logger.debug(f"Detected lines in {np.sum(line_channels)} channels: {line_indices[0]}-{line_indices[-1]}")
     
-    return mask
+    # Apply velocity window constraint: zero out channels outside the window (AFTER detection)
+    if not np.all(velocity_mask):
+        mask[:, ~velocity_mask] = False
+        logger.debug(f"  Applying velocity window filter to detection results")
+    
+    # Log per-spectrum and per-channel statistics
+    n_spectra_with_lines = np.sum(np.any(mask, axis=1))
+    line_channels = np.any(mask, axis=0)
+    n_channels_with_lines = np.sum(line_channels)
+    
+    logger.debug(f"  Result: {n_spectra_with_lines}/{n_spectra} spectra with lines, {n_channels_with_lines}/{n_channels} channels detected")
+    
+    if n_channels_with_lines > 0:
+        line_indices = np.where(line_channels)[0]
+        logger.debug(f"    Channel range: {line_indices[0]}-{line_indices[-1]}")
+        if velocity_axis_kms is not None:
+            v_min_detected = velocity_axis_kms[line_indices[0]]
+            v_max_detected = velocity_axis_kms[line_indices[-1]]
+            logger.debug(f"    Velocity range: {v_min_detected:.2f}-{v_max_detected:.2f} km/s")
+    
+    # Return None if no lines detected in any spectrum (to match original behavior)
+    return mask if n_spectra_with_lines > 0 else None
 
 
 def get_velocity_window_channels(velocity_axis, window_km_s, tolerance=1.0):
@@ -258,7 +322,7 @@ class PCACorrector:
     
     def __init__(self, decomposition_pkl, config=None, 
                  line_kernel_size=51, line_cutoff_std=2.0, 
-                 smoothing_kernel_size=None):
+                 smoothing_kernel_size=None, line_window_velocities=None):
         """
         Initialize PCA corrector with decomposition results.
         
@@ -274,11 +338,14 @@ class PCACorrector:
             Standard deviation cutoff for line detection (default: 2.0)
         smoothing_kernel_size : int, optional
             Smoothing kernel size for line detection refinement
+        line_window_velocities : tuple, optional
+            (v_min, v_max) velocity range in km/s to constrain line detection
         """
         self.config = config or {}
         self.line_kernel_size = line_kernel_size
         self.line_cutoff_std = line_cutoff_std
         self.smoothing_kernel_size = smoothing_kernel_size
+        self.line_window_velocities = line_window_velocities
         
         self.decomposition = self._load_decomposition(decomposition_pkl)
         self.pca = self.decomposition.pca if hasattr(self.decomposition, 'pca') else None
@@ -303,6 +370,8 @@ class PCACorrector:
         logger.info(f"  Variance explained: {np.sum(self.explained_variance_ratio)*100:.2f}%")
         logger.info(f"  Line detection kernel size: {line_kernel_size}")
         logger.info(f"  Line detection cutoff: {line_cutoff_std} sigma")
+        if line_window_velocities:
+            logger.info(f"  Line detection window: {line_window_velocities[0]}-{line_window_velocities[1]} km/s")
     
     def _load_decomposition(self, pkl_path):
         """Load decomposition from pickle file."""
@@ -809,185 +878,26 @@ class PCACorrector:
             else:
                 velocity_axis_kms = None
             
-            # Detect science lines if requested
-            # Note: Line detection is done on a representative sample of spectra
-            # per mission/telescope/scan/subscan combination (following pca_correct.py)
-            science_line_mask = None
-            if detect_science_lines:
-                # NOTE: Science line detection happens HERE in pca_correct, not during decomposition.
-                # During decomposition, only the mission-specific telluric mask (from mission_id_parameters.yml)
-                # is used to exclude telluric regions from the components. Here, we additionally detect
-                # and mask the actual emission line being observed to prevent it from biasing the correction.
-                logger.info("Detecting science lines per mission/telescope/scan/subscan...")
-                try:
-                    # Convert string columns to consistent format once
-                    def to_string(x):
-                        if isinstance(x, bytes):
-                            return x.decode('utf-8').strip()
-                        return str(x).strip()
-                    
-                    mission_ids = np.array([to_string(data['MISSION_ID'][i]) for i in indices])
-                    telescopes = np.array([to_string(data['TELESCOP'][i]) for i in indices])
-                    scans = np.array([to_string(x) for x in data['SCAN'][indices]])
-                    subscans = np.array([to_string(x) for x in data['SUBSCAN'][indices]])
-                    
-                    # Create mask for all spectra
-                    science_line_mask = np.zeros((len(indices), len(velocity_axis_kms)), dtype=bool)
-                    
-                    # Get unique mission/telescope/scan/subscan combinations
-                    unique_groups = np.unique(
-                        np.column_stack((mission_ids, telescopes, scans, subscans)),
-                        axis=0
-                    )
-                    
-                    logger.info(f"  Found {len(unique_groups)} unique mission/telescope/scan/subscan groups")
-                    logger.info(f"  Total spectra to process: {len(indices)}")
-                    
-                    # DEBUG: Show first few groups and their sizes
-                    group_sizes = {}
-                    for mission_id_group, telescope_group, scan_id, subscan_id in unique_groups:
-                        group_mask = (
-                            (mission_ids == mission_id_group) &
-                            (telescopes == telescope_group) &
-                            (scans == scan_id) &
-                            (subscans == subscan_id)
-                        )
-                        group_sizes[(mission_id_group, telescope_group, scan_id, subscan_id)] = np.sum(group_mask)
-                    
-                    # Show distribution
-                    sizes = list(group_sizes.values())
-                    logger.info(f"  Group sizes: min={min(sizes)}, max={max(sizes)}, mean={np.mean(sizes):.1f}, median={np.median(sizes):.0f}")
-                    
-                    # Show a few example groups
-                    sample_groups = list(group_sizes.items())[:5]
-                    for (mid, tel, scan, subscan), size in sample_groups:
-                        logger.info(f"    Example group: {mid}/{tel}/scan{scan}/subscan{subscan} ({size} spectra)")
-                    logger.info(f"  velocity_axis_kms is None: {velocity_axis_kms is None}, len: {len(velocity_axis_kms) if velocity_axis_kms is not None else 'N/A'}")
-                    
-                    group_detections = {}
-                    # Store 2D threshold masks for each group for visualization
-                    group_thresholds = {}
-                    logger.info(f"Starting line detection for {len(unique_groups)} mission/telescope/scan/subscan groups...")
-                    # Set seed for reproducible sampling across runs
-                    np.random.seed(42)
-                    for mission_id_group, telescope_group, scan_id, subscan_id in unique_groups:
-                        # Find spectra matching this mission/telescope/scan/subscan combination
-                        group_mask = (
-                            (mission_ids == mission_id_group) &
-                            (telescopes == telescope_group) &
-                            (scans == scan_id) &
-                            (subscans == subscan_id)
-                        )
-                        group_indices = np.where(group_mask)[0]
-                        if len(group_indices) == 0:
-                            continue
-                        
-                        # Get sample of spectra from this group (up to 20 to keep computation reasonable)
-                        # Use deterministic sampling with seed for reproducibility
-                        sample_size = min(20, len(group_indices))
-                        sample_indices_in_group = np.random.choice(np.arange(len(group_indices)), sample_size, replace=False)
-                        sample_indices = group_indices[sample_indices_in_group]
-                        group_sample = data[spectrum_col][indices[sample_indices]]
-                        
-                        # Detect lines in this group's sample (as 2D image to leverage smoothing/contours)
-                        try:
-                            group_threshold = find_science_lines(
-                                group_sample,
-                                kernel_size=self.line_kernel_size,
-                                cutoff_std=self.line_cutoff_std,
-                                smoothing_kernel=self.smoothing_kernel_size
-                            )
-                            
-                            if group_threshold is not None:
-                                # SAVE THE 2D THRESHOLD FOR VISUALIZATION
-                                group_key = (mission_id_group, telescope_group, scan_id, subscan_id)
-                                group_thresholds[group_key] = group_threshold
-                                
-                                # Get the detected line region from the 2D threshold
-                                line_channels_window = np.any(group_threshold, axis=0)
-                                if np.any(line_channels_window):
-                                    # Get the continuous channel range
-                                    line_indices = np.where(line_channels_window)[0]
-                                    ch_min = line_indices[0]
-                                    ch_max = line_indices[-1]
-                                    
-                                    logger.debug(f"  Sample detection for {mission_id_group}/{telescope_group}/scan{scan_id}/subscan{subscan_id}: channels {ch_min}-{ch_max}")
-                                    
-                                    # Apply the detected line mask to each spectrum in the group
-                                    # IMPORTANT: Only apply masks to spectra that were actually sampled and detected
-                                    # Do NOT apply fallback masks to unsampled spectra - they should have no mask
-                                    n_spectra_with_lines = 0
-                                    spectra_with_mask_list = []
-                                    
-                                    for group_spectrum_idx, global_spectrum_idx in enumerate(group_indices):
-                                        # Check if this spectrum was in the sample
-                                        # by seeing if its position matches any of the sample indices
-                                        sample_position_in_group = np.where(sample_indices_in_group == group_spectrum_idx)[0]
-                                        
-                                        if len(sample_position_in_group) > 0:
-                                            # This spectrum was in the sample, use its detection
-                                            threshold_row = sample_position_in_group[0]
-                                            line_mask = group_threshold[threshold_row]
-                                            
-                                            if np.any(line_mask):
-                                                # Apply this mask to the spectrum
-                                                # Convert global index to local index within filtered indices array
-                                                local_idx = np.where(indices == global_spectrum_idx)[0][0]
-                                                science_line_mask[local_idx] = line_mask
-                                                n_spectra_with_lines += 1
-                                                spectra_with_mask_list.append(global_spectrum_idx)
-                                        # else: spectrum wasn't sampled, so don't apply any mask
-                                    
-                                    if n_spectra_with_lines > 0:
-                                        # Record detection for logging
-                                        group_key = (mission_id_group, telescope_group, scan_id, subscan_id)
-                                        group_detections[group_key] = {
-                                            'ch_min': ch_min,
-                                            'ch_max': ch_max,
-                                            'n_channels': ch_max - ch_min + 1,
-                                            'n_spectra_with_mask': n_spectra_with_lines
-                                        }
-                                        logger.debug(f"    Applied to {n_spectra_with_lines} spectra")
-                                        logger.debug(f"    Applied to spectra indices: {spectra_with_mask_list}")
-                        except Exception as e:
-                            logger.debug(f"Line detection failed for {mission_id_group}/{telescope_group}/scan{scan_id}/subscan{subscan_id}: {e}")
-                    
-                    if group_detections:
-                        # Log summary of detections across all groups
-                        line_channels_any = np.any(science_line_mask, axis=0)
-                        n_line_channels = np.sum(line_channels_any)
-                        line_indices = np.where(line_channels_any)[0]
-                        ch_min = line_indices[0]
-                        ch_max = line_indices[-1]
-                        
-                        if velocity_axis_kms is not None:
-                            v_min = velocity_axis_kms[ch_min]
-                            v_max = velocity_axis_kms[ch_max]
-                            logger.info(f"  Detected science lines in {n_line_channels} channels "
-                                      f"({ch_min}-{ch_max}, {v_min:.1f}-{v_max:.1f} km/s)")
-                        else:
-                            logger.info(f"  Detected science lines in {n_line_channels} channels ({ch_min}-{ch_max})")
-                        
-                        # Report per-group statistics
-                        logger.info(f"  {len(group_detections)}/{len(unique_groups)} mission/telescope/scan/subscan groups with detected science lines")
-                        
-                        # DEBUG: Show how many unique mask patterns exist
-                        unique_masks = set()
-                        for row in science_line_mask:
-                            unique_masks.add(tuple(row))
-                        logger.info(f"  {len(unique_masks)} unique mask patterns across {len(science_line_mask)} spectra")
-                    else:
-                        logger.warning("  Could not detect science lines in any mission/telescope/scan/subscan group")
-                        science_line_mask = None
-                
-                except Exception as e:
-                    logger.warning(f"Line detection failed: {e}")
-                    science_line_mask = None
+            # Prepare for iterative line detection (following original pca_correct.py)
+            # Convert string columns to consistent format once
+            def to_string(x):
+                if isinstance(x, bytes):
+                    return x.decode('utf-8').strip()
+                return str(x).strip()
             
-            # NOTE: If no lines detected, don't apply fallback masking
-            # The config_window is only used by the old reduction pipeline as a protection window.
-            # For PCA correction, we want actual detected lines only, not speculative masking.
-            # The config_window is still passed through for reference but not used as a mask.
+            mission_ids = np.array([to_string(data['MISSION_ID'][i]) for i in indices])
+            telescopes = np.array([to_string(data['TELESCOP'][i]) for i in indices])
+            scans = np.array([to_string(x) for x in data['SCAN'][indices]])
+            subscans = np.array([to_string(x) for x in data['SUBSCAN'][indices]])
+            
+            # Get unique mission/telescope/scan/subscan combinations
+            unique_groups = np.unique(
+                np.column_stack((mission_ids, telescopes, scans, subscans)),
+                axis=0
+            )
+            
+            logger.info(f"  Found {len(unique_groups)} unique mission/telescope/scan/subscan groups")
+            logger.info(f"  Total spectra to process: {len(indices)}")
             
             # Load telluric line mask from mission parameters
             telluric_line_mask = None
@@ -998,32 +908,11 @@ class PCACorrector:
                         telluric_channels = np.any(telluric_line_mask, axis=0)
                         n_telluric_channels = np.sum(telluric_channels)
                         logger.info(f"  Loaded telluric line mask: {n_telluric_channels} channels masked")
-                        logger.debug(f"    telluric_line_mask shape: {telluric_line_mask.shape}, dtype: {telluric_line_mask.dtype}")
-                        # Show which channels are masked
-                        masked_ch_indices = np.where(telluric_channels)[0]
-                        if len(masked_ch_indices) > 0:
-                            logger.debug(f"    Masked channels: {masked_ch_indices[0]}-{masked_ch_indices[-1]} (indices)")
-                        
-                        # IMPORTANT: Remove telluric lines from science line detection
-                        # Following the same pattern as pca_correct.py
-                        # This ensures no line detection happens in telluric regions
-                        if len(group_thresholds) > 0:
-                            for group_key, threshold_2d in group_thresholds.items():
-                                # Zero out telluric channels in the 2D threshold
-                                threshold_2d[:, telluric_channels] = 0
-                            logger.debug(f"  Removed telluric regions from {len(group_thresholds)} group thresholds")
-                        
-                        # Also remove from science_line_mask
-                        for spec_idx in range(len(science_line_mask)):
-                            science_line_mask[spec_idx][telluric_channels] = False
-                        logger.debug(f"  Removed telluric regions from science_line_mask")
                 except Exception as e:
                     logger.debug(f"  Could not load telluric mask: {e}")
             
-            # Correct each spectrum
-            # Initialize with original data so uncorrected spectra (outside indices) stay unchanged
+            # Initialize corrected spectra and plots arrays
             corrected_spectra = data[spectrum_col].copy()
-            # IMPORTANT: Keep original spectra for plotting BEFORE any modifications
             original_spectra_for_plotting = data[spectrum_col].copy()
             correction_details = {}
             stats = {
@@ -1031,8 +920,175 @@ class PCACorrector:
                 'corrected': 0,
                 'failed': 0,
                 'components_used': [],
-                'lines_detected': science_line_mask is not None
+                'lines_detected': False
             }
+            
+            # ============================================================================
+            # ITERATIVE LINE DETECTION FOLLOWING ORIGINAL pca_correct.py APPROACH
+            # ============================================================================
+            # Step 1: First pass correction WITHOUT line mask to get preliminary corrected spectra
+            logger.info("STEP 1: First pass correction (without line detection mask)")
+            
+            prelim_corrected_spectra = corrected_spectra.copy()
+            detected_lines_mask = None
+            
+            for spec_idx, idx in enumerate(indices):
+                try:
+                    spectrum = data[spectrum_col][idx]
+                    
+                    # Select correct decomposition for this spectrum if using per-mission decompositions
+                    if mission_decompositions:
+                        spec_mission_id = data['MISSION_ID'][idx].strip()
+                        spec_telescope = data['TELESCOP'][idx].strip()
+                        decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
+                        if decomp is None:
+                            continue
+                        saved_components = self.components
+                        saved_variance_ratio = self.explained_variance_ratio
+                        self.components = decomp.components
+                        self.explained_variance_ratio = decomp.explained_variance_ratio
+                    
+                    # Check for bad channels only (no line mask yet)
+                    bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
+                    good_channels_for_fitting = ~bad_channels
+                    
+                    if not np.any(good_channels_for_fitting):
+                        correction_details[idx] = {'n_components_used': 0, 'skipped': True}
+                        if mission_decompositions:
+                            self.components = saved_components
+                            self.explained_variance_ratio = saved_variance_ratio
+                        continue
+                    
+                    # First pass: correct without line mask
+                    corrected, details = self.apply_correction(
+                        spectrum,
+                        good_channels=good_channels_for_fitting,
+                        good_channels_for_subtraction=good_channels_for_fitting,
+                        cutoff_variance=cutoff_variance,
+                        cutoff_noise_ratio=cutoff_noise_ratio,
+                        verbose=False
+                    )
+                    
+                    prelim_corrected_spectra[idx] = corrected
+                    correction_details[idx] = details
+                    
+                    if mission_decompositions:
+                        self.components = saved_components
+                        self.explained_variance_ratio = saved_variance_ratio
+                
+                except Exception as e:
+                    logger.debug(f"First pass correction failed for spectrum {idx}: {e}")
+                    correction_details[idx] = {'n_components_used': 0, 'skipped': True}
+            
+            # Step 2: Detect lines FROM the corrected spectra (following original pca_correct.py)
+            logger.info("STEP 2: Detecting lines from corrected spectra (iterative refinement)")
+            
+            detected_lines_mask = np.zeros((len(indices), len(velocity_axis_kms)), dtype=bool)
+            group_thresholds = {}
+            
+            # Detect lines from each group's corrected spectra (3 iterations like original)
+            for iteration in range(3):
+                logger.info(f"  Iteration {iteration + 1}/3 of line detection")
+                
+                for mission_id_group, telescope_group, scan_id, subscan_id in unique_groups:
+                    # Find spectra matching this mission/telescope/scan/subscan combination
+                    group_mask = (
+                        (mission_ids == mission_id_group) &
+                        (telescopes == telescope_group) &
+                        (scans == scan_id) &
+                        (subscans == subscan_id)
+                    )
+                    group_indices = np.where(group_mask)[0]
+                    if len(group_indices) == 0:
+                        continue
+                    
+                    # Get CORRECTED spectra from first pass for line detection
+                    group_corrected_spectra = prelim_corrected_spectra[indices[group_indices]]
+                    
+                    try:
+                        # Detect lines in the corrected spectra
+                        line_window_kms = None
+                        if hasattr(self, 'line_window_velocities') and self.line_window_velocities:
+                            line_window_kms = tuple(self.line_window_velocities)
+                        
+                        group_threshold = find_science_lines(
+                            group_corrected_spectra,
+                            kernel_size=self.line_kernel_size,
+                            cutoff_std=self.line_cutoff_std,
+                            smoothing_kernel=self.smoothing_kernel_size,
+                            velocity_axis_kms=velocity_axis_kms,
+                            velocity_window_kms=line_window_kms
+                        )
+                        
+                        if group_threshold is not None:
+                            # Save threshold for visualization (only on last iteration)
+                            if iteration == 2:
+                                group_key = (mission_id_group, telescope_group, scan_id, subscan_id)
+                                group_thresholds[group_key] = group_threshold
+                            
+                            # Apply detected lines to mask
+                            for group_spectrum_position, global_spectrum_idx in enumerate(group_indices):
+                                line_mask = group_threshold[group_spectrum_position]
+                                if np.any(line_mask):
+                                    local_idx = np.where(indices == global_spectrum_idx)[0][0]
+                                    detected_lines_mask[local_idx] = line_mask
+                    
+                    except Exception as e:
+                        logger.debug(f"Line detection failed for {mission_id_group}/{telescope_group}/scan{scan_id}/subscan{subscan_id}: {e}")
+                
+                # If last iteration, skip re-correction
+                if iteration < 2:
+                    # Re-correct with the current detected lines mask
+                    for spec_idx, idx in enumerate(indices):
+                        try:
+                            spectrum = data[spectrum_col][idx]
+                            
+                            if mission_decompositions:
+                                spec_mission_id = data['MISSION_ID'][idx].strip()
+                                spec_telescope = data['TELESCOP'][idx].strip()
+                                decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
+                                if decomp is None:
+                                    continue
+                                saved_components = self.components
+                                saved_variance_ratio = self.explained_variance_ratio
+                                self.components = decomp.components
+                                self.explained_variance_ratio = decomp.explained_variance_ratio
+                            
+                            bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
+                            good_channels_for_fitting = ~bad_channels
+                            good_channels_for_subtraction = good_channels_for_fitting.copy()
+                            
+                            # Exclude detected lines from subtraction (but use for fitting - like original)
+                            line_regions = detected_lines_mask[spec_idx]
+                            good_channels_for_subtraction = good_channels_for_subtraction & ~line_regions
+                            
+                            if not np.any(good_channels_for_fitting):
+                                if mission_decompositions:
+                                    self.components = saved_components
+                                    self.explained_variance_ratio = saved_variance_ratio
+                                continue
+                            
+                            # Re-correct with detected lines excluded from subtraction
+                            corrected, details = self.apply_correction(
+                                spectrum,
+                                good_channels=good_channels_for_fitting,
+                                good_channels_for_subtraction=good_channels_for_subtraction,
+                                cutoff_variance=cutoff_variance,
+                                cutoff_noise_ratio=cutoff_noise_ratio,
+                                verbose=False
+                            )
+                            
+                            prelim_corrected_spectra[idx] = corrected
+                            
+                            if mission_decompositions:
+                                self.components = saved_components
+                                self.explained_variance_ratio = saved_variance_ratio
+                        
+                        except Exception as e:
+                            logger.debug(f"Re-correction iteration {iteration + 1} failed for spectrum {idx}: {e}")
+            
+            # Step 3: Final correction with detected lines excluded from fitting
+            logger.info("STEP 3: Final correction with detected lines excluded from fitting")
             
             for spec_idx, idx in enumerate(indices):
                 try:
@@ -1054,29 +1110,31 @@ class PCACorrector:
                         self.components = decomp.components
                         self.explained_variance_ratio = decomp.explained_variance_ratio
                     
-                    # Check for bad channels (NaN, Inf, 0)
+                    # Check for bad channels
                     bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
-                    good_channels_for_fitting = ~bad_channels  # Channels for fitting (no NaN/Inf/0)
-                    good_channels_for_subtraction = ~bad_channels.copy()  # Channels where we actually subtract components
+                    good_channels_for_fitting = ~bad_channels
+                    good_channels_for_subtraction = good_channels_for_fitting.copy()
                     
                     n_good = np.sum(good_channels_for_fitting)
                     n_line = 0
                     
-                    # Apply science line mask - exclude from SUBTRACTION, but still use for FITTING
-                    if science_line_mask is not None:
-                        # Science lines are protected - don't subtract components there
-                        line_regions = science_line_mask[min(spec_idx, len(science_line_mask)-1)]
+                    # Exclude detected lines from FITTING (following original pca_correct.py)
+                    if detected_lines_mask is not None and np.any(detected_lines_mask):
+                        line_regions = detected_lines_mask[spec_idx]
+                        good_channels_for_fitting = good_channels_for_fitting & ~line_regions
                         good_channels_for_subtraction = good_channels_for_subtraction & ~line_regions
                         n_line = np.sum(line_regions)
+                        stats['lines_detected'] = True
                     
-                    # Apply telluric line mask - exclude from SUBTRACTION, but still use for FITTING
+                    # Also exclude telluric lines
                     if telluric_line_mask is not None:
                         telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask)-1)]
+                        good_channels_for_fitting = good_channels_for_fitting & ~telluric_regions
                         good_channels_for_subtraction = good_channels_for_subtraction & ~telluric_regions
 
                     
                     if not np.any(good_channels_for_fitting):
-                        logger.warning(f"Spectrum {idx}: no good channels for fitting (had {n_good} good, {n_line if science_line_mask is not None else 0} lines), skipping")
+                        logger.warning(f"Spectrum {idx}: no good channels for fitting (had {n_good} good, {n_line if detected_lines_mask is not None else 0} lines), skipping")
                         corrected_spectra[idx] = spectrum
                         # Record as skipped but still track it
                         correction_details[idx] = {'n_components_used': 0, 'skipped': True}
@@ -1087,7 +1145,7 @@ class PCACorrector:
                             self.explained_variance_ratio = saved_variance_ratio
                         continue
                     
-                    # Apply correction
+                    # Final correction with detected lines excluded from fitting
                     corrected, details = self.apply_correction(
                         spectrum, 
                         good_channels=good_channels_for_fitting,
@@ -1150,14 +1208,14 @@ class PCACorrector:
                 filtered_corrected = corrected_spectra[indices]
                 filtered_details = correction_details
                 
-                # Note: science_line_mask and telluric_line_mask are already sized for the filtered spectra
+                # Note: detected_lines_mask and telluric_line_mask are already sized for the filtered spectra
                 # (they were initialized as np.zeros((len(indices), n_channels))), so we pass them directly
                 # without further filtering
                 
                 # Generate plots with all filtered spectra
                 self._generate_plots(filtered_data, filtered_original, filtered_corrected, filtered_details,
                                    velocity_axis, mission_id, output_dir,
-                                   science_line_mask=science_line_mask,
+                                   science_line_mask=detected_lines_mask,
                                    telluric_line_mask=telluric_line_mask,
                                    input_fits=input_fits,
                                    group_thresholds=group_thresholds,
@@ -1185,12 +1243,11 @@ class PCACorrector:
         logger.info(f"Generating diagnostic plots...")
         
         # Debug logging for masks
-        logger.debug(f"_generate_plots called with science_line_mask: {science_line_mask is not None}")
-        logger.debug(f"_generate_plots called with telluric_line_mask: {telluric_line_mask is not None}")
+        logger.info(f"_generate_plots called with science_line_mask: {science_line_mask is not None}, telluric_line_mask: {telluric_line_mask is not None}")
         if science_line_mask is not None:
-            logger.debug(f"  science_line_mask shape: {science_line_mask.shape}")
+            logger.info(f"  science_line_mask shape: {science_line_mask.shape}, any detections: {np.any(science_line_mask)}")
         if telluric_line_mask is not None:
-            logger.debug(f"  telluric_line_mask shape: {telluric_line_mask.shape}")
+            logger.info(f"  telluric_line_mask shape: {telluric_line_mask.shape}")
         
         # Get unique scan/subscan/telescope combinations
         scans = data['SCAN']
@@ -1206,6 +1263,9 @@ class PCACorrector:
             unique_combos = unique_combos[::step]
         
         logger.info(f"Creating {len(unique_combos)} plots...")
+        logger.info(f"group_thresholds passed to _generate_plots: {len(group_thresholds) if group_thresholds else 0} groups")
+        if group_thresholds:
+            logger.info(f"  First few threshold keys: {list(group_thresholds.keys())[:3]}")
         
         plot_count = 0
         for scan, subscan, telescope in unique_combos:
@@ -1361,23 +1421,45 @@ class PCACorrector:
             n_sampled_for_threshold = None
             
             if group_thresholds is not None and len(group_thresholds) > 0:
+                # Convert scan/subscan/telescope to strings for consistent comparison
+                # (handles both byte strings and regular strings from FITS)
+                def to_string(x):
+                    if isinstance(x, bytes):
+                        return x.decode('utf-8').strip()
+                    return str(x).strip()
+                
+                scan_str = to_string(scan)
+                subscan_str = to_string(subscan)
+                telescope_str = to_string(telescope)
+                
                 # Try to find the threshold for THIS specific scan/subscan/telescope
                 # group_thresholds keys are: (mission_id, telescope, scan, subscan)
+                found_match = False
                 for group_key, thresh in group_thresholds.items():
                     group_mission_id, group_telescope, group_scan, group_subscan = group_key
                     # Match on scan, subscan, and telescope (mission_id should be same for all in this function)
-                    if (group_scan == str(scan) and 
-                        group_subscan == str(subscan) and 
-                        group_telescope == str(telescope)):
+                    # Convert group values to strings too to handle np.str_ and bytes
+                    if (to_string(group_scan) == scan_str and 
+                        to_string(group_subscan) == subscan_str and 
+                        to_string(group_telescope) == telescope_str):
                         threshold_2d = thresh
                         n_sampled_for_threshold = threshold_2d.shape[0]  # Number of spectra that were sampled
+                        found_match = True
+                        logger.info(f"Found threshold match for plot: scan={scan_str}, subscan={subscan_str}, telescope={telescope_str}")
                         break
+                
+                if not found_match:
+                    logger.debug(f"No exact match for scan={scan_str}, subscan={subscan_str}, telescope={telescope_str}")
                 
                 # If no exact match found, use the first available as fallback
                 if threshold_2d is None and len(group_thresholds) > 0:
+                    logger.debug(f"Using first available threshold as fallback")
                     threshold_2d = next(iter(group_thresholds.values()), None)
                     if threshold_2d is not None:
                         n_sampled_for_threshold = threshold_2d.shape[0]
+                
+                if threshold_2d is None:
+                    logger.debug(f"No threshold available for this plot")
             
             ax_before = fig.add_axes([2*padding + plot_width, 0.05, plot_width, 0.45])
             
@@ -1391,66 +1473,72 @@ class PCACorrector:
                                         interpolation='nearest', cmap='viridis')
             
             # Draw line detection contours as overlay if available
-            if science_line_mask is not None and len(science_line_mask) > 0:
+            # Use group_thresholds (2D detection result) for visualization,
+            # even if science_line_mask is None (which happens when no lines applied to individual spectra)
+            if threshold_2d is not None and n_sampled_for_threshold is not None:
+                logger.info(f"Attempting to draw contours for plot (threshold_2d shape: {threshold_2d.shape})")
                 try:
-                    import cv2 as cv
-                    
                     # Use actual 2D thresholds from group_thresholds if available
                     # This shows the actual line detections from OpenCV
-                    if threshold_2d is not None and n_sampled_for_threshold is not None:
-                        # Use threshold directly for the rows that were sampled
-                        # Don't interpolate - just overlay it on the first n_sampled rows
-                        threshold_2d_resized = threshold_2d[:min(n_sampled_for_threshold, n_display)].astype(bool)
-                        
-                        # Draw the 2D threshold mask as colored contours
-                        # For each row that has any True values, draw the boundaries
-                        for spectrum_idx in range(threshold_2d_resized.shape[0]):
-                            row = threshold_2d_resized[spectrum_idx]
-                            if np.any(row):
-                                # Find contiguous regions in this row
-                                diff = np.diff(row.astype(int))
-                                # -1 means transition from True to False, +1 means False to True
-                                starts = np.where(diff == 1)[0] + 1
-                                ends = np.where(diff == -1)[0] + 1
+                    logger.debug(f"Drawing contours: threshold_2d shape={threshold_2d.shape}, n_sampled={n_sampled_for_threshold}")
+                    from matplotlib.patches import Rectangle
+                    
+                    # Use threshold directly for the rows that were sampled
+                    # Don't interpolate - just overlay it on the first n_sampled rows
+                    threshold_2d_resized = threshold_2d[:min(n_sampled_for_threshold, n_display)].astype(bool)
+                    
+                    logger.debug(f"Drawing contours for {threshold_2d_resized.shape[0]} spectra with threshold")
+                    
+                    # Draw the 2D threshold mask as colored rectangles
+                    # For each row that has any True values, draw rectangles at the boundaries
+                    has_line_contours = False
+                    rect_count = 0
+                    for spectrum_idx in range(threshold_2d_resized.shape[0]):
+                        row = threshold_2d_resized[spectrum_idx]
+                        if np.any(row):
+                            has_line_contours = True
+                            # Find contiguous regions in this row
+                            diff = np.diff(row.astype(int))
+                            # +1 means False to True transition, -1 means True to False
+                            starts = np.where(diff == 1)[0] + 1
+                            ends = np.where(diff == -1)[0]
+                            
+                            # Handle edge cases
+                            if row[0]:
+                                starts = np.concatenate([[0], starts])
+                            if row[-1]:
+                                ends = np.concatenate([ends, [len(row)]])
+                            
+                            # Draw rectangles for each detected region
+                            for start, end in zip(starts, ends):
+                                # Convert channel indices to velocity/frequency coordinates
+                                x_start = np.interp(start, [0, len(row)], [x_axis[0], x_axis[-1]])
+                                x_end = np.interp(end, [0, len(row)], [x_axis[0], x_axis[-1]])
+                                x_width = x_end - x_start
                                 
-                                # Handle edge cases
-                                if row[0]:
-                                    starts = np.concatenate([[0], starts])
-                                if row[-1]:
-                                    ends = np.concatenate([ends, [len(row)]])
-                                
-                                # Draw vertical lines at boundaries
-                                for start, end in zip(starts, ends):
-                                    # Convert channel indices to frequency/velocity coordinates
-                                    x_start = np.interp(start, [0, len(row)], [x_axis[0], x_axis[-1]])
-                                    x_end = np.interp(end, [0, len(row)], [x_axis[0], x_axis[-1]])
-                                    
-                                    # Use normalized coordinates for consistency
-                                    # spectrum_idx ranges from 0 to len(threshold_2d_resized)-1
-                                    # We need to normalize to [0, n_display] range
-                                    y_norm_start = spectrum_idx / n_display
-                                    y_norm_end = (spectrum_idx + 0.9) / n_display
-                                    
-                                    # Draw vertical bars marking the detected line regions
-                                    ax_before.axvline(x_start, ymin=y_norm_start, 
-                                                    ymax=y_norm_end,
-                                                    color='yellow', linewidth=1.5, alpha=0.8)
-                                    ax_before.axvline(x_end, ymin=y_norm_start,
-                                                    ymax=y_norm_end,
-                                                    color='yellow', linewidth=1.5, alpha=0.8)
-                                    # Fill the region between using NORMALIZED coordinates
-                                    # Convert to 0-1 range for fill_betweenx with transform
-                                    ax_before.fill_betweenx([spectrum_idx, spectrum_idx+0.9],
-                                                           x_start, x_end,
-                                                           color='yellow', alpha=0.15,
-                                                           transform=ax_before.get_xaxis_transform())
-                        has_line_contours = True
-                    else:
-                        has_line_contours = False
+                                # Draw rectangle: (x, y, width, height)
+                                # y is spectrum_idx (0 at top), height is 1 spectrum
+                                # Note: imshow with extent puts y=0 at top and increases downward
+                                rect = Rectangle(
+                                    (x_start, spectrum_idx),  # lower left corner
+                                    x_width,  # width
+                                    1.0,  # height (1 spectrum)
+                                    linewidth=1.5,
+                                    edgecolor='yellow',
+                                    facecolor='yellow',
+                                    alpha=0.3
+                                )
+                                ax_before.add_patch(rect)
+                                rect_count += 1
+                    
+                    logger.info(f"Contours drawn: {rect_count} rectangles, has_line_contours={has_line_contours}")
                 except Exception as e:
+                    import traceback
                     logger.debug(f"Error drawing line contours: {e}")
+                    logger.debug(traceback.format_exc())
                     has_line_contours = False
             else:
+                logger.debug(f"Skipping contours: science_line_mask is {science_line_mask is None}")
                 has_line_contours = False
             
             # Add annotation showing line detection status
@@ -1499,34 +1587,93 @@ class PCACorrector:
             # ==================================================================
             # COLUMN 4: MASKED ARRAY + COEFFICIENTS HEATMAP (TOP-RIGHT)
             # ==================================================================
-            # Masked array visualization: show the spectra used for fitting with masks overlaid
-            # This matches the original pca_correct.py which shows actual spectrum values
-            # with masking information encoded in the data
+            # Masked array visualization: show science spectra with masks applied
+            # This is the same science spectra as "Before Correction" but with masks shown
             ax_masked = fig.add_axes([4*padding + 3*plot_width, 0.55, plot_width, 0.35])
             
-            # Create a version of the spectra with masked channels replaced by NaN or zero
-            # to visualize which regions are masked
-            masked_spec_display = original_spectra_subset[:n_display].copy()
+            # Use the same science spectra as the Before Correction plot
+            masked_science_spectra = original_spectra_subset[:n_display].copy()
             
-            # Mark masked regions (science lines + telluric) as NaN so they appear as white/empty
-            for spec_idx in range(n_display):
-                # Mark science line regions as NaN if present
-                if science_line_mask is not None and spec_idx < len(science_line_mask):
-                    science_regions = science_line_mask[spec_idx]
-                    masked_spec_display[spec_idx, science_regions] = np.nan
-                
-                # Mark telluric line regions as NaN if present
-                if telluric_line_mask is not None and spec_idx < len(telluric_line_mask):
-                    telluric_regions = telluric_line_mask[spec_idx]
-                    masked_spec_display[spec_idx, telluric_regions] = np.nan
+            # ====================================================================
+            # IMPORTANT: Apply masks PER-SPECTRUM, not as union!
+            # This matches the original pca_correct.py behavior where each spectrum
+            # has its own apply_mask = bad_channels OR detected_lines[spec_idx]
+            # ====================================================================
             
-            im_masked = ax_masked.imshow(masked_spec_display, aspect='auto',
+            # 1. Apply BAD CHANNELS uniformly (vertical lines - same for all spectra)
+            # These are channels that are NaN/Inf/zero in the original data
+            bad_channel_mask = np.isnan(original_spectra_subset[:n_display]) | \
+                               np.isinf(original_spectra_subset[:n_display]) | \
+                               (original_spectra_subset[:n_display] == 0)
+            # Get which channels are bad in ANY spectrum (will show as vertical lines)
+            bad_channels_any = np.any(bad_channel_mask, axis=0)
+            masked_science_spectra[:, bad_channels_any] = 0
+            
+            # 2. Apply TELLURIC CHANNELS uniformly (vertical lines - same for all spectra)
+            if telluric_line_mask is not None:
+                # Get channels that are masked in ANY spectrum (uniform across all)
+                telluric_masked_channels = np.any(telluric_line_mask, axis=0)
+                masked_science_spectra[:, telluric_masked_channels] = 0
+            
+            # 3. Apply DETECTED LINE CHANNELS PER-SPECTRUM (different for each row)
+            # This is the key difference: detected lines vary by spectrum
+            if threshold_2d is not None and len(threshold_2d) > 0:
+                # Apply each spectrum's detected lines to that row only
+                for spec_idx in range(min(len(threshold_2d), n_display)):
+                    detected_channels = threshold_2d[spec_idx].astype(bool)
+                    if np.any(detected_channels):
+                        masked_science_spectra[spec_idx, detected_channels] = 0
+            
+            im_masked = ax_masked.imshow(masked_science_spectra, aspect='auto',
                                         extent=[x_axis[0], x_axis[-1], n_display, 0],
                                         interpolation='nearest', cmap='viridis')
-            ax_masked.set_title(f'Spectra Used for Fitting\n(white=masked regions)', fontsize=10)
+            
+            # Draw the same line detection contours as in the Before Correction plot
+            if threshold_2d is not None and n_sampled_for_threshold is not None:
+                try:
+                    from matplotlib.patches import Rectangle
+                    threshold_2d_resized = threshold_2d[:min(n_sampled_for_threshold, n_display)].astype(bool)
+                    rect_count = 0
+                    for spectrum_idx in range(threshold_2d_resized.shape[0]):
+                        row = threshold_2d_resized[spectrum_idx]
+                        if np.any(row):
+                            # Find contiguous regions in this row
+                            diff = np.diff(row.astype(int))
+                            starts = np.where(diff == 1)[0] + 1
+                            ends = np.where(diff == -1)[0]
+                            
+                            # Handle edge cases
+                            if row[0]:
+                                starts = np.concatenate([[0], starts])
+                            if row[-1]:
+                                ends = np.concatenate([ends, [len(row)]])
+                            
+                            # Draw rectangles for each detected region
+                            for start, end in zip(starts, ends):
+                                # Convert channel indices to velocity/frequency coordinates
+                                x_start = np.interp(start, [0, len(row)], [x_axis[0], x_axis[-1]])
+                                x_end = np.interp(end, [0, len(row)], [x_axis[0], x_axis[-1]])
+                                x_width = x_end - x_start
+                                
+                                # Draw rectangle: (x, y, width, height)
+                                rect = Rectangle(
+                                    (x_start, spectrum_idx),  # lower left corner
+                                    x_width,  # width
+                                    1.0,  # height (1 spectrum)
+                                    linewidth=1.5,
+                                    edgecolor='yellow',
+                                    facecolor='yellow',
+                                    alpha=0.3
+                                )
+                                ax_masked.add_patch(rect)
+                                rect_count += 1
+                except Exception as e:
+                    logger.debug(f"Error drawing contours on masked plot: {e}")
+            
+            ax_masked.set_title(f'Spectra Used for Fitting\n({n_display} specs with masks)', fontsize=10)
             ax_masked.set_xlabel(x_label, fontsize=9)
             ax_masked.set_ylabel('Spectrum #', fontsize=9)
-            ax_masked.set_ylim(n_display, 0)  # Top to bottom
+            ax_masked.set_ylim(n_display, 0)  # Top to bottom - same height as Before Correction
             fig.colorbar(im_masked, ax=ax_masked, pad=0.02)
             ax_masked.tick_params(labelsize=8)
             
@@ -1568,17 +1715,7 @@ class PCACorrector:
             corrected_ex = corrected_spectra_subset[example_idx]
             example_global_idx = usable_global_indices[example_idx]
             
-            # Plot original spectrum
-            ax_ex_orig = fig.add_axes([5*padding + 4*plot_width, 0.65, plot_width, 0.25])
-            ax_ex_orig.plot(x_axis, original_ex, 'k-', lw=1.5)
-            ax_ex_orig.set_title(f'Example Spectrum #{example_global_idx}\n(Median Correction)', fontsize=10)
-            ax_ex_orig.grid(True, alpha=0.3)
-            ax_ex_orig.tick_params(labelsize=8)
-            
-            # Plot correction for each component
-            n_comp_show = min(3, len(self.components))
-            spec_height = 0.55 / n_comp_show
-            
+            # Get component info for this spectrum
             if example_global_idx in correction_details:
                 details = correction_details[example_global_idx]
                 comp_info = details.get('component_info', {})
@@ -1587,16 +1724,25 @@ class PCACorrector:
                 comp_info = {}
                 coeffs = np.zeros(len(self.components))
             
+            # Plot correction for each component (show all components)
+            n_comp_show = len(self.components)
+            # Allocate space evenly for all components (no separate title, use title area for first component)
+            spec_height = 0.90 / n_comp_show
+            
             for comp_idx in range(n_comp_show):
+                # First component gets title above it
+                y_pos = 0.90 - (comp_idx + 1)*spec_height
+                
                 ax_ex_comp = fig.add_axes([5*padding + 4*plot_width, 
-                                          0.55 - (comp_idx + 1)*spec_height, 
+                                          y_pos, 
                                           plot_width, spec_height])
                 
-                # Plot original and component contribution
+                # Plot original, corrected, and component contribution
                 ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=0.5, alpha=0.5, label='Orig')
+                ax_ex_comp.plot(x_axis, corrected_ex, color='gray', lw=0.8, alpha=0.7, label='Corr')
                 
                 scaled_comp = coeffs[comp_idx] * self.components[comp_idx]
-                ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Fitted Comp')
+                ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')
                 
                 info = comp_info.get(comp_idx, {})
                 used = info.get('used', False)
@@ -1604,21 +1750,29 @@ class PCACorrector:
                 noise_ratio = info.get('noise_ratio', 0)
                 
                 # Create label
-                label_text = f"comp: {comp_idx+1}; coeff: {coeff_val:.2f}; noise_ratio: {noise_ratio:.1f}"
+                label_text = f"C{comp_idx+1}: coeff={coeff_val:.2f}, NR={noise_ratio:.1f}"
                 if not used:
                     label_text += " (NOT USED)"
-                    ax_ex_comp.text(0.03, 0.9, label_text, transform=ax_ex_comp.transAxes,
-                                  fontsize=7, va='top', color='red')
+                    ax_ex_comp.text(0.03, 0.85, label_text, transform=ax_ex_comp.transAxes,
+                                  fontsize=7, va='top', color='red', fontweight='bold')
                 else:
-                    ax_ex_comp.text(0.03, 0.9, label_text, transform=ax_ex_comp.transAxes,
-                                  fontsize=7, va='top', color='green')
+                    ax_ex_comp.text(0.03, 0.85, label_text, transform=ax_ex_comp.transAxes,
+                                  fontsize=7, va='top', color='green', fontweight='bold')
+                
+                # Add title above first component
+                if comp_idx == 0:
+                    ax_ex_comp.text(0.5, 1.15, f'Example Spectrum #{example_global_idx}\n(Median Correction)',
+                                  transform=ax_ex_comp.transAxes, ha='center', va='bottom',
+                                  fontsize=9, fontweight='bold')
                 
                 ax_ex_comp.grid(True, alpha=0.3)
                 ax_ex_comp.tick_params(labelsize=7)
-                ax_ex_comp.set_ylabel(f'C{comp_idx+1}', fontsize=8)
+                
+                if comp_idx == 0:
+                    ax_ex_comp.legend(fontsize=7, loc='upper right')
                 
                 if comp_idx == n_comp_show - 1:
-                    ax_ex_comp.set_xlabel(x_label, fontsize=9)
+                    ax_ex_comp.set_xlabel(x_label, fontsize=8)
             
             fig.suptitle(f'{mission_id} | Scan {scan} | Subscan {subscan} | {telescope} | {len(usable_local_indices)} Spectra', 
                         fontsize=12, fontweight='bold')
@@ -2072,13 +2226,18 @@ Examples:
         
         # Create corrector and apply correction
         logger.info("Initializing PCA corrector...")
+        
+        # Get line_window from [reduction] section (already extracted above)
+        line_window_velocities = tuple(config_line_window) if config_line_window else None
+        
         if decomposition_file:
             # Use single decomposition file
             corrector = PCACorrector(
                 str(decomp_path),
                 line_kernel_size=args.line_kernel_size,
                 line_cutoff_std=args.line_cutoff_std,
-                smoothing_kernel_size=args.smoothing_kernel
+                smoothing_kernel_size=args.smoothing_kernel,
+                line_window_velocities=line_window_velocities
             )
             mission_decompositions_to_use = None
         else:
@@ -2105,12 +2264,12 @@ Examples:
                     temp_decomp_path,
                     line_kernel_size=args.line_kernel_size,
                     line_cutoff_std=args.line_cutoff_std,
-                    smoothing_kernel_size=args.smoothing_kernel
+                    smoothing_kernel_size=args.smoothing_kernel,
+                    line_window_velocities=line_window_velocities
                 )
             finally:
                 # Clean up temp file
                 os.unlink(temp_decomp_path)
-            
             mission_decompositions_to_use = mission_decompositions
         
         logger.info("Applying PCA correction...")
