@@ -67,3 +67,21 @@ env/
 
 # Test files
 tests/
+
+# Generated output files (should not be version controlled)
+output/pca_components/*.pkl
+output/pca_plots/
+output/**/*.fits
+output/**/*.fits.gz
+pca_corrected.fits
+prepared_for_pca.fits
+reduced_data.fits
+clean_data.fits
+rejected_data.fits
+averaged_data.fits
+datacube.fits
+
+# Generated data files
+*.fits
+*.fits.gz
+
