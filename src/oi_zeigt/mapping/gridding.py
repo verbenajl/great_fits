@@ -22,7 +22,8 @@ try:
     HAS_CYGRID = True
 except (ImportError, ValueError) as e:
     # ValueError can occur due to numpy binary incompatibility
-    warnings.warn(f"cygrid not available ({type(e).__name__}) - using scipy griddata instead", UserWarning)
+    # Warning will be shown only when gridding is actually attempted (not at module import)
+    pass
 
 
 def get_gridding_params_from_config(config_path: Optional[str] = None,
@@ -615,7 +616,8 @@ def grid_spectra_with_cygrid(hdul: fits.HDUList,
         # Get the gridded data
         grid_map = gridder.get_datacube()  # Returns 2D array (naxis2, naxis1)
     else:
-        # Fallback to scipy
+        # Fallback to scipy (cygrid not available)
+        warnings.warn("cygrid not available - using scipy griddata instead (less accurate for astronomical data)", UserWarning)
         from scipy.interpolate import griddata
         
         ra_grid = np.linspace(ra_min, ra_max, naxis1)
@@ -710,11 +712,18 @@ def create_integrated_map(hdul: fits.HDUList,
                          beamsize_deg: float = 0.25,
                          pixsize: Optional[float] = None,
                          figsize: Tuple[int, int] = (10, 8),
-                         show_scatter: bool = False) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+                         show_scatter: bool = False,
+                         velocity_range: Optional[Tuple[float, float]] = None) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Create a spatial map from integrated spectral intensity.
     
-    Integrates spectra across all channels, then grids with proper WCS.
+    Integrates spectra across all channels (or specified velocity range), then grids with proper WCS.
+    
+    Parameters
+    ----------
+    velocity_range : tuple or None
+        (v_min, v_max) in km/s to restrict integration to this velocity range.
+        If None, integrates entire spectrum.
     """
     # Find ALL binary tables with the required spectrum column (supports multi-HDU files)
     matrix_hdus = []
@@ -751,6 +760,52 @@ def create_integrated_map(hdul: fits.HDUList,
         ras = ras[mask]
         decs = decs[mask]
         spectra = spectra[mask]
+    
+    # Apply velocity range filtering if specified
+    if velocity_range is not None:
+        v_min, v_max = velocity_range
+        
+        # Get header for velocity axis computation
+        header = hdul[0].header if len(hdul) > 0 else {}
+        
+        # Extract velocity calibration parameters (prefer VELOCITY/DELTAV columns, fallback to header)
+        try:
+            n_channels = spectra.shape[1]
+            
+            # Try to get velocity from data columns first (units: m/s)
+            if 'VELOCITY' in data.dtype.names and 'DELTAV' in data.dtype.names:
+                velo_ref = float(data['VELOCITY'][0]) / 1000.0  # Convert m/s to km/s
+                deltav = float(data['DELTAV'][0]) / 1000.0      # Convert m/s to km/s
+            else:
+                # Fallback to header (CRVAL3/CDELT3 units depend on CUNIT3)
+                velo_ref = header.get('CRVAL3', 0.0)
+                deltav = header.get('CDELT3', 1.0)
+                
+                # Check units and convert if necessary
+                cunit3 = header.get('CUNIT3', 'm/s')
+                if 'm/s' in str(cunit3).lower():
+                    velo_ref = velo_ref / 1000.0  # Convert m/s to km/s
+                    deltav = deltav / 1000.0
+            
+            crpix1_spec = header.get('CRPIX1', 1.0)
+            
+            # Compute velocity axis in km/s
+            channel_indices = np.arange(n_channels, dtype=np.float64)
+            velocity_axis = velo_ref + (channel_indices - (crpix1_spec - 1.0)) * deltav
+            
+            # Find channel range for this velocity window
+            ch_min = np.argmin(np.abs(velocity_axis - v_min))
+            ch_max = np.argmin(np.abs(velocity_axis - v_max))
+            ch_min, ch_max = min(ch_min, ch_max), max(ch_min, ch_max)
+            
+            # Include both boundary channels
+            ch_max = min(ch_max + 1, n_channels)
+            
+            # Slice spectra to velocity range
+            spectra = spectra[:, ch_min:ch_max]
+            
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
+            raise ValueError(f"Cannot compute velocity axis from data/header: {e}")
     
     # Compute integrated intensity
     integrated = np.nansum(spectra, axis=1)
@@ -823,7 +878,8 @@ def create_integrated_map(hdul: fits.HDUList,
         # Get the gridded data
         grid_map = gridder.get_datacube()  # Returns 2D array (naxis2, naxis1)
     else:
-        # Fallback to scipy
+        # Fallback to scipy (cygrid not available)
+        warnings.warn("cygrid not available - using scipy griddata instead (less accurate for astronomical data)", UserWarning)
         from scipy.interpolate import griddata
         
         ra_grid = np.linspace(ra_min, ra_max, naxis1)
@@ -1199,7 +1255,8 @@ def create_spectral_datacube(hdul: fits.HDUList,
                 points = np.column_stack([ras_valid, decs_valid])
                 channel_map = griddata(points, data_valid, (ra_mesh, dec_mesh), method='linear')
         else:
-            # Use scipy
+            # Use scipy (cygrid not available)
+            warnings.warn("cygrid not available - using scipy griddata instead (less accurate for astronomical data)", UserWarning)
             from scipy.interpolate import griddata
             ra_grid = np.linspace(ra_min, ra_max, naxis1)
             dec_grid = np.linspace(dec_min, dec_max, naxis2)

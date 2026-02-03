@@ -20,7 +20,7 @@ Usage:
 
 Output:
     Creates one pickle file per mission/telescope combination:
-    output/pca_components/decomposition_<MISSION_ID>_<TELESCOP>_<DATE>_components.pkl
+    output/pca_components/decomposition_<MISSION_ID>_<TELESCOP>_components.pkl
 """
 
 import sys
@@ -128,12 +128,33 @@ def load_spectra_by_mission(fits_file: str) -> Dict[str, Dict]:
                 sky_indices = np.where(mask)[0]
                 logger.info(f"    └─ (no OBJECT filter, using all {n_spectra} spectra)")
             
-            # Get date from first spectrum
+            # Get date from first spectrum (YYYYMMDD format)
             if 'DATE-OBS' in mission_spectra.dtype.names:
                 date_obs = str(mission_spectra['DATE-OBS'][0])
                 if isinstance(date_obs, bytes):
                     date_obs = date_obs.decode().strip()
-                flight_date = date_obs.split('T')[0].replace('-', '')
+                # Extract just the date part (YYYY-MM-DD format or variations)
+                date_part = date_obs.split('T')[0]
+                # Split by dash to get year, month, day parts
+                date_parts = date_part.split('-')
+                if len(date_parts) == 3:
+                    try:
+                        # Reconstruct as YYYYMMDD with proper zero-padding
+                        year = str(date_parts[0]).zfill(4)
+                        month = str(date_parts[1]).zfill(2)
+                        day = str(date_parts[2]).zfill(2)
+                        flight_date = f"{year}{month}{day}"
+                        if len(flight_date) != 8:
+                            logger.warning(f"Unexpected date format: DATE-OBS={date_obs}")
+                            flight_date = 'unknown'
+                        else:
+                            logger.debug(f"Extracted flight_date={flight_date} from DATE-OBS={date_obs}")
+                    except (ValueError, AttributeError):
+                        logger.warning(f"Could not parse date: DATE-OBS={date_obs}")
+                        flight_date = 'unknown'
+                else:
+                    logger.warning(f"Unexpected date format (not YYYY-MM-DD): DATE-OBS={date_obs}")
+                    flight_date = 'unknown'
             else:
                 flight_date = 'unknown'
             
@@ -336,7 +357,7 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
     return result
 
 
-def save_results(result: DecompositionResult, mission_id: str, telescop: str, flight_date: str) -> Path:
+def save_results(result: DecompositionResult, mission_id: str, telescop: str) -> Path:
     """
     Save decomposition result to pickle file.
     
@@ -345,11 +366,9 @@ def save_results(result: DecompositionResult, mission_id: str, telescop: str, fl
     result : DecompositionResult
         Decomposition result to save
     mission_id : str
-        Mission identifier for filename
+        Mission identifier for filename (includes date like 2017-02-01_...)
     telescop : str
         Telescope identifier for filename
-    flight_date : str
-        Flight date for filename
     
     Returns
     -------
@@ -361,7 +380,7 @@ def save_results(result: DecompositionResult, mission_id: str, telescop: str, fl
     
     # Replace special characters in telescope name for filesystem safety
     safe_telescop = telescop.replace('/', '_').replace(' ', '_')
-    output_file = output_dir / f"decomposition_{mission_id}_{safe_telescop}_{flight_date}_components.pkl"
+    output_file = output_dir / f"decomposition_{mission_id}_{safe_telescop}_components.pkl"
     
     with open(output_file, 'wb') as f:
         pickle.dump({
@@ -547,7 +566,7 @@ def main_cli():
             results[key] = result
             
             # Save
-            output_file = save_results(result, mission_id, telescop, data['date'])
+            output_file = save_results(result, mission_id, telescop)
             output_files.append(output_file)
         
         # Summary
@@ -611,7 +630,7 @@ def main_cli():
                             
                             # Safe telescope name for filename
                             safe_telescop = telescop.replace('/', '_').replace(' ', '_')
-                            components_path = output_dir / f"pca_components_{mission_id}_{safe_telescop}_{flight_date}.png"
+                            components_path = output_dir / f"pca_components_{mission_id}_{safe_telescop}.png"
                             plt.savefig(components_path, dpi=150, bbox_inches='tight')
                             plt.close(fig)
                             logger.info(f"✓ Saved component plots to {components_path}")
@@ -643,7 +662,7 @@ def main_cli():
                             ax2.set_ylim(0, 105)
                             
                             plt.tight_layout()
-                            variance_path = output_dir / f"pca_variance_{mission_id}_{safe_telescop}_{flight_date}.png"
+                            variance_path = output_dir / f"pca_variance_{mission_id}_{safe_telescop}.png"
                             plt.savefig(variance_path, dpi=150, bbox_inches='tight')
                             plt.close(fig2)
                             logger.info(f"✓ Saved variance plots to {variance_path}")

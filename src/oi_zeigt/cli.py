@@ -47,19 +47,18 @@ def _print_fits_details(hdul):
         if hdu.header:
             click.echo(f"  Header keywords: {len(hdu.header)}")
         click.echo()
-    
-    # Print object information
-    _print_object_info(hdul)
 
 
-def _print_object_info(hdul):
+def _print_object_info(hdul, object_filter=None):
     """
-    Print information about unique objects in the FITS file.
+    Print information about unique objects, AOR_IDs, and MISSION_IDs in the FITS file.
     
     Parameters
     ----------
     hdul : astropy.io.fits.HDUList
         The FITS HDU list to analyze.
+    object_filter : str, optional
+        If provided, only display entries matching this substring in the OBJECT column.
     """
     # Look for OBJECT column in binary tables
     for hdu in hdul:
@@ -86,6 +85,99 @@ def _print_object_info(hdul):
                 for obj, count in sorted_objects:
                     obj_str = obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()
                     click.echo(f"  {obj_str:<{max_obj_len}}  : {count:6d} entries")
+                
+                click.echo("="*70 + "\n")
+            
+            # Filter data by object if object_filter is provided
+            if object_filter and 'OBJECT' in hdu.data.dtype.names:
+                objects = hdu.data['OBJECT']
+                mask = np.array([
+                    object_filter.upper() in (obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()).upper()
+                    for obj in objects
+                ])
+                filtered_data = hdu.data[mask]
+                
+                click.echo("="*70)
+                click.echo(f"FILTERED DATA (OBJECT contains '{object_filter}')")
+                click.echo("="*70)
+                click.echo(f"Total entries matching filter: {np.sum(mask)}\n")
+                
+                # Show AOR_IDs for filtered data
+                if 'AOR_ID' in hdu.data.dtype.names:
+                    filtered_aor_ids = filtered_data['AOR_ID']
+                    aor_id_counts = Counter(filtered_aor_ids)
+                    
+                    click.echo(f"AOR_IDs in filtered data ({len(aor_id_counts)} unique):")
+                    sorted_aor_ids = sorted(aor_id_counts.items(), key=lambda x: x[1], reverse=True)
+                    max_aor_len = max(len(aor_id.decode() if isinstance(aor_id, bytes) else aor_id) 
+                                      for aor_id, _ in sorted_aor_ids)
+                    
+                    for aor_id, count in sorted_aor_ids:
+                        aor_id_str = aor_id.decode().strip() if isinstance(aor_id, bytes) else str(aor_id).strip()
+                        click.echo(f"  {aor_id_str:<{max_aor_len}}  : {count:6d} entries")
+                
+                # Show MISSION_IDs for filtered data
+                if 'MISSION_ID' in hdu.data.dtype.names:
+                    filtered_mission_ids = filtered_data['MISSION_ID']
+                    mission_id_counts = Counter(filtered_mission_ids)
+                    
+                    click.echo(f"\nMISSION_IDs in filtered data ({len(mission_id_counts)} unique):")
+                    sorted_mission_ids = sorted(mission_id_counts.items(), key=lambda x: x[1], reverse=True)
+                    max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id) 
+                                          for mission_id, _ in sorted_mission_ids)
+                    
+                    for mission_id, count in sorted_mission_ids:
+                        mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
+                        click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
+                
+                click.echo("="*70 + "\n")
+                return  # Skip the general AOR/MISSION display if we're showing filtered data
+            
+            # Check for AOR_ID column (only if not filtered)
+            if 'AOR_ID' in hdu.data.dtype.names:
+                aor_ids = hdu.data['AOR_ID']
+                
+                # Get unique AOR_IDs and their counts
+                aor_id_counts = Counter(aor_ids)
+                
+                click.echo("="*70)
+                click.echo("UNIQUE AOR_IDS IN FITS FILE")
+                click.echo("="*70)
+                click.echo(f"Total unique AOR_IDs: {len(aor_id_counts)}\n")
+                
+                # Sort by count (descending)
+                sorted_aor_ids = sorted(aor_id_counts.items(), key=lambda x: x[1], reverse=True)
+                
+                max_aor_len = max(len(aor_id.decode() if isinstance(aor_id, bytes) else aor_id) 
+                                  for aor_id, _ in sorted_aor_ids)
+                
+                for aor_id, count in sorted_aor_ids:
+                    aor_id_str = aor_id.decode().strip() if isinstance(aor_id, bytes) else str(aor_id).strip()
+                    click.echo(f"  {aor_id_str:<{max_aor_len}}  : {count:6d} entries")
+                
+                click.echo("="*70 + "\n")
+            
+            # Check for MISSION_ID column (only if not filtered)
+            if 'MISSION_ID' in hdu.data.dtype.names:
+                mission_ids = hdu.data['MISSION_ID']
+                
+                # Get unique MISSION_IDs and their counts
+                mission_id_counts = Counter(mission_ids)
+                
+                click.echo("="*70)
+                click.echo("UNIQUE MISSION_IDS IN FITS FILE")
+                click.echo("="*70)
+                click.echo(f"Total unique MISSION_IDs: {len(mission_id_counts)}\n")
+                
+                # Sort by count (descending)
+                sorted_mission_ids = sorted(mission_id_counts.items(), key=lambda x: x[1], reverse=True)
+                
+                max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id) 
+                                      for mission_id, _ in sorted_mission_ids)
+                
+                for mission_id, count in sorted_mission_ids:
+                    mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
+                    click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
                 
                 click.echo("="*70 + "\n")
 
@@ -121,6 +213,19 @@ def print_fits_info(config: Optional[str], fits: Optional[str]):
         print_fits_info
     """
     try:
+        # Load config to get object filter if available
+        object_filter = None
+        if config:
+            try:
+                import tomllib
+            except ModuleNotFoundError:
+                import tomli as tomllib
+            
+            with open(config, 'rb') as f:
+                cfg = tomllib.load(f)
+                parameters_cfg = cfg.get('parameters', {})
+                object_filter = parameters_cfg.get('object', None)
+        
         # Read FITS file
         if fits:
             click.echo(f"Reading FITS file: {fits}")
@@ -133,6 +238,7 @@ def print_fits_info(config: Optional[str], fits: Optional[str]):
             hdul = read_fits_from_config()
         
         _print_fits_details(hdul)
+        _print_object_info(hdul, object_filter=object_filter)
         hdul.close()
         
     except FileNotFoundError as e:
@@ -1043,28 +1149,27 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
             except (ValueError, TypeError, IndexError):
                 pass
         
-        if baseline:
+        # Check if baseline should be applied (either from --baseline flag or from config)
+        baseline_from_config = reduction_cfg.get('baseline', None)
+        baseline_window_from_config = reduction_cfg.get('line_window', None)
+        
+        if baseline or baseline_from_config:
             # Get baseline order
             if baseline_order is None:
-                reduction_cfg = cfg.get('reduction', {})
-                baseline_order = reduction_cfg.get('baseline_order', 
-                                                   reduction_cfg.get('baseline', 1))
+                baseline_order = baseline_from_config if baseline_from_config else 1
                 try:
                     baseline_order = int(baseline_order)
                 except Exception:
                     baseline_order = 1
             
-            # Get baseline window
-            if baseline_window is None:
-                reduction_cfg = cfg.get('reduction', {})
-                window_cfg = reduction_cfg.get('window', None)
-                if window_cfg is not None:
-                    try:
-                        if isinstance(window_cfg, (list, tuple)) and len(window_cfg) == 2:
-                            # Window from config is in km/s
-                            baseline_window = window_cfg
-                    except (ValueError, TypeError, IndexError):
-                        baseline_window = None
+            # Get baseline window from line_window in config if not specified via CLI
+            if baseline_window is None and baseline_window_from_config is not None:
+                try:
+                    if isinstance(baseline_window_from_config, (list, tuple)) and len(baseline_window_from_config) == 2:
+                        # Window from config is in km/s
+                        baseline_window = baseline_window_from_config
+                except (ValueError, TypeError, IndexError):
+                    baseline_window = None
             
             methods['baseline'] = {
                 'order': baseline_order,
@@ -1105,15 +1210,31 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
         click.echo(f"\n✓ Spectral reduction complete.")
         click.echo(f"  Output: {output_path}")
         click.echo(f"  Methods applied:")
+        
+        methods_applied = False
         if unblank:
             click.echo(f"    - Unblank (fill NaN values with linear interpolation)")
-        if baseline:
+            methods_applied = True
+        
+        # Check if baseline is in methods dict (either from --baseline flag or auto-applied from config)
+        if 'baseline' in methods:
+            baseline_info = methods['baseline']
+            baseline_order = baseline_info.get('order', 1)
+            baseline_window = baseline_info.get('window', None)
+            source = " (from config)" if not baseline and baseline_from_config else ""
             if baseline_window:
-                click.echo(f"    - Baseline subtraction (order={baseline_order}, window={baseline_window[0]}-{baseline_window[1]})")
+                click.echo(f"    - Baseline subtraction (order={baseline_order}, window={baseline_window[0]}-{baseline_window[1]}){source}")
             else:
-                click.echo(f"    - Baseline subtraction (order={baseline_order})")
+                click.echo(f"    - Baseline subtraction (order={baseline_order}){source}")
+            methods_applied = True
+        
         if smooth:
             click.echo(f"    - Smoothing (window={smooth_window})")
+            methods_applied = True
+        
+        if not methods_applied:
+            click.echo(f"    (Extraction only, if configured; no other processing applied)")
+        
         click.echo()
         
     except FileNotFoundError as e:
@@ -1764,18 +1885,20 @@ def map_column_cmd(config, reduced, clean, object, column, beamsize, pixsize, sc
               help='Beam size in degrees for gridding kernel. If not specified, reads from config [gridding].beamsize_arcsec.')
 @click.option('--pixsize', type=float, default=None,
               help='Map pixel size in degrees. If not specified, uses beamsize/3 or config [gridding].pixel_size_arcsec.')
+@click.option('--velocity-range', type=(float, float), default=None, nargs=2,
+              help='Velocity range in km/s (e.g., --velocity-range 450 500). If not specified, integrates entire spectrum.')
 @click.option('--scatter', is_flag=True, default=False,
               help='Show observation points as scatter plot on map.')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for plot (e.g., integrated_map.png). If not specified, plot is shown but not saved.')
 @click.option('--fits-output', type=click.Path(), default=None,
               help='Output path for FITS file (e.g., integrated_map.fits). If not specified, FITS is not saved.')
-def map_integrated_cmd(config, fits, reduced, clean, object, beamsize, pixsize, scatter, plot, fits_output):
+def map_integrated_cmd(config, fits, reduced, clean, object, beamsize, pixsize, velocity_range, scatter, plot, fits_output):
     """
     Create a spatial map of integrated spectral intensity.
     
-    Integrates the spectrum across all frequency channels for each observation,
-    then creates a WCS-based spatial map with cygrid gridding.
+    Integrates the spectrum across all frequency channels (or specified velocity range)
+    for each observation, then creates a WCS-based spatial map with cygrid gridding.
     
     Reads input file from:
     1. --fits parameter if specified (overrides config)
@@ -1790,6 +1913,8 @@ def map_integrated_cmd(config, fits, reduced, clean, object, beamsize, pixsize, 
         map_integrated --config config.toml --reduced --object M51
         map_integrated --config config.toml --fits data.fits --beamsize 0.3 --plot integrated.png
         map_integrated --config config.toml --fits data.fits --pixsize 0.05 --object M51
+        map_integrated --config config.toml --fits data.fits --velocity-range 450 500
+        map_integrated --config config.toml --reduced --velocity-range -50 50 --plot map_narrow_range.png
     """
     try:
         from oi_zeigt.mapping.gridding import get_gridding_params_from_config
@@ -1847,15 +1972,18 @@ def map_integrated_cmd(config, fits, reduced, clean, object, beamsize, pixsize, 
             object_filter=object_filter,
             beamsize_deg=beamsize_deg,
             pixsize=pixsize_deg,
-            show_scatter=scatter
+            show_scatter=scatter,
+            velocity_range=velocity_range
         )
 
         click.echo(f"\n✓ Integrated intensity map created")
-        click.echo(f"  Beam size: {beamsize_deg:.4f}°")
+        click.echo(f"  Beam size: {beamsize_deg*3600:.2f}\"")
         if pixsize_deg:
-            click.echo(f"  Pixel size: {pixsize_deg:.6f}°")
+            click.echo(f"  Pixel size: {pixsize_deg*3600:.3f}\"")
         if object_filter:
             click.echo(f"  Object filter: {object_filter}")
+        if velocity_range:
+            click.echo(f"  Velocity range: {velocity_range[0]:.1f} - {velocity_range[1]:.1f} km/s")
         click.echo(f"  Map dimensions: {grid_map.shape[1]} × {grid_map.shape[0]}")
 
         # Save plot if requested
@@ -1867,7 +1995,7 @@ def map_integrated_cmd(config, fits, reduced, clean, object, beamsize, pixsize, 
         if fits_output:
             from oi_zeigt.mapping.gridding import save_map_to_fits
             save_map_to_fits(grid_map, wcs_header, fits_output, 
-                           beam_maj_deg=beamsize, overwrite=True)
+                           beam_maj_deg=beamsize_deg, overwrite=True)
             click.echo(f"  FITS saved: {fits_output}")
 
         click.echo()

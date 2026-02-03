@@ -48,6 +48,9 @@ coverage.xml
 # IDEs
 .vscode/
 .idea/
+
+# Documentation (generated files)
+docs/
 *.swp
 *.swo
 *~

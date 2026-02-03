@@ -472,57 +472,52 @@ class PCACorrector:
         for decomp_file in decomp_files:
             try:
                 # Extract mission_id and telescope from filename
-                # New format: decomposition_{mission_id}_{telescop}_{date}_components.pkl
-                # Old format: decomposition_{mission_id}_{date}_components.pkl
+                # Format: decomposition_{YYYY-MM-DD}_{GR/HR}_{F###}_{LFAH/LFAV}_{PX##}_{S}_components.pkl
+                # OR: decomposition_{YYYYMMDD}_{mission_id}_components.pkl
+                # Example: decomposition_2016-05-12_GR_F296_LFAH_PX00_S_components.pkl
                 filename = os.path.basename(decomp_file)
-                parts = filename.replace('decomposition_', '').replace('_components.pkl', '').split('_')
+                base = filename.replace('decomposition_', '').replace('_components.pkl', '')
                 
-                # Try to identify mission_id, telescope, and date
-                # Date can be 7-8 digits (YYYYMMD or YYYYMMDD)
+                # The date is at the START and contains dashes: YYYY-MM-DD
+                # After the date comes: GR/HR_F###_LFAH/LFAV_PX##_S
                 flight_date = None
-                remaining = parts
-                if len(parts) >= 2:
-                    # Check last part for date (7-8 consecutive digits)
-                    if len(parts[-1]) >= 7 and parts[-1][:7].isdigit():
+                mission_id = None
+                telescope = None
+                
+                # Try to match YYYY-MM-DD at the beginning
+                import re
+                match = re.match(r'^(\d{4})-(\d{2})-(\d{2})_(.+)$', base)
+                if match:
+                    year, month, day = match.group(1), match.group(2), match.group(3)
+                    flight_date = f"{year}{month}{day}"
+                    date_str = f"{year}-{month}-{day}"  # Keep with dashes for mission_id
+                    remaining = match.group(4)
+                    
+                    # Now parse: GR_F296_LFAH_PX00_S
+                    parts = remaining.split('_')
+                    
+                    # Look for telescope pattern: LFAH_PX##_S or LFAV_PX##_S
+                    # The mission_id is everything before the telescope code, INCLUDING the date
+                    for i in range(len(parts) - 1, -1, -1):
+                        if parts[i] in ['LFAH', 'LFAI', 'LFAV', 'LFBI', 'LFBH']:
+                            # Found telescope type
+                            if i + 2 < len(parts) and parts[i+1].startswith('PX') and parts[i+2] == 'S':
+                                # Reconstruct mission_id with the date at the front
+                                mission_id = date_str + '_' + '_'.join(parts[:i])
+                                telescope = '_'.join(parts[i:i+3])  # LFAH_PX00_S
+                                break
+                
+                # Fallback for old YYYYMMDD format
+                if flight_date is None:
+                    parts = base.split('_')
+                    if len(parts) >= 2 and len(parts[-1]) >= 7 and parts[-1][:7].isdigit():
                         flight_date = parts[-1]
-                        remaining = parts[:-1]
+                        mission_id = '_'.join(parts[:-1])
                 
                 if flight_date is None:
                     # No valid date found, skip
                     logger.warning(f"  Could not parse date from {filename}")
                     continue
-                
-                # Now determine if we have mission_id/telescope or just mission_id
-                # New files have: mission_id, telescope, date
-                # Old files have: mission_id, date (where mission_id may have underscores)
-                # FULL format: decomposition_2017-02-01_GR_F367_LFAH_PX00_S_2017021_components.pkl
-                # When split by '_': ['2017', '02', '01', 'GR', 'F367', 'LFAH', 'PX00', 'S', '2017021']
-                # Need to find LFAH/LFAV which come AFTER F367
-                
-                # Try to detect if we have mission/telescope pairing
-                # Look for telescope patterns - they usually have format like LFAH_PX##_S or LFAV_PX##_S
-                mission_id = None
-                telescope = None
-                
-                # Search from the end backwards to find a telescope pattern
-                # Telescopes are typically: LFAH_PXxx_S, LFAV_PXxx_S, LFBH_PXxx_S, etc.
-                for i in range(len(remaining) - 1, -1, -1):
-                    part = remaining[i]
-                    # Check if this looks like a 4-letter telescope code at the start
-                    if len(part) >= 4 and part[:4] in ['LFAH', 'LFAI', 'LFAV', 'LFBI', 'LFBH', 'PRISM', 'HR', 'R100Q']:
-                        # Check if the following parts look like PX##_S pattern
-                        # e.g., remaining = [..., 'LFAH', 'PX00', 'S'] or [..., 'LFAH', 'PX00', 'S']
-                        # We need: LFAH + PX## + S as telescope
-                        if i + 2 <= len(remaining) - 1 and remaining[i+1].startswith('PX') and remaining[i+2] == 'S':
-                            # Found LFAH_PX00_S pattern
-                            mission_id = '_'.join(remaining[:i])
-                            telescope = '_'.join(remaining[i:i+3])  # LFAH_PX00_S
-                            break
-                        elif i + 1 == len(remaining) - 1:
-                            # Maybe it's just LFAH with no PX## suffix
-                            mission_id = '_'.join(remaining[:i])
-                            telescope = part
-                            break
                 
                 # Load the decomposition
                 with open(decomp_file, 'rb') as f:
@@ -541,11 +536,14 @@ class PCACorrector:
                     key = (mission_id, telescope)
                     decompositions[key] = corrector
                     logger.info(f"  Loaded {mission_id}/{telescope}: {len(corrector.components)} components")
-                else:
+                elif mission_id:
                     # Fall back to old format (mission_id only)
-                    mission_id = '_'.join(remaining) if not mission_id else mission_id
                     decompositions[mission_id] = corrector
                     logger.info(f"  Loaded {mission_id}: {len(corrector.components)} components")
+                else:
+                    # No mission_id could be parsed, skip
+                    logger.warning(f"  Could not parse mission_id from {filename}")
+                    continue
                 
             except Exception as e:
                 logger.warning(f"  Failed to load {decomp_file}: {e}")
@@ -562,7 +560,7 @@ class PCACorrector:
         Parameters
         ----------
         mission_id : str
-            Mission identifier
+            Mission identifier (e.g., "2016-05-12_GR_F296")
         telescope : str
             Telescope identifier (e.g., LFAH_PX00_S)
         mission_decompositions : dict
@@ -1219,13 +1217,14 @@ class PCACorrector:
                                    telluric_line_mask=telluric_line_mask,
                                    input_fits=input_fits,
                                    group_thresholds=group_thresholds,
-                                   global_indices=indices)
+                                   global_indices=indices,
+                                   mission_decompositions=mission_decompositions)
             
             return stats
     
     def _generate_plots(self, data, original_spectra, corrected_spectra, correction_details,
                        velocity_axis, mission_id, output_dir, science_line_mask=None, telluric_line_mask=None,
-                       input_fits=None, group_thresholds=None, global_indices=None):
+                       input_fits=None, group_thresholds=None, global_indices=None, mission_decompositions=None):
         """
         Generate diagnostic plots matching pca_correct.py structure.
         
@@ -1242,6 +1241,36 @@ class PCACorrector:
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Generating diagnostic plots...")
         
+        # Load SKYCHOPDIFF reference spectra from the same input FITS file for waterfall plots
+        skychopdiff_spectra = {}
+        if mission_decompositions and input_fits:
+            try:
+                from astropy.io import fits as pyfits
+                with pyfits.open(input_fits) as hdul:
+                    # Load all SKYCHOPDIFF spectra and their metadata
+                    hdu = hdul[1]
+                    all_data = hdu.data
+                    all_object = np.array([s.strip() for s in all_data['OBJECT']])
+                    all_mission = np.array([s.strip() for s in all_data['MISSION_ID']])
+                    all_telescope = np.array([s.strip() for s in all_data['TELESCOP']])
+                    
+                    # Filter to only SKYCHOPDIFF spectra
+                    sky_mask = all_object == 'SKYCHOPDIFF'
+                    sky_spectra = all_data['SPECTRUM'][sky_mask]
+                    sky_mission = all_mission[sky_mask]
+                    sky_telescope = all_telescope[sky_mask]
+                    
+                    # Group by mission/telescope
+                    for key in mission_decompositions.keys():
+                        # key is (mission_id, telescope)
+                        mission_str, telescope_str = key
+                        combo_mask = (sky_mission == mission_str) & (sky_telescope == telescope_str)
+                        if np.any(combo_mask):
+                            skychopdiff_spectra[key] = sky_spectra[combo_mask]
+                            logger.info(f"Loaded {len(sky_spectra[combo_mask])} SKYCHOPDIFF spectra for {mission_str}/{telescope_str}")
+            except Exception as e:
+                logger.warning(f"Failed to load SKYCHOPDIFF spectra for plotting: {e}")
+        
         # Debug logging for masks
         logger.info(f"_generate_plots called with science_line_mask: {science_line_mask is not None}, telluric_line_mask: {telluric_line_mask is not None}")
         if science_line_mask is not None:
@@ -1249,58 +1278,53 @@ class PCACorrector:
         if telluric_line_mask is not None:
             logger.info(f"  telluric_line_mask shape: {telluric_line_mask.shape}")
         
-        # Get unique scan/subscan/telescope combinations
+        # Get unique scan/subscan/telescope/mission combinations
         scans = data['SCAN']
         subscans = data['SUBSCAN']
         telescopes = data['TELESCOP']
-        unique_combos = list(set(zip(scans, subscans, telescopes)))
-        unique_combos = sorted(unique_combos)
+        missions = np.array([data['MISSION_ID'][i].strip() for i in range(len(data))])
         
-        # Limit to ~20 plots by sampling
-        max_plots = 20
-        if len(unique_combos) > max_plots:
-            step = max(1, len(unique_combos) // max_plots)
-            unique_combos = unique_combos[::step]
+        # Group by (mission_id, telescope, scan) like original pca_correct.py
+        # This creates one plot per (mission_id, telescope, scan) group
+        # ALL subscans within that group are ACCUMULATED and shown together
+        unique_mission_tel_scan = sorted(list(set(zip(missions, telescopes, scans))))
         
-        logger.info(f"Creating {len(unique_combos)} plots...")
+        logger.info(f"Grouping by (mission_id, telescope, scan): {len(unique_mission_tel_scan)} groups")
         logger.info(f"group_thresholds passed to _generate_plots: {len(group_thresholds) if group_thresholds else 0} groups")
         if group_thresholds:
             logger.info(f"  First few threshold keys: {list(group_thresholds.keys())[:3]}")
         
-        plot_count = 0
-        for scan, subscan, telescope in unique_combos:
-            plot_count += 1
-            mask = (scans == scan) & (subscans == subscan) & (telescopes == telescope)
-            local_indices = np.where(mask)[0]
+        total_plots = 0
+        for mission_id, telescope, scan in unique_mission_tel_scan:
+            # Get all spectra for this (mission_id, telescope, scan) combination
+            # This includes ALL subscans for this scan
+            group_mask = (missions == mission_id) & (telescopes == telescope) & (scans == scan)
+            group_indices = np.where(group_mask)[0]
             
-            if len(local_indices) == 0:
+            if len(group_indices) == 0:
                 continue
             
             # Convert local indices to global indices if we have the mapping
             if global_indices is not None:
-                global_idx_for_group = global_indices[local_indices]
+                global_idx_for_group = global_indices[group_indices]
             else:
-                global_idx_for_group = local_indices
+                global_idx_for_group = group_indices
             
             # Filter to only spectra that were actually processed (exclude skipped ones with all bad channels)
-            # Skipped spectra have correction_details[idx]['skipped'] = True
             usable_global_indices = [idx for idx in global_idx_for_group 
                                 if idx in correction_details 
                                 and not correction_details[idx].get('skipped', False)]
             
             if len(usable_global_indices) == 0:
-                logger.info(f"scan={scan}, subscan={subscan}, telescope={telescope}: Found {len(global_idx_for_group)} total, {len([i for i in global_idx_for_group if i in correction_details])} in correction_details, {len(usable_global_indices)} usable (skipping plot)")
+                logger.info(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: No usable spectra (skipping plot)")
                 continue
             
-            # Convert usable global indices back to local indices for slicing the filtered arrays
-            usable_local_indices = [np.where(global_indices == g_idx)[0][0] for g_idx in usable_global_indices] if global_indices is not None else usable_global_indices
+            # Get all spectra for this group (all subscans accumulated)
+            original_spectra_subset = original_spectra[group_indices]
+            corrected_spectra_subset = corrected_spectra[group_indices]
             
-            logger.info(f"Creating plot for scan={scan}, subscan={subscan}, telescope={telescope}: {len(usable_local_indices)} usable spectra (skipped {len(global_idx_for_group) - len(usable_local_indices)} bad ones)")
-            
-            # Get spectra for this scan/telescope (only usable ones)
-            original_spectra_subset = original_spectra[usable_local_indices]
-            corrected_spectra_subset = corrected_spectra[usable_local_indices]
-            logger.debug(f"  original_spectra_subset.shape={original_spectra_subset.shape}")
+            logger.info(f"Creating plot {total_plots + 1} for mission_id={mission_id}, telescope={telescope}, scan={scan}: {len(usable_global_indices)} usable spectra")
+            total_plots += 1
             
             # Setup x_axis
             if velocity_axis is not None:
@@ -1323,10 +1347,30 @@ class PCACorrector:
             original_mean = np.mean(original_spectra_subset, axis=0)
             corrected_mean = np.mean(corrected_spectra_subset, axis=0)
             
+            # Handle NaN/Inf in mean spectra
+            original_mean = np.nan_to_num(original_mean, nan=0.0, posinf=0.0, neginf=0.0)
+            corrected_mean = np.nan_to_num(corrected_mean, nan=0.0, posinf=0.0, neginf=0.0)
+            
             min_val = min(np.min(original_mean), np.min(corrected_mean)) * 1.1
             max_val = max(np.max(original_mean), np.max(corrected_mean)) * 1.1
             
-            n_components_show = len(self.components)
+            # Skip this plot if axis limits are invalid
+            if not (np.isfinite(min_val) and np.isfinite(max_val)):
+                logger.warning(f"Skipping plot: invalid axis limits for mission_id={mission_id}, telescope={telescope}, scan={scan}")
+                continue
+            
+            # Get the correct decomposition for this specific mission/telescope
+            plot_decomposition = self.get_decomposition_for_mission(mission_id, telescope, mission_decompositions)
+            
+            # Use components from the correct mission decomposition, or fall back to self.components
+            if plot_decomposition:
+                components_to_plot = plot_decomposition.components
+                variance_ratio_to_plot = plot_decomposition.explained_variance_ratio
+            else:
+                components_to_plot = self.components
+                variance_ratio_to_plot = self.explained_variance_ratio
+            
+            n_components_show = len(components_to_plot)
             spectral_height = 0.85 / (2 + n_components_show)  # 2 for orig/corr + n for components
             
             # Original mean
@@ -1350,8 +1394,8 @@ class PCACorrector:
             # Components
             for i in range(n_components_show):
                 axi = fig.add_axes([padding, 0.90 - (2+i+1)*spectral_height, plot_width, spectral_height])
-                axi.plot(x_axis, self.components[i], 'k-', lw=1)
-                label = f"Component {i+1}\n(Var: {self.explained_variance_ratio[i]*100:.1f}%)"
+                axi.plot(x_axis, components_to_plot[i], 'k-', lw=1)
+                label = f"Component {i+1}\n(Var: {variance_ratio_to_plot[i]*100:.1f}%)"
                 axi.text(0.03, 0.9, label, transform=axi.transAxes, fontsize=8, va='top')
                 axi.grid(True, alpha=0.3)
                 axi.tick_params(labelsize=8)
@@ -1361,44 +1405,22 @@ class PCACorrector:
             # ==================================================================
             # COLUMN 2: WATERFALL + BEFORE HEATMAP (TOP-MID LEFT)
             # ==================================================================
-            # Heatmap of spectra: prefer SKYCHOPDIFF reference spectra if available
             ax_waterfall = fig.add_axes([2*padding + plot_width, 0.55, plot_width, 0.35])
             
-            # Try to load reference SKYCHOPDIFF spectra from FITS using stored indices
-            waterfall_spectra = None
-            if input_fits is not None:
-                # Get indices from decomposition (handle both dict and object formats)
-                indices_ref = None
-                if isinstance(self.decomposition, dict):
-                    indices_ref = self.decomposition.get('reference_spectrum_indices')
-                    logger.info(f"Decomposition is dict, got reference_spectrum_indices: {type(indices_ref)}")
-                elif hasattr(self.decomposition, 'reference_spectrum_indices'):
-                    indices_ref = self.decomposition.reference_spectrum_indices
-                    logger.info(f"Decomposition is object, got reference_spectrum_indices: {type(indices_ref)}")
-                else:
-                    logger.info(f"Decomposition type: {type(self.decomposition)}, has no reference_spectrum_indices")
-                
-                if indices_ref is not None and len(indices_ref) > 0:
-                    logger.info(f"Found {len(indices_ref)} reference spectrum indices, loading...")
-                    waterfall_spectra = self.load_reference_spectra_from_fits(input_fits, indices_ref)
-                elif indices_ref is not None:
-                    logger.warning(f"reference_spectrum_indices exists but is empty")
-                else:
-                    logger.info(f"reference_spectrum_indices is None")
-            else:
-                logger.info(f"input_fits is None")
+            # Get the correct decomposition for this specific mission/telescope
+            plot_decomposition = self.get_decomposition_for_mission(mission_id, telescope, mission_decompositions)
             
-            # Use reference SKYCHOPDIFF spectra if loaded, otherwise use science spectra
-            if waterfall_spectra is not None:
-                to_display = waterfall_spectra
-                waterfall_title = f'Reference SKYCHOPDIFF Spectra\n(used for decomposition, {len(waterfall_spectra)} total)'
+            # Display SKYCHOPDIFF spectra used for this mission/telescope decomposition
+            mission_telescope_key = (mission_id, telescope)
+            if mission_telescope_key in skychopdiff_spectra:
+                to_display = skychopdiff_spectra[mission_telescope_key]
+                waterfall_title = f'SKYCHOPDIFF Spectra - {mission_id}/{telescope}\n({len(to_display)} spectra used for decomposition)'
             else:
+                # Fallback: show all spectra from current scan
                 to_display = original_spectra_subset
-                waterfall_title = f'Science Spectra\n({len(original_spectra_subset)} spectra)'
-                if input_fits is not None:
-                    logger.warning(f"Reference spectra not available, displaying science spectra instead")
+                waterfall_title = f'Spectra - {mission_id}/{telescope}\n({len(to_display)} spectra from this scan)'
             
-            n_display_waterfall = len(to_display)  # Display all spectra (not just first 200)
+            n_display_waterfall = len(to_display)  # Display all SKYCHOPDIFF spectra
             im_waterfall = ax_waterfall.imshow(to_display[:n_display_waterfall], aspect='auto',
                                               extent=[x_axis[0], x_axis[-1], n_display_waterfall, 0],
                                               interpolation='nearest', cmap='viridis')
@@ -1410,18 +1432,15 @@ class PCACorrector:
             ax_waterfall.tick_params(labelsize=8)
             
             # Calculate n_display early - all plots will use this for consistent sizing
-            # Display all available processed spectra for this scan/subscan/telescope combination
-            n_display = len(usable_local_indices)
+            # Display all available processed spectra for this scan
+            n_display = len(original_spectra_subset)
             
             # Before correction heatmap with line detection contours overlay
-            # IMPORTANT: Line detection was performed on sampled spectra (up to 20).
-            # We show all available spectra for this scan/subscan/telescope.
-            # The threshold overlay will only be drawn for the first N rows where detection was done.
             threshold_2d = None
             n_sampled_for_threshold = None
             
             if group_thresholds is not None and len(group_thresholds) > 0:
-                # Convert scan/subscan/telescope to strings for consistent comparison
+                # Convert scan/telescope to strings for consistent comparison
                 # (handles both byte strings and regular strings from FITS)
                 def to_string(x):
                     if isinstance(x, bytes):
@@ -1429,37 +1448,36 @@ class PCACorrector:
                     return str(x).strip()
                 
                 scan_str = to_string(scan)
-                subscan_str = to_string(subscan)
                 telescope_str = to_string(telescope)
+                mission_str = to_string(mission_id)
                 
-                # Try to find the threshold for THIS specific scan/subscan/telescope
+                # Consolidate thresholds across ALL subscans for this (mission, telescope, scan) group
                 # group_thresholds keys are: (mission_id, telescope, scan, subscan)
-                found_match = False
+                # We want to collect all thresholds that match (mission, telescope, scan)
+                found_thresholds = []
                 for group_key, thresh in group_thresholds.items():
                     group_mission_id, group_telescope, group_scan, group_subscan = group_key
-                    # Match on scan, subscan, and telescope (mission_id should be same for all in this function)
+                    # Match on mission, scan, and telescope
                     # Convert group values to strings too to handle np.str_ and bytes
-                    if (to_string(group_scan) == scan_str and 
-                        to_string(group_subscan) == subscan_str and 
+                    if (to_string(group_mission_id) == mission_str and 
+                        to_string(group_scan) == scan_str and 
                         to_string(group_telescope) == telescope_str):
-                        threshold_2d = thresh
-                        n_sampled_for_threshold = threshold_2d.shape[0]  # Number of spectra that were sampled
-                        found_match = True
-                        logger.info(f"Found threshold match for plot: scan={scan_str}, subscan={subscan_str}, telescope={telescope_str}")
-                        break
+                        found_thresholds.append((group_subscan, thresh))
                 
-                if not found_match:
-                    logger.debug(f"No exact match for scan={scan_str}, subscan={subscan_str}, telescope={telescope_str}")
-                
-                # If no exact match found, use the first available as fallback
-                if threshold_2d is None and len(group_thresholds) > 0:
-                    logger.debug(f"Using first available threshold as fallback")
-                    threshold_2d = next(iter(group_thresholds.values()), None)
-                    if threshold_2d is not None:
+                # If we found thresholds, vertically stack them (accumulating across subscans)
+                if found_thresholds:
+                    logger.info(f"Found {len(found_thresholds)} threshold sets for mission_id={mission_str}, scan={scan_str}, telescope={telescope_str}")
+                    thresholds_to_stack = [thresh for _, thresh in sorted(found_thresholds)]
+                    try:
+                        threshold_2d = np.vstack(thresholds_to_stack)
                         n_sampled_for_threshold = threshold_2d.shape[0]
-                
-                if threshold_2d is None:
-                    logger.debug(f"No threshold available for this plot")
+                        logger.info(f"Consolidated thresholds shape: {threshold_2d.shape}")
+                    except Exception as e:
+                        logger.debug(f"Could not consolidate thresholds: {e}")
+                        threshold_2d = None
+                        n_sampled_for_threshold = None
+                else:
+                    logger.debug(f"No thresholds found for mission_id={mission_str}, scan={scan_str}, telescope={telescope_str}")
             
             ax_before = fig.add_axes([2*padding + plot_width, 0.05, plot_width, 0.45])
             
@@ -1703,7 +1721,7 @@ class PCACorrector:
             # Find example spectrum (median correction)
             correction_amounts = np.array([
                 np.mean(np.abs(original_spectra_subset[i] - corrected_spectra_subset[i]))
-                for i in range(len(usable_local_indices))
+                for i in range(len(original_spectra_subset))
             ])
             
             if np.any(correction_amounts > 0):
@@ -1774,16 +1792,16 @@ class PCACorrector:
                 if comp_idx == n_comp_show - 1:
                     ax_ex_comp.set_xlabel(x_label, fontsize=8)
             
-            fig.suptitle(f'{mission_id} | Scan {scan} | Subscan {subscan} | {telescope} | {len(usable_local_indices)} Spectra', 
+            fig.suptitle(f'{mission_id} | Scan {scan} | Telescope {telescope} | {len(usable_global_indices)} Spectra', 
                         fontsize=12, fontweight='bold')
             
-            # Save plot
+            # Save plot - one plot per (mission_id, telescope, scan) group
             plot_file = os.path.join(output_dir, 
-                                    f'pca_correction_{mission_id}_scan{scan}_subscan{subscan}_{telescope}.png')
+                                    f'pca_correction_{mission_id}_scan{scan}_{telescope}.png')
             fig.savefig(plot_file, dpi=100, bbox_inches='tight')
             plt.close(fig)
         
-        logger.info(f"✓ Generated {plot_count} diagnostic plots")
+        logger.info(f"✓ Generated {total_plots} diagnostic plots")
 
 
 def correct_fits_file(input_fits, output_fits, decomposition_pkl,

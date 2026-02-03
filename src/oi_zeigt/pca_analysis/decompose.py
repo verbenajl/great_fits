@@ -794,7 +794,7 @@ def decompose_spectra(fits_directory: Union[str, Path],
 
 
 def _plot_decomposition_results(result: DecompositionResult, velocity_axis: np.ndarray, 
-                                 mission_id: str, flight_date: str, output_dir: Path) -> Tuple[Path, Path]:
+                                 mission_id: str, output_dir: Path) -> Tuple[Path, Path]:
     """
     Create visualization plots of PCA components.
     
@@ -805,9 +805,7 @@ def _plot_decomposition_results(result: DecompositionResult, velocity_axis: np.n
     velocity_axis : np.ndarray
         Velocity axis in km/s for x-axis labels
     mission_id : str
-        Mission ID for plot filenames
-    flight_date : str
-        Flight date for plot filenames
+        Mission ID for plot filenames (includes date like 2017-02-01_...)
     output_dir : Path
         Output directory for plots
         
@@ -858,7 +856,7 @@ def _plot_decomposition_results(result: DecompositionResult, velocity_axis: np.n
             axes[i+1].set_xlabel('Velocity (km/s)')
     
     plt.tight_layout()
-    components_path = output_dir / f"pca_components_{mission_id}_{flight_date}.png"
+    components_path = output_dir / f"pca_components_{mission_id}.png"
     plt.savefig(components_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     logger.info(f"  Saved component plots to {components_path}")
@@ -888,7 +886,7 @@ def _plot_decomposition_results(result: DecompositionResult, velocity_axis: np.n
         ax2.text(i+1, 100*v + 0.3, f'{100*v:.2f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
     
     plt.tight_layout()
-    variance_path = output_dir / f"pca_variance_{mission_id}_{flight_date}.png"
+    variance_path = output_dir / f"pca_variance_{mission_id}.png"
     plt.savefig(variance_path, dpi=150, bbox_inches='tight')
     plt.close(fig2)
     logger.info(f"  Saved variance plot to {variance_path}")
@@ -1059,14 +1057,9 @@ def main_cli():
                     logger.info(f"  {obj_str}: {count} spectra")
                 sys.exit(1)
             
-            # Get flight date and mission_id for filename
+            # Get mission_id from MISSION_ID column if it exists
             skychopdiff_data = matrix_hdu.data[mask]
             if len(skychopdiff_data) > 0:
-                date_obs = skychopdiff_data[0]['DATE-OBS']
-                if isinstance(date_obs, bytes):
-                    date_obs = date_obs.decode().strip()
-                flight_date = date_obs.split('T')[0].replace('-', '')
-                
                 # Get mission_id from MISSION_ID column if it exists
                 if 'MISSION_ID' in matrix_hdu.data.dtype.names:
                     mission_id = skychopdiff_data[0]['MISSION_ID']
@@ -1075,7 +1068,6 @@ def main_cli():
                 else:
                     mission_id = 'unknown'
             else:
-                flight_date = 'unknown'
                 mission_id = 'unknown'
             
             # Extract velocity axis if available (for telluric masking)
@@ -1156,7 +1148,7 @@ def main_cli():
         # Save results
         output_dir = Path("output/pca_components")
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_file = output_dir / f"decomposition_{mission_id}_{flight_date}_components.pkl"
+        output_file = output_dir / f"decomposition_{mission_id}_components.pkl"
         result.save(str(output_file))
         
         logger.info(f"✓ Results saved to {output_file}")
@@ -1185,7 +1177,7 @@ def main_cli():
                         velocity_axis_kms = velocity_axis_ms / 1000.0
                         
                         _plot_decomposition_results(
-                            result, velocity_axis_kms, mission_id, flight_date, output_dir
+                            result, velocity_axis_kms, mission_id, output_dir
                         )
                         logger.info("✓ Plots generated successfully")
                     else:

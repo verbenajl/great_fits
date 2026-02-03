@@ -6,8 +6,8 @@
 # (CRVAL1, CDELT1, CRPIX1) from each spectrum's FITS header
 
 2016-05-12_GR_F296:
-  telluric_line_center: 566
-  telluric_line_width: 30
+  telluric_line_center: 569
+  telluric_line_width: 57
 
 2016-05-18_GR_F298:
   telluric_line_center: 566
