@@ -415,7 +415,7 @@ def main_cli():
         "--fits",
         type=str,
         default=None,
-        help="FITS file to decompose (overrides config file [output][reduced_fits])"
+        help="FITS file to decompose (overrides config file [output][prepared_for_pca] or [output][reduced_fits])"
     )
     parser.add_argument(
         "--n-components",
@@ -448,30 +448,37 @@ def main_cli():
         logger.info(f"Loading configuration from {args.config}")
         config = get_config(args.config)
         
-        # Determine FITS file (command line > config [output][reduced_fits] > config [input][fits_file])
+        # Determine FITS file (command line > config [output][prepared_for_pca] > config [output][reduced_fits] > config [input][fits_file])
         if args.fits is not None:
             fits_file = args.fits
             logger.info(f"✓ FITS file = {fits_file} (from command line)")
         else:
-            # Try [output][reduced_fits] first
+            # Try [output][prepared_for_pca] first
             output_config = config.get('output', {})
-            fits_file = output_config.get('reduced_fits')
+            fits_file = output_config.get('prepared_for_pca')
             
             if fits_file:
-                logger.info(f"✓ FITS file = {fits_file} (from config [output][reduced_fits])")
+                logger.info(f"✓ FITS file = {fits_file} (from config [output][prepared_for_pca])")
             else:
-                # Fall back to [input][fits_file]
-                input_config = config.get('input', {})
-                fits_file = input_config.get('fits_file')
+                # Fall back to [output][reduced_fits]
+                fits_file = output_config.get('reduced_fits')
+                
                 if fits_file:
-                    logger.info(f"✓ FITS file = {fits_file} (from config [input][fits_file])")
+                    logger.info(f"✓ FITS file = {fits_file} (from config [output][reduced_fits])")
                 else:
-                    logger.error("No FITS file specified in configuration or command line")
-                    logger.error("Specify via:")
-                    logger.error("  1. Command line: pca_decompose --fits /path/to/file.fits")
-                    logger.error("  2. Config [output][reduced_fits]")
-                    logger.error("  3. Config [input][fits_file]")
-                    sys.exit(1)
+                    # Final fall back to [input][fits_file]
+                    input_config = config.get('input', {})
+                    fits_file = input_config.get('fits_file')
+                    if fits_file:
+                        logger.info(f"✓ FITS file = {fits_file} (from config [input][fits_file])")
+                    else:
+                        logger.error("No FITS file specified in configuration or command line")
+                        logger.error("Specify via:")
+                        logger.error("  1. Command line: pca_decompose --fits /path/to/file.fits")
+                        logger.error("  2. Config [output][prepared_for_pca]")
+                        logger.error("  3. Config [output][reduced_fits]")
+                        logger.error("  4. Config [input][fits_file]")
+                        sys.exit(1)
         
         # Verify file exists
         if not Path(fits_file).exists():

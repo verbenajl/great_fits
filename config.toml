@@ -15,6 +15,7 @@ object="M51CENTER"
 
 [filters]
 blank_fraction = 0.20
+rmsratio = 1.3
 
 [reduction]
 baseline=3
@@ -30,6 +31,14 @@ group_by = "OBJECT"
 method = "cygrid"  # Options: "cygrid" or "scipy" (auto-falls back if cygrid unavailable)
 beamsize_arcsec = 14.1  # Beam size in arcseconds
 #pixel_size_arcsec = 14.0  # Pixel size in arcseconds (will be calculated from beamsize if not specified)
+
+[pca_prepare]
+fill_with_noise=true
+rmsratio_value=1.3
+tau_min=0.001
+tau_max=1.0
+rymin=-1000
+rymax=1000
 
 [pca]
 n_components = 5
@@ -51,5 +60,6 @@ rejected_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files
 reduced_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/reduced_data.fits"
 averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/averaged_data.fits"
 datacube = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/datacube.fits"
+prepared_for_pca="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/prepared_for_pca.fits"
 pcad_fits="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/pca_corrected.fits"
 pca_plots_dir="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/pca_plots"

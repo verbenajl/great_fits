@@ -195,16 +195,45 @@ def _print_object_info(hdul, object_filter=None):
     default=None,
     help="Path to FITS file to read directly"
 )
-def print_fits_info(config: Optional[str], fits: Optional[str]):
+@click.option(
+    "--reduced",
+    is_flag=True,
+    default=False,
+    help="Print info from output.reduced_fits in config.toml"
+)
+@click.option(
+    "--clean",
+    is_flag=True,
+    default=False,
+    help="Print info from output.clean_fits in config.toml"
+)
+@click.option(
+    "--prepared",
+    is_flag=True,
+    default=False,
+    help="Print info from output.prepared_for_pca in config.toml"
+)
+def print_fits_info(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool):
     """
     Print basic information about a FITS file.
     
     Can read the FITS file path from a config.toml file or directly specify it.
     
+    Use --reduced, --clean, or --prepared flags to read from output paths in config.toml
+    
     Examples:
     
-        # Read FITS file from config.toml
+        # Read FITS file from config.toml input section
         print_fits_info --config config.toml
+        
+        # Read FITS file from output.reduced_fits in config.toml
+        print_fits_info --config config.toml --reduced
+        
+        # Read FITS file from output.clean_fits in config.toml
+        print_fits_info --config config.toml --clean
+        
+        # Read FITS file from output.prepared_for_pca in config.toml
+        print_fits_info --config config.toml --prepared
         
         # Read FITS file directly
         print_fits_info --fits /path/to/file.fits
@@ -215,16 +244,36 @@ def print_fits_info(config: Optional[str], fits: Optional[str]):
     try:
         # Load config to get object filter if available
         object_filter = None
-        if config:
+        if config or (reduced or clean or prepared):
             try:
                 import tomllib
             except ModuleNotFoundError:
                 import tomli as tomllib
             
-            with open(config, 'rb') as f:
+            config_path = config or "config.toml"
+            with open(config_path, 'rb') as f:
                 cfg = tomllib.load(f)
                 parameters_cfg = cfg.get('parameters', {})
                 object_filter = parameters_cfg.get('object', None)
+                
+                # Handle output file flags
+                if reduced or clean or prepared:
+                    output_cfg = cfg.get('output', {})
+                    if reduced and 'reduced_fits' in output_cfg:
+                        fits = output_cfg['reduced_fits']
+                        click.echo(f"Reading from output.reduced_fits: {fits}")
+                    elif clean and 'clean_fits' in output_cfg:
+                        fits = output_cfg['clean_fits']
+                        click.echo(f"Reading from output.clean_fits: {fits}")
+                    elif prepared and 'prepared_for_pca' in output_cfg:
+                        fits = output_cfg['prepared_for_pca']
+                        click.echo(f"Reading from output.prepared_for_pca: {fits}")
+                    elif reduced or clean or prepared:
+                        click.echo(click.style(
+                            f"Error: Requested output file not found in config.toml",
+                            fg="red"
+                        ), err=True)
+                        sys.exit(1)
         
         # Read FITS file
         if fits:
@@ -304,7 +353,25 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
     "--fits",
     type=click.Path(exists=False),
     default=None,
-    help="Path to FITS file to read directly"
+    help="Path to FITS file to read directly (default: input.fits_file from config)"
+)
+@click.option(
+    "--reduced",
+    is_flag=True,
+    default=False,
+    help="Plot from output.reduced_fits in config.toml"
+)
+@click.option(
+    "--clean",
+    is_flag=True,
+    default=False,
+    help="Plot from output.clean_fits in config.toml"
+)
+@click.option(
+    "--prepared",
+    is_flag=True,
+    default=False,
+    help="Plot from output.prepared_for_pca in config.toml"
 )
 @click.option(
     "--object",
@@ -325,8 +392,8 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
 )
 
 
-def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Optional[str],
-                       num_spectra: int, output: Optional[str]):
+def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
+                       object: Optional[str], num_spectra: int, output: Optional[str]):
     """
     Plot a sample of spectra from a FITS file.
     
@@ -346,15 +413,42 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Opti
         plot_sample_spectra --fits /path/to/file.fits --num-spectra 50 --output plot.pdf
     """
     try:
-        # Always try to load config (for object name, thresholds, etc.)
+        # Load config to get object filter and handle output file flags
         config_data = {}
         try:
-            if config:
+            if config or (reduced or clean or prepared):
+                try:
+                    import tomllib
+                except ModuleNotFoundError:
+                    import tomli as tomllib
+                
+                config_path = config or "config.toml"
+                with open(config_path, 'rb') as f:
+                    cfg = tomllib.load(f)
+                    config_data = cfg
+                    
+                    # Handle output file flags
+                    if reduced or clean or prepared:
+                        output_cfg = cfg.get('output', {})
+                        if reduced and 'reduced_fits' in output_cfg:
+                            fits = output_cfg['reduced_fits']
+                            click.echo(f"Reading from output.reduced_fits: {fits}")
+                        elif clean and 'clean_fits' in output_cfg:
+                            fits = output_cfg['clean_fits']
+                            click.echo(f"Reading from output.clean_fits: {fits}")
+                        elif prepared and 'prepared_for_pca' in output_cfg:
+                            fits = output_cfg['prepared_for_pca']
+                            click.echo(f"Reading from output.prepared_for_pca: {fits}")
+                        elif reduced or clean or prepared:
+                            click.echo(click.style(
+                                f"Error: Requested output file not found in config.toml",
+                                fg="red"
+                            ), err=True)
+                            sys.exit(1)
+            elif config:
                 config_data = get_config(config)
-                click.echo(f"Loaded config from: {config}")
             else:
                 config_data = get_config()
-                click.echo("Loaded config from default location")
         except FileNotFoundError as e:
             click.echo(f"Warning: Could not load config file: {e}")
             config_data = {}
@@ -540,7 +634,25 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Opti
     "--fits",
     type=click.Path(exists=False),
     default=None,
-    help="Path to FITS file to read directly"
+    help="Path to FITS file to read directly (default: input.fits_file from config)"
+)
+@click.option(
+    "--reduced",
+    is_flag=True,
+    default=False,
+    help="Plot from output.reduced_fits in config.toml"
+)
+@click.option(
+    "--clean",
+    is_flag=True,
+    default=False,
+    help="Plot from output.clean_fits in config.toml"
+)
+@click.option(
+    "--prepared",
+    is_flag=True,
+    default=False,
+    help="Plot from output.prepared_for_pca in config.toml"
 )
 @click.option(
     "--num-spectra",
@@ -554,8 +666,8 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], object: Opti
     default=None,
     help="Output file for the plot (PNG or PDF). If not specified, show plot."
 )
-def plot_skies(config: Optional[str], fits: Optional[str], num_spectra: int, 
-              output: Optional[str]):
+def plot_skies(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
+              num_spectra: int, output: Optional[str]):
     """
     Plot a sample of sky/background spectra (SKYCHOPDIFF or SKY-DIFF observations).
     
@@ -566,6 +678,33 @@ def plot_skies(config: Optional[str], fits: Optional[str], num_spectra: int,
         plot_skies --fits /path/to/file.fits --output sky_plot.pdf
     """
     try:
+        # Handle output file flags
+        if reduced or clean or prepared:
+            try:
+                import tomllib
+            except ModuleNotFoundError:
+                import tomli as tomllib
+            
+            config_path = config or "config.toml"
+            with open(config_path, 'rb') as f:
+                cfg = tomllib.load(f)
+                output_cfg = cfg.get('output', {})
+                if reduced and 'reduced_fits' in output_cfg:
+                    fits = output_cfg['reduced_fits']
+                    click.echo(f"Reading from output.reduced_fits: {fits}")
+                elif clean and 'clean_fits' in output_cfg:
+                    fits = output_cfg['clean_fits']
+                    click.echo(f"Reading from output.clean_fits: {fits}")
+                elif prepared and 'prepared_for_pca' in output_cfg:
+                    fits = output_cfg['prepared_for_pca']
+                    click.echo(f"Reading from output.prepared_for_pca: {fits}")
+                elif reduced or clean or prepared:
+                    click.echo(click.style(
+                        f"Error: Requested output file not found in config.toml",
+                        fg="red"
+                    ), err=True)
+                    sys.exit(1)
+        
         # Read FITS file
         if fits:
             hdul = read_fits(fits)
@@ -2224,6 +2363,94 @@ def combine_fits(input, output, single_hdu):
         click.echo("\n" + "="*70 + "\n")
         
         combined_hdul.close()
+        
+    except FileNotFoundError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.option(
+    "--config",
+    type=click.Path(exists=False),
+    default=None,
+    help="Path to config.toml file (reads input/output paths and settings)"
+)
+@click.option(
+    "--fits",
+    type=click.Path(exists=False),
+    default=None,
+    help="Input FITS file to prepare (default: output.reduced_fits from config.toml)"
+)
+@click.option(
+    "--output",
+    type=click.Path(),
+    default=None,
+    help="Output FITS file path (default: output.prepared_for_pca from config.toml)"
+)
+@click.option(
+    "--pca-source",
+    type=str,
+    default=None,
+    help="PCA source to filter for (default: pca.pca_source from config.toml, e.g., SKYCHOPDIFF)"
+)
+@click.option(
+    "--object",
+    type=str,
+    default=None,
+    help="Object substring to filter for (default: parameters.object from config.toml, e.g., M51CENTER)"
+)
+def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional[str],
+                   pca_source: Optional[str], object: Optional[str]):
+    """
+    Prepare FITS data for PCA analysis.
+    
+    Filters data to include only specified PCA source and object,
+    then fills telluric line regions with Gaussian noise.
+    
+    Uses configuration from config.toml by default:
+    - Input: output.reduced_fits
+    - Output: output.prepared_for_pca
+    - PCA source: pca.pca_source
+    - Object filter: parameters.object
+    
+    Examples:
+    
+        # Use config.toml defaults
+        prepare_for_pca --config config.toml
+        
+        # Specify custom files
+        prepare_for_pca --fits input.fits --output output.fits
+        
+        # Override config settings
+        prepare_for_pca --config config.toml --pca-source SKYCHOPDIFF --object M51CENTER
+    """
+    try:
+        from .pca_analysis.prepare_for_pca import prepare_for_pca as prepare_func
+        
+        click.echo("="*70)
+        click.echo("Preparing data for PCA analysis")
+        click.echo("="*70 + "\n")
+        
+        prepare_func(
+            fits_file=fits,
+            output_fits=output,
+            config=config,
+            pca_source=pca_source,
+            object_filter=object
+        )
+        
+        click.echo("\n" + "="*70)
+        click.echo(click.style("✓ Data preparation complete!", fg="green"))
+        click.echo("="*70 + "\n")
         
     except FileNotFoundError as e:
         click.echo(click.style(f"Error: {e}", fg="red"), err=True)

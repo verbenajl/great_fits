@@ -888,13 +888,20 @@ class PCACorrector:
             scans = np.array([to_string(x) for x in data['SCAN'][indices]])
             subscans = np.array([to_string(x) for x in data['SUBSCAN'][indices]])
             
-            # Get unique mission/telescope/scan/subscan combinations
+            # Get unique mission/telescope/scan/subscan combinations (needed for iterative line detection)
             unique_groups = np.unique(
                 np.column_stack((mission_ids, telescopes, scans, subscans)),
                 axis=0
             )
             
-            logger.info(f"  Found {len(unique_groups)} unique mission/telescope/scan/subscan groups")
+            # Also get unique mission/telescope/scan combinations for plotting
+            unique_groups_for_plotting = np.unique(
+                np.column_stack((mission_ids, telescopes, scans)),
+                axis=0
+            )
+            
+            logger.info(f"  Found {len(unique_groups)} unique mission/telescope/scan/subscan combinations (for line detection)")
+            logger.info(f"  Will generate {len(unique_groups_for_plotting)} plots (one per mission/telescope/scan)")
             logger.info(f"  Total spectra to process: {len(indices)}")
             
             # Load telluric line mask from mission parameters
@@ -1323,16 +1330,26 @@ class PCACorrector:
             original_spectra_subset = original_spectra[group_indices]
             corrected_spectra_subset = corrected_spectra[group_indices]
             
+            # Safety check: ensure we have spectra
+            if len(original_spectra_subset) == 0 or len(original_spectra_subset[0]) == 0:
+                logger.warning(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: No spectral data (skipping plot)")
+                continue
+            
             logger.info(f"Creating plot {total_plots + 1} for mission_id={mission_id}, telescope={telescope}, scan={scan}: {len(usable_global_indices)} usable spectra")
             total_plots += 1
             
             # Setup x_axis
-            if velocity_axis is not None:
+            if velocity_axis is not None and len(velocity_axis) > 0:
                 x_axis = velocity_axis / 1000.0  # Convert m/s to km/s
                 x_label = 'Velocity (km/s)'
             else:
                 x_axis = np.arange(len(original_spectra_subset[0]))
                 x_label = 'Channel'
+            
+            # Safety check: ensure x_axis has elements
+            if len(x_axis) == 0:
+                logger.warning(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: Empty x_axis (skipping plot)")
+                continue
             
             # Create figure (25x10 to match pca_correct.py)
             fig = Figure(figsize=(25, 10))
@@ -1394,7 +1411,12 @@ class PCACorrector:
             # Components
             for i in range(n_components_show):
                 axi = fig.add_axes([padding, 0.90 - (2+i+1)*spectral_height, plot_width, spectral_height])
-                axi.plot(x_axis, components_to_plot[i], 'k-', lw=1)
+                if len(x_axis) > 0 and len(components_to_plot[i]) == len(x_axis):
+                    axi.plot(x_axis, components_to_plot[i], 'k-', lw=1)
+                elif len(x_axis) > 0:
+                    axi.plot(components_to_plot[i], 'k-', lw=1)
+                else:
+                    axi.plot(components_to_plot[i], 'k-', lw=1)
                 label = f"Component {i+1}\n(Var: {variance_ratio_to_plot[i]*100:.1f}%)"
                 axi.text(0.03, 0.9, label, transform=axi.transAxes, fontsize=8, va='top')
                 axi.grid(True, alpha=0.3)
@@ -1421,9 +1443,16 @@ class PCACorrector:
                 waterfall_title = f'Spectra - {mission_id}/{telescope}\n({len(to_display)} spectra from this scan)'
             
             n_display_waterfall = len(to_display)  # Display all SKYCHOPDIFF spectra
-            im_waterfall = ax_waterfall.imshow(to_display[:n_display_waterfall], aspect='auto',
-                                              extent=[x_axis[0], x_axis[-1], n_display_waterfall, 0],
-                                              interpolation='nearest', cmap='viridis')
+            
+            # Safety check: ensure x_axis is valid before using it
+            if len(x_axis) > 0:
+                im_waterfall = ax_waterfall.imshow(to_display[:n_display_waterfall], aspect='auto',
+                                                  extent=[x_axis[0], x_axis[-1], n_display_waterfall, 0],
+                                                  interpolation='nearest', cmap='viridis')
+            else:
+                logger.warning(f"Skipping waterfall plot: x_axis is empty")
+                im_waterfall = ax_waterfall.imshow(to_display[:n_display_waterfall], aspect='auto',
+                                                  interpolation='nearest', cmap='viridis')
             ax_waterfall.set_title(waterfall_title, fontsize=10)
             ax_waterfall.set_xlabel(x_label, fontsize=9)
             ax_waterfall.set_ylabel('Spectrum #', fontsize=9)
@@ -1486,9 +1515,14 @@ class PCACorrector:
             # CRITICAL: extent MUST match the actual data shape being displayed
             # Shape of before_display: (n_display, n_channels)
             # extent format: [left, right, bottom, top] where bottom and top are in data coordinates
-            im_before = ax_before.imshow(before_display, aspect='auto',
-                                        extent=[x_axis[0], x_axis[-1], n_display, 0],
-                                        interpolation='nearest', cmap='viridis')
+            if len(x_axis) > 0:
+                im_before = ax_before.imshow(before_display, aspect='auto',
+                                            extent=[x_axis[0], x_axis[-1], n_display, 0],
+                                            interpolation='nearest', cmap='viridis')
+            else:
+                im_before = ax_before.imshow(before_display, aspect='auto',
+                                            interpolation='nearest', cmap='viridis')
+
             
             # Draw line detection contours as overlay if available
             # Use group_thresholds (2D detection result) for visualization,
@@ -1530,9 +1564,15 @@ class PCACorrector:
                             # Draw rectangles for each detected region
                             for start, end in zip(starts, ends):
                                 # Convert channel indices to velocity/frequency coordinates
-                                x_start = np.interp(start, [0, len(row)], [x_axis[0], x_axis[-1]])
-                                x_end = np.interp(end, [0, len(row)], [x_axis[0], x_axis[-1]])
-                                x_width = x_end - x_start
+                                if len(x_axis) > 0:
+                                    x_start = np.interp(start, [0, len(row)], [x_axis[0], x_axis[-1]])
+                                    x_end = np.interp(end, [0, len(row)], [x_axis[0], x_axis[-1]])
+                                    x_width = x_end - x_start
+                                else:
+                                    # Fall back to channel indices if x_axis is empty
+                                    x_start = start
+                                    x_end = end
+                                    x_width = x_end - x_start
                                 
                                 # Draw rectangle: (x, y, width, height)
                                 # y is spectrum_idx (0 at top), height is 1 spectrum
@@ -1561,10 +1601,18 @@ class PCACorrector:
             
             # Add annotation showing line detection status
             title_text = f'Before Correction\n(first {n_display} specs)'
-            if has_line_contours:
-                line_channels = np.any(science_line_mask, axis=0)
-                n_line_channels = np.sum(line_channels)
-                title_text += f'\nYellow contours = {n_line_channels} detected line channels'
+            if has_line_contours and science_line_mask is not None and len(science_line_mask) > 0:
+                try:
+                    line_channels = np.any(science_line_mask, axis=0)
+                    n_line_channels = np.sum(line_channels)
+                    title_text += f'\nYellow contours = {n_line_channels} detected line channels'
+                except (IndexError, ValueError) as e:
+                    logger.debug(f"Could not annotate line channels: {e}")
+                    # Use threshold_2d instead if available
+                    if threshold_2d is not None:
+                        line_channels = np.any(threshold_2d, axis=0)
+                        n_line_channels = np.sum(line_channels)
+                        title_text += f'\nYellow contours = {n_line_channels} detected line channels'
             
             ax_before.set_title(title_text, fontsize=10)
             ax_before.set_xlabel(x_label, fontsize=9)
@@ -1580,9 +1628,13 @@ class PCACorrector:
             # Difference heatmap
             ax_diff = fig.add_axes([3*padding + 2*plot_width, 0.55, plot_width, 0.35])
             difference = original_spectra_subset[:n_display] - corrected_spectra_subset[:n_display]
-            im_diff = ax_diff.imshow(difference, aspect='auto',
-                                    extent=[x_axis[0], x_axis[-1], n_display, 0],
-                                    interpolation='nearest', cmap='RdBu_r')
+            if len(x_axis) > 0:
+                im_diff = ax_diff.imshow(difference, aspect='auto',
+                                        extent=[x_axis[0], x_axis[-1], n_display, 0],
+                                        interpolation='nearest', cmap='RdBu_r')
+            else:
+                im_diff = ax_diff.imshow(difference, aspect='auto',
+                                        interpolation='nearest', cmap='RdBu_r')
             ax_diff.set_title(f'Correction Applied\n(Original - Corrected)', fontsize=10)
             ax_diff.set_xlabel(x_label, fontsize=9)
             ax_diff.set_ylabel('Spectrum #', fontsize=9)
@@ -1592,9 +1644,13 @@ class PCACorrector:
             
             # After correction heatmap
             ax_after = fig.add_axes([3*padding + 2*plot_width, 0.05, plot_width, 0.45])
-            im_after = ax_after.imshow(corrected_spectra_subset[:n_display], aspect='auto',
-                                      extent=[x_axis[0], x_axis[-1], n_display, 0],
-                                      interpolation='nearest', cmap='viridis')
+            if len(x_axis) > 0:
+                im_after = ax_after.imshow(corrected_spectra_subset[:n_display], aspect='auto',
+                                          extent=[x_axis[0], x_axis[-1], n_display, 0],
+                                          interpolation='nearest', cmap='viridis')
+            else:
+                im_after = ax_after.imshow(corrected_spectra_subset[:n_display], aspect='auto',
+                                          interpolation='nearest', cmap='viridis')
             ax_after.set_title(f'After Correction\n(first {n_display} specs)', fontsize=10)
             ax_after.set_xlabel(x_label, fontsize=9)
             ax_after.set_ylabel('Spectrum #', fontsize=9)
@@ -1643,7 +1699,7 @@ class PCACorrector:
                         masked_science_spectra[spec_idx, detected_channels] = 0
             
             im_masked = ax_masked.imshow(masked_science_spectra, aspect='auto',
-                                        extent=[x_axis[0], x_axis[-1], n_display, 0],
+                                        extent=[x_axis[0], x_axis[-1], n_display, 0] if len(x_axis) > 0 else None,
                                         interpolation='nearest', cmap='viridis')
             
             # Draw the same line detection contours as in the Before Correction plot
@@ -1898,7 +1954,7 @@ Examples:
     parser.add_argument(
         '--input', '-i',
         default=None,
-        help='Input FITS file with spectra to correct (default: from config [output][reduced_fits])'
+        help='Input FITS file with spectra to correct (default: from config [output][prepared_for_pca] or [output][reduced_fits])'
     )
     parser.add_argument(
         '--decomposition', '-d',
@@ -2052,7 +2108,8 @@ Examples:
             config = ConfigLoader(args.config)
             output_config = config.get('output', {})
             config_plot_dir = output_config.get('pca_plots_dir', 'output/pca_corrected')
-            config_input_file = output_config.get('reduced_fits')
+            # Try prepared_for_pca first, then fall back to reduced_fits
+            config_input_file = output_config.get('prepared_for_pca') or output_config.get('reduced_fits')
             config_output_file = output_config.get('pcad_fits')
             
             # Get object filter from [parameters] section
@@ -2132,18 +2189,22 @@ Examples:
     except Exception as e:
         logger.warning(f"Could not load config file: {e}, using defaults")
     
-    # Determine input file: explicit CLI arg > config [output][reduced_fits]
+    # Determine input file: explicit CLI arg > config [output][prepared_for_pca] > config [output][reduced_fits]
     if args.input is not None:
         input_file = args.input
         logger.info(f"✓ Input file = {input_file} (from command line)")
     elif config_input_file:
         input_file = config_input_file
-        logger.info(f"✓ Input file = {input_file} (from config [output][reduced_fits])")
+        if config_input_file == config.get('output', {}).get('prepared_for_pca'):
+            logger.info(f"✓ Input file = {input_file} (from config [output][prepared_for_pca])")
+        else:
+            logger.info(f"✓ Input file = {input_file} (from config [output][reduced_fits])")
     else:
         logger.error("No input file specified in configuration or command line")
         logger.error("Specify via:")
         logger.error("  1. Command line: pca_correct --input /path/to/file.fits ...")
-        logger.error("  2. Config [output][reduced_fits]")
+        logger.error("  2. Config [output][prepared_for_pca]")
+        logger.error("  3. Config [output][reduced_fits]")
         sys.exit(1)
     
     # Determine object filter: explicit CLI arg > config [parameters][object]
