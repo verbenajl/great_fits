@@ -469,6 +469,10 @@ class PCACorrector:
         
         logger.info(f"Found {len(decomp_files)} decomposition files in {decomp_dir}")
         
+        if len(decomp_files) == 0:
+            logger.warning(f"No decomposition files found matching pattern: decomposition_*_components.pkl")
+            return {}
+        
         for decomp_file in decomp_files:
             try:
                 # Extract mission_id and telescope from filename
@@ -616,14 +620,29 @@ class PCACorrector:
         coeff = np.dot(component, scaled_spectrum)
         scaled_comp = coeff * component
         
-        # Noise in spectrum and component
-        spectrum_std = np.std(scaled_spectrum)
-        component_std = np.std(scaled_comp)
+        # Noise in spectrum and component - use nanstd to ignore NaN values
+        spectrum_std = np.nanstd(scaled_spectrum)
+        component_std = np.nanstd(scaled_comp)
+        
+        # Handle edge cases that could produce NaN or inf
+        if np.isnan(spectrum_std) or np.isnan(component_std):
+            # If either std is NaN, we have bad data - return high value to skip component
+            return np.inf
         
         if component_std < 1e-10:
             return np.inf
         
-        return spectrum_std / component_std
+        if spectrum_std < 1e-10:
+            # Flat spectrum - component noise is higher than signal
+            return np.inf
+        
+        noise_ratio = spectrum_std / component_std
+        
+        # Ensure the result is finite
+        if not np.isfinite(noise_ratio):
+            return np.inf
+        
+        return noise_ratio
     
     def fit_coefficients(self, spectrum, good_channels=None):
         """
@@ -733,6 +752,18 @@ class PCACorrector:
             if verbose:
                 logger.info(f"  Comp {i}: coeff={coeff[i]:.6f}, var_ratio={var_ratio:.6f}, "
                            f"noise_ratio={noise_ratio:.6f}, scaled_comp_range=[{scaled_comp.min():.6f}, {scaled_comp.max():.6f}]")
+            
+            # Skip if noise ratio is NaN (bad data) or exceeds cutoff
+            if np.isnan(noise_ratio) or np.isinf(noise_ratio):
+                if verbose:
+                    logger.info(f"    -> SKIPPED (noise_ratio is {noise_ratio}, bad data)")
+                component_info[i] = {
+                    'used': False,
+                    'reason': 'bad_noise_ratio',
+                    'coeff': coeff[i],
+                    'noise_ratio': noise_ratio
+                }
+                continue
             
             if cutoff_noise_ratio is not None and noise_ratio > cutoff_noise_ratio:
                 if verbose:
@@ -1296,7 +1327,9 @@ class PCACorrector:
         # ALL subscans within that group are ACCUMULATED and shown together
         unique_mission_tel_scan = sorted(list(set(zip(missions, telescopes, scans))))
         
+        logger.info(f"_generate_plots received {len(data)} spectra")
         logger.info(f"Grouping by (mission_id, telescope, scan): {len(unique_mission_tel_scan)} groups")
+        logger.info(f"correction_details contains {len(correction_details)} entries")
         logger.info(f"group_thresholds passed to _generate_plots: {len(group_thresholds) if group_thresholds else 0} groups")
         if group_thresholds:
             logger.info(f"  First few threshold keys: {list(group_thresholds.keys())[:3]}")
@@ -1311,21 +1344,6 @@ class PCACorrector:
             if len(group_indices) == 0:
                 continue
             
-            # Convert local indices to global indices if we have the mapping
-            if global_indices is not None:
-                global_idx_for_group = global_indices[group_indices]
-            else:
-                global_idx_for_group = group_indices
-            
-            # Filter to only spectra that were actually processed (exclude skipped ones with all bad channels)
-            usable_global_indices = [idx for idx in global_idx_for_group 
-                                if idx in correction_details 
-                                and not correction_details[idx].get('skipped', False)]
-            
-            if len(usable_global_indices) == 0:
-                logger.info(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: No usable spectra (skipping plot)")
-                continue
-            
             # Get all spectra for this group (all subscans accumulated)
             original_spectra_subset = original_spectra[group_indices]
             corrected_spectra_subset = corrected_spectra[group_indices]
@@ -1333,6 +1351,19 @@ class PCACorrector:
             # Safety check: ensure we have spectra
             if len(original_spectra_subset) == 0 or len(original_spectra_subset[0]) == 0:
                 logger.warning(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: No spectral data (skipping plot)")
+                continue
+            
+            # Get indices of spectra with correction details (were actually corrected)
+            usable_global_indices = [group_indices[i] for i in range(len(group_indices)) 
+                                    if group_indices[i] in correction_details]
+            
+            if len(usable_global_indices) == 0:
+                logger.info(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: No corrected spectra in group (skipping plot)")
+                continue
+            
+            # Additional safety check: ensure spectra have data
+            if original_spectra_subset.ndim < 2 or original_spectra_subset.shape[0] == 0 or original_spectra_subset.shape[1] == 0:
+                logger.warning(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: Invalid spectrum shape {original_spectra_subset.shape} (skipping plot)")
                 continue
             
             logger.info(f"Creating plot {total_plots + 1} for mission_id={mission_id}, telescope={telescope}, scan={scan}: {len(usable_global_indices)} usable spectra")
@@ -1343,7 +1374,9 @@ class PCACorrector:
                 x_axis = velocity_axis / 1000.0  # Convert m/s to km/s
                 x_label = 'Velocity (km/s)'
             else:
-                x_axis = np.arange(len(original_spectra_subset[0]))
+                # Safe to access now since we've checked shape above
+                n_channels = original_spectra_subset.shape[1]
+                x_axis = np.arange(n_channels)
                 x_label = 'Channel'
             
             # Safety check: ensure x_axis has elements
@@ -1461,8 +1494,8 @@ class PCACorrector:
             ax_waterfall.tick_params(labelsize=8)
             
             # Calculate n_display early - all plots will use this for consistent sizing
-            # Display all available processed spectra for this scan
-            n_display = len(original_spectra_subset)
+            # Display only the usable processed spectra (those with correction details)
+            n_display = len(usable_global_indices)
             
             # Before correction heatmap with line detection contours overlay
             threshold_2d = None
@@ -1725,9 +1758,14 @@ class PCACorrector:
                             # Draw rectangles for each detected region
                             for start, end in zip(starts, ends):
                                 # Convert channel indices to velocity/frequency coordinates
-                                x_start = np.interp(start, [0, len(row)], [x_axis[0], x_axis[-1]])
-                                x_end = np.interp(end, [0, len(row)], [x_axis[0], x_axis[-1]])
-                                x_width = x_end - x_start
+                                if len(x_axis) > 0:
+                                    x_start = np.interp(start, [0, len(row)], [x_axis[0], x_axis[-1]])
+                                    x_end = np.interp(end, [0, len(row)], [x_axis[0], x_axis[-1]])
+                                    x_width = x_end - x_start
+                                else:
+                                    x_start = start
+                                    x_end = end
+                                    x_width = x_end - x_start
                                 
                                 # Draw rectangle: (x, y, width, height)
                                 rect = Rectangle(
@@ -1775,19 +1813,40 @@ class PCACorrector:
             # COLUMN 5: EXAMPLE SPECTRUM BREAKDOWN (RIGHT SIDE)
             # ==================================================================
             # Find example spectrum (median correction)
-            correction_amounts = np.array([
-                np.mean(np.abs(original_spectra_subset[i] - corrected_spectra_subset[i]))
-                for i in range(len(original_spectra_subset))
-            ])
+            # IMPORTANT: example_idx must be within usable_global_indices, not all spectra
+            # Only use indices that actually have correction details
+            valid_indices_for_example = [
+                i for i in range(len(original_spectra_subset))
+                if i < len(usable_global_indices)  # Ensure index exists in usable list
+            ]
             
-            if np.any(correction_amounts > 0):
-                example_idx = np.argsort(correction_amounts)[len(correction_amounts)//2]
+            if len(valid_indices_for_example) == 0:
+                # If no valid indices, use the first one
+                logger.debug(f"No valid indices for example spectrum, using index 0")
+                example_idx = 0
+                example_global_idx = usable_global_indices[0] if len(usable_global_indices) > 0 else 0
             else:
-                example_idx = len(correction_amounts) // 2
+                correction_amounts = np.array([
+                    np.mean(np.abs(original_spectra_subset[i] - corrected_spectra_subset[i]))
+                    for i in valid_indices_for_example
+                ])
+                
+                if np.any(correction_amounts > 0):
+                    # Get median index in valid list
+                    median_pos = len(correction_amounts) // 2
+                    example_idx_in_valid = np.argsort(correction_amounts)[median_pos]
+                    example_idx = valid_indices_for_example[example_idx_in_valid]
+                else:
+                    example_idx = valid_indices_for_example[0]
+                
+                # Get the global index
+                if example_idx < len(usable_global_indices):
+                    example_global_idx = usable_global_indices[example_idx]
+                else:
+                    example_global_idx = usable_global_indices[0] if len(usable_global_indices) > 0 else 0
             
             original_ex = original_spectra_subset[example_idx]
             corrected_ex = corrected_spectra_subset[example_idx]
-            example_global_idx = usable_global_indices[example_idx]
             
             # Get component info for this spectrum
             if example_global_idx in correction_details:
@@ -2239,7 +2298,7 @@ Examples:
             else:
                 # Fall back to single decomposition file
                 import glob
-                decomp_files = sorted(glob.glob(str(decomp_dir / "decomposition_*.pkl")))
+                decomp_files = sorted(glob.glob(str(decomp_dir / "decomposition_*_components.pkl")))
                 if decomp_files:
                     decomposition_file = decomp_files[-1]  # Use most recent
                     logger.info(f"✓ Decomposition = {decomposition_file} (from ./output/pca_components)")
