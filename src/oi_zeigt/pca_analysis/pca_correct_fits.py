@@ -112,6 +112,20 @@ def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel
     # Use FULL spectra for detection (don't mask before OpenCV processing)
     spectra_for_detection = spectra
     
+    # CRITICAL: Reject spectra with zero or negligible signal
+    # Calculate spectrum amplitude for each row
+    spectrum_amplitudes = np.max(np.abs(spectra_for_detection), axis=1)
+    global_max_amplitude = np.max(spectrum_amplitudes)
+    
+    # Find spectra with negligible signal (< 1e-10 of the maximum)
+    amplitude_threshold = 1e-10 * global_max_amplitude
+    if amplitude_threshold == 0:
+        amplitude_threshold = 1e-10  # Fallback if all spectra are zero
+    
+    good_spectrum_mask = spectrum_amplitudes > amplitude_threshold
+    logger.debug(f"  Amplitude threshold: {amplitude_threshold:.2e}")
+    logger.debug(f"  Good spectra: {np.sum(good_spectrum_mask)}/{n_spectra}")
+    
     # Normalize spectra to 8-bit range for OpenCV
     data_min = np.min(spectra_for_detection)
     data_max = np.max(spectra_for_detection)
@@ -182,6 +196,11 @@ def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel
     
     # Convert to boolean mask
     mask = threshold.astype(bool)
+    
+    # CRITICAL: Zero out detections in spectra with negligible signal
+    # These spectra should not have any lines detected
+    mask[~good_spectrum_mask, :] = False
+    logger.debug(f"  Zeroed out {np.sum(~good_spectrum_mask)} spectra with negligible signal")
     
     # Apply velocity window constraint: zero out channels outside the window (AFTER detection)
     if not np.all(velocity_mask):
@@ -595,9 +614,17 @@ class PCACorrector:
         logger.warning(f"No decomposition found for {mission_id}/{telescope}, using default")
         return None
     
-    def get_noise_ratio(self, spectrum, component, scaled_spectrum=None):
+    def get_noise_ratio(self, spectrum, component, scaled_spectrum=None, smoothing_kernel_size=None):
         """
         Calculate noise ratio: noise in spectrum / noise in component.
+        
+        This metric measures the reliability of a component for this spectrum:
+        - noise_ratio = std(spectrum) / std(scaled_component)
+        - Higher values = component explains less signal, more noise-like
+        - Lower values = component explains signal well
+        
+        Optionally applies box-car smoothing to distinguish between noise and signal,
+        following the approach in pca_correct.py lines 939-956.
         
         Parameters
         ----------
@@ -607,6 +634,8 @@ class PCACorrector:
             PCA component
         scaled_spectrum : ndarray, optional
             Scaled spectrum (if different from original)
+        smoothing_kernel_size : int, optional
+            Kernel size for box-car smoothing. If None, no smoothing applied.
         
         Returns
         -------
@@ -620,27 +649,36 @@ class PCACorrector:
         coeff = np.dot(component, scaled_spectrum)
         scaled_comp = coeff * component
         
-        # Noise in spectrum and component - use nanstd to ignore NaN values
+        # Calculate spectrum std (unsmoothed)
         spectrum_std = np.nanstd(scaled_spectrum)
         component_std = np.nanstd(scaled_comp)
         
+        # Apply smoothing if kernel size provided (like original pca_correct.py)
+        if smoothing_kernel_size and smoothing_kernel_size > 0:
+            kernel = np.ones(smoothing_kernel_size) / smoothing_kernel_size
+            spectrum_smoothed = np.convolve(scaled_spectrum, kernel, mode="same")
+            spectrum_std = np.nanstd(spectrum_smoothed)
+        
         # Handle edge cases that could produce NaN or inf
         if np.isnan(spectrum_std) or np.isnan(component_std):
-            # If either std is NaN, we have bad data - return high value to skip component
+            # If either std is NaN, we have bad/masked data
             return np.inf
         
-        if component_std < 1e-10:
-            return np.inf
+        # Prevent division by zero with a minimum threshold
+        epsilon = 1e-15
+        if component_std < epsilon:
+            # Component has negligible amplitude
+            return 1e10
         
-        if spectrum_std < 1e-10:
-            # Flat spectrum - component noise is higher than signal
-            return np.inf
+        if spectrum_std < epsilon:
+            # Spectrum is essentially flat/zero
+            return 1e5
         
         noise_ratio = spectrum_std / component_std
         
         # Ensure the result is finite
         if not np.isfinite(noise_ratio):
-            return np.inf
+            return 1e10
         
         return noise_ratio
     
@@ -675,7 +713,7 @@ class PCACorrector:
         return coeff
     
     def apply_correction(self, spectrum, good_channels=None, good_channels_for_subtraction=None,
-                         cutoff_variance=None, cutoff_noise_ratio=None, verbose=False):
+                         cutoff_variance=None, cutoff_noise_ratio=None, verbose=False, smoothing_kernel_size=None):
         """
         Apply PCA correction to a single spectrum.
         
@@ -703,6 +741,9 @@ class PCACorrector:
             Skip components where noise_ratio > this threshold
         verbose : bool
             Print debug information
+        smoothing_kernel_size : int, optional
+            Kernel size for box-car smoothing in noise_ratio calculation.
+            If None, no smoothing applied.
         
         Returns
         -------
@@ -745,18 +786,19 @@ class PCACorrector:
                 }
                 continue
             
-            # Calculate noise ratio
+            # Calculate noise ratio (with optional smoothing)
             scaled_comp = coeff[i] * comp
-            noise_ratio = self.get_noise_ratio(spectrum, comp)
+            noise_ratio = self.get_noise_ratio(spectrum, comp, smoothing_kernel_size=smoothing_kernel_size)
             
             if verbose:
                 logger.info(f"  Comp {i}: coeff={coeff[i]:.6f}, var_ratio={var_ratio:.6f}, "
                            f"noise_ratio={noise_ratio:.6f}, scaled_comp_range=[{scaled_comp.min():.6f}, {scaled_comp.max():.6f}]")
             
-            # Skip if noise ratio is NaN (bad data) or exceeds cutoff
-            if np.isnan(noise_ratio) or np.isinf(noise_ratio):
+            # Skip if noise ratio is NaN (bad data, masked/corrupted spectrum)
+            # Note: Very large noise ratios (1e5+) are now handled in cutoff_noise_ratio check below
+            if np.isnan(noise_ratio):
                 if verbose:
-                    logger.info(f"    -> SKIPPED (noise_ratio is {noise_ratio}, bad data)")
+                    logger.info(f"    -> SKIPPED (noise_ratio is NaN, bad/masked data)")
                 component_info[i] = {
                     'used': False,
                     'reason': 'bad_noise_ratio',
@@ -807,7 +849,7 @@ class PCACorrector:
                          object_filter=None, overwrite=False, generate_plots=False,
                          output_dir='output/pca_corrected', config_window=None,
                          detect_science_lines=True, scan_filter=None, subscan_filter=None,
-                         telescope_filter=None, mission_decompositions=None):
+                         telescope_filter=None, mission_id_filter=None, mission_decompositions=None):
         """
         Correct all spectra in a FITS file.
         
@@ -843,6 +885,8 @@ class PCACorrector:
             Only correct spectra from this SUBSCAN (for testing)
         telescope_filter : str, optional
             Only correct spectra from this TELESCOP (for testing)
+        mission_id_filter : str, optional
+            Only correct spectra from this MISSION_ID (for testing)
         mission_decompositions : dict, optional
             Dictionary mapping (mission_id, telescope) or mission_id -> decomposition
             If provided, uses per-mission/telescope decompositions instead of self.components
@@ -897,6 +941,60 @@ class PCACorrector:
                 mask = telescopes == telescope_filter.strip()
                 indices = indices[mask]
                 logger.info(f"  Filtering to {len(indices)} spectra with TELESCOP='{telescope_filter}'")
+            
+            if mission_id_filter is not None:
+                def to_string(x):
+                    if isinstance(x, bytes):
+                        return x.decode('utf-8').strip()
+                    return str(x).strip()
+                
+                mission_ids_filtered = np.array([to_string(data['MISSION_ID'][i]) for i in indices])
+                mask = mission_ids_filtered == mission_id_filter.strip()
+                indices = indices[mask]
+                logger.info(f"  Filtering to {len(indices)} spectra with MISSION_ID='{mission_id_filter}'")
+                
+                # Debug: show what mission_ids are in the filtered data
+                if len(indices) > 0:
+                    filtered_mission_ids = np.unique(mission_ids_filtered[mask])
+                    logger.info(f"  Actual mission_ids in filtered data: {filtered_mission_ids}")
+                    if mission_decompositions:
+                        logger.info(f"  Available decompositions: {list(mission_decompositions.keys())[:3]}... ({len(mission_decompositions)} total)")
+                else:
+                    logger.warning(f"  WARNING: No spectra found with MISSION_ID='{mission_id_filter}'")
+                    # Show what mission_ids ARE available
+                    unique_mission_ids = np.unique(mission_ids_filtered)
+                    logger.info(f"  Available mission_ids in data: {unique_mission_ids}")
+            
+            # CRITICAL: Filter out spectra with all zeros or negligible signal
+            # These spectra cannot be corrected anyway and contaminate line detection
+            logger.info("Filtering out spectra with negligible signal...")
+            n_before_zero_filter = len(indices)
+            
+            # Calculate amplitude (max absolute value) for each spectrum, ignoring NaN
+            spectrum_amplitudes = np.array([
+                np.nanmax(np.abs(data[spectrum_col][i]))
+                for i in indices
+            ])
+            
+            # Find global maximum amplitude
+            valid_amplitudes = spectrum_amplitudes[~np.isnan(spectrum_amplitudes)]
+            if len(valid_amplitudes) > 0:
+                global_max_amplitude = np.max(valid_amplitudes)
+            else:
+                global_max_amplitude = 1.0
+            
+            # Filter: keep only spectra with amplitude > 1e-10 * global_max
+            # This filters out spectra that are all zeros or all NaN
+            amplitude_threshold = 1e-10 * global_max_amplitude
+            good_amplitude_mask = spectrum_amplitudes > amplitude_threshold
+            
+            indices = indices[good_amplitude_mask]
+            n_after_zero_filter = len(indices)
+            
+            if n_after_zero_filter < n_before_zero_filter:
+                logger.info(f"  Removed {n_before_zero_filter - n_after_zero_filter} spectra with negligible signal ({n_after_zero_filter} remaining)")
+            else:
+                logger.info(f"  All {n_after_zero_filter} spectra have sufficient signal")
             
             # Get velocity axis if available
             velocity_axis = None
@@ -968,6 +1066,13 @@ class PCACorrector:
             prelim_corrected_spectra = corrected_spectra.copy()
             detected_lines_mask = None
             
+            # Log if we're using per-mission decompositions
+            if mission_decompositions:
+                logger.info(f"Using per-mission decompositions ({len(mission_decompositions)} available)")
+                logger.info(f"  Sample keys: {list(mission_decompositions.keys())[:3]}")
+            else:
+                logger.info("Using single default decomposition for all spectra")
+            
             for spec_idx, idx in enumerate(indices):
                 try:
                     spectrum = data[spectrum_col][idx]
@@ -978,6 +1083,12 @@ class PCACorrector:
                         spec_telescope = data['TELESCOP'][idx].strip()
                         decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
                         if decomp is None:
+                            if spec_idx < 3:  # Log only first 3 misses
+                                logger.warning(f"Spectrum {idx}: No decomposition found for {spec_mission_id}/{spec_telescope} - keeping original (uncorrected)")
+                            # Keep original spectrum uncorrected instead of skipping
+                            prelim_corrected_spectra[idx] = spectrum
+                            correction_details[idx] = {'n_components_used': 0, 'skipped': True, 'reason': 'no_decomposition'}
+                            stats['failed'] += 1
                             continue
                         saved_components = self.components
                         saved_variance_ratio = self.explained_variance_ratio
@@ -1002,7 +1113,8 @@ class PCACorrector:
                         good_channels_for_subtraction=good_channels_for_fitting,
                         cutoff_variance=cutoff_variance,
                         cutoff_noise_ratio=cutoff_noise_ratio,
-                        verbose=False
+                        verbose=False,
+                        smoothing_kernel_size=self.smoothing_kernel_size
                     )
                     
                     prelim_corrected_spectra[idx] = corrected
@@ -1015,6 +1127,24 @@ class PCACorrector:
                 except Exception as e:
                     logger.debug(f"First pass correction failed for spectrum {idx}: {e}")
                     correction_details[idx] = {'n_components_used': 0, 'skipped': True}
+            
+            # Log coefficient statistics after first pass
+            all_coefficients = []
+            for idx in indices:
+                if idx in correction_details and 'coefficients' in correction_details[idx]:
+                    all_coefficients.append(correction_details[idx]['coefficients'])
+            
+            if all_coefficients:
+                all_coefficients = np.array(all_coefficients)
+                logger.info(f"COEFFICIENT STATISTICS (first pass, {len(all_coefficients)} spectra):")
+                for comp_idx in range(all_coefficients.shape[1]):
+                    comp_coeff = all_coefficients[:, comp_idx]
+                    logger.info(f"  Component {comp_idx}: "
+                              f"min={np.min(comp_coeff):.4e}, "
+                              f"max={np.max(comp_coeff):.4e}, "
+                              f"mean={np.mean(comp_coeff):.4e}, "
+                              f"std={np.std(comp_coeff):.4e}, "
+                              f"median={np.median(comp_coeff):.4e}")
             
             # Step 2: Detect lines FROM the corrected spectra (following original pca_correct.py)
             logger.info("STEP 2: Detecting lines from corrected spectra (iterative refinement)")
@@ -1111,7 +1241,8 @@ class PCACorrector:
                                 good_channels_for_subtraction=good_channels_for_subtraction,
                                 cutoff_variance=cutoff_variance,
                                 cutoff_noise_ratio=cutoff_noise_ratio,
-                                verbose=False
+                                verbose=False,
+                                smoothing_kernel_size=self.smoothing_kernel_size
                             )
                             
                             prelim_corrected_spectra[idx] = corrected
@@ -1136,7 +1267,7 @@ class PCACorrector:
                         spec_telescope = data['TELESCOP'][idx].strip()
                         decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
                         if decomp is None:
-                            logger.warning(f"Spectrum {idx}: no decomposition for {spec_mission_id}/{spec_telescope}, skipping")
+                            logger.debug(f"Spectrum {idx}: no decomposition for {spec_mission_id}/{spec_telescope}, keeping original (uncorrected)")
                             corrected_spectra[idx] = spectrum
                             stats['failed'] += 1
                             continue
@@ -1188,7 +1319,8 @@ class PCACorrector:
                         good_channels_for_subtraction=good_channels_for_subtraction,
                         cutoff_variance=cutoff_variance,
                         cutoff_noise_ratio=cutoff_noise_ratio,
-                        verbose=(spec_idx < 3)  # Log first 3 spectra
+                        verbose=(spec_idx < 3),  # Log first 3 spectra
+                        smoothing_kernel_size=self.smoothing_kernel_size
                     )
                     
                     corrected_spectra[idx] = corrected
@@ -1220,13 +1352,80 @@ class PCACorrector:
             # Update data with corrected spectra
             data[spectrum_col] = corrected_spectra
             
+            # Preserve calibration objects (TSYS, TAU_SIG) even when filtering
+            # These are needed for downstream analysis and pairing with M51CENTER
+            if object_filter:
+                # Get indices of calibration objects to preserve
+                calibration_mask = np.array([
+                    s.strip() in ('TSYS', 'TAU_SIG') 
+                    for s in data['OBJECT']
+                ])
+                calibration_indices = np.where(calibration_mask)[0]
+                
+                # Combine filtered science object indices with calibration indices
+                all_indices_to_keep = np.concatenate([indices, calibration_indices])
+                all_indices_to_keep = np.sort(all_indices_to_keep)
+                
+                logger.info(f"Filters applied - preserving {len(indices)} corrected {object_filter} + {len(calibration_indices)} calibration spectra (TSYS/TAU_SIG)")
+                filtered_data = data[all_indices_to_keep]
+                
+                # CRITICAL: Recalculate TSYS_INDEX and TAU_SIG_INDEX for the output file
+                # These indices must point to rows in the OUTPUT file, not the input file
+                # Create a mapping from old row numbers (in input) to new row numbers (in output)
+                row_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(all_indices_to_keep)}
+                
+                # Recalculate indices
+                if 'TSYS_INDEX' in filtered_data.columns.names:
+                    old_tsys_indices = filtered_data['TSYS_INDEX'].copy()
+                    new_tsys_indices = np.full_like(old_tsys_indices, -1, dtype=np.int32)
+                    
+                    for new_row_idx in range(len(filtered_data)):
+                        old_row_idx = all_indices_to_keep[new_row_idx]
+                        old_tsys_ref = old_tsys_indices[new_row_idx]
+                        
+                        # If this row had a valid TSYS_INDEX in the input, remap it to output
+                        if old_tsys_ref >= 0 and old_tsys_ref in row_mapping:
+                            new_tsys_indices[new_row_idx] = row_mapping[old_tsys_ref]
+                    
+                    filtered_data['TSYS_INDEX'] = new_tsys_indices
+                    n_remapped = np.sum(new_tsys_indices >= 0)
+                    logger.debug(f"Remapped TSYS_INDEX: {n_remapped} entries now point to correct rows in output file")
+                
+                if 'TAU_SIG_INDEX' in filtered_data.columns.names:
+                    old_tau_indices = filtered_data['TAU_SIG_INDEX'].copy()
+                    new_tau_indices = np.full_like(old_tau_indices, -1, dtype=np.int32)
+                    
+                    for new_row_idx in range(len(filtered_data)):
+                        old_row_idx = all_indices_to_keep[new_row_idx]
+                        old_tau_ref = old_tau_indices[new_row_idx]
+                        
+                        # If this row had a valid TAU_SIG_INDEX in the input, remap it to output
+                        if old_tau_ref >= 0 and old_tau_ref in row_mapping:
+                            new_tau_indices[new_row_idx] = row_mapping[old_tau_ref]
+                    
+                    filtered_data['TAU_SIG_INDEX'] = new_tau_indices
+                    n_remapped = np.sum(new_tau_indices >= 0)
+                    logger.debug(f"Remapped TAU_SIG_INDEX: {n_remapped} entries now point to correct rows in output file")
+                
+                output_table = fits.BinTableHDU(filtered_data, header=header)
+            elif scan_filter is not None or subscan_filter is not None or telescope_filter or mission_id_filter:
+                logger.info(f"Filters applied - writing only {len(indices)} filtered spectra to output")
+                filtered_data = data[indices]
+                output_table = fits.BinTableHDU(filtered_data, header=header)
+            else:
+                logger.info(f"No filters applied - writing all {len(data)} spectra to output")
+                output_table = fits.BinTableHDU(data, header=header)
+            
             # Write output FITS
             os.makedirs(os.path.dirname(output_fits) or '.', exist_ok=True)
-            hdul_out = fits.HDUList([hdul[0], fits.BinTableHDU(data, header=header)])
+            hdul_out = fits.HDUList([hdul[0], output_table])
             hdul_out.writeto(output_fits, overwrite=overwrite)
             
             logger.info(f"✓ Saved corrected spectra to {output_fits}")
-            logger.info(f"  Corrected: {stats['corrected']}/{stats['total']}")
+            logger.info(f"  Total: {stats['total']} spectra processed")
+            logger.info(f"  Corrected: {stats['corrected']} spectra")
+            if stats['failed'] > 0:
+                logger.info(f"  Kept uncorrected: {stats['failed']} spectra (no decomposition or other issues)")
             if stats['components_used']:
                 logger.info(f"  Components used: {np.mean(stats['components_used']):.1f} ± "
                            f"{np.std(stats['components_used']):.1f}")
@@ -1339,14 +1538,20 @@ class PCACorrector:
             # Get all spectra for this (mission_id, telescope, scan) combination
             # This includes ALL subscans for this scan
             group_mask = (missions == mission_id) & (telescopes == telescope) & (scans == scan)
-            group_indices = np.where(group_mask)[0]
+            group_indices_in_filtered = np.where(group_mask)[0]
             
-            if len(group_indices) == 0:
+            if len(group_indices_in_filtered) == 0:
                 continue
             
+            # Convert filtered indices back to global indices
+            if global_indices is not None:
+                group_indices_global = global_indices[group_indices_in_filtered]
+            else:
+                group_indices_global = group_indices_in_filtered
+            
             # Get all spectra for this group (all subscans accumulated)
-            original_spectra_subset = original_spectra[group_indices]
-            corrected_spectra_subset = corrected_spectra[group_indices]
+            original_spectra_subset = original_spectra[group_indices_in_filtered]
+            corrected_spectra_subset = corrected_spectra[group_indices_in_filtered]
             
             # Safety check: ensure we have spectra
             if len(original_spectra_subset) == 0 or len(original_spectra_subset[0]) == 0:
@@ -1354,19 +1559,31 @@ class PCACorrector:
                 continue
             
             # Get indices of spectra with correction details (were actually corrected)
-            usable_global_indices = [group_indices[i] for i in range(len(group_indices)) 
-                                    if group_indices[i] in correction_details]
+            # Now check global indices against correction_details
+            usable_global_indices = [global_idx for global_idx in group_indices_global
+                                    if global_idx in correction_details]
             
             if len(usable_global_indices) == 0:
                 logger.info(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: No corrected spectra in group (skipping plot)")
                 continue
+            
+            # CRITICAL: Filter subset arrays to ONLY include successfully corrected spectra
+            # Create a mapping from global indices back to positions in group_indices_global
+            usable_indices_in_group = []
+            for i, global_idx in enumerate(group_indices_global):
+                if global_idx in correction_details:
+                    usable_indices_in_group.append(i)
+            
+            # Now filter the subset arrays using these indices (which are positions in group_indices_in_filtered)
+            original_spectra_subset = original_spectra_subset[usable_indices_in_group]
+            corrected_spectra_subset = corrected_spectra_subset[usable_indices_in_group]
             
             # Additional safety check: ensure spectra have data
             if original_spectra_subset.ndim < 2 or original_spectra_subset.shape[0] == 0 or original_spectra_subset.shape[1] == 0:
                 logger.warning(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: Invalid spectrum shape {original_spectra_subset.shape} (skipping plot)")
                 continue
             
-            logger.info(f"Creating plot {total_plots + 1} for mission_id={mission_id}, telescope={telescope}, scan={scan}: {len(usable_global_indices)} usable spectra")
+            logger.info(f"Creating plot {total_plots + 1} for mission_id={mission_id}, telescope={telescope}, scan={scan}: {len(usable_indices_in_group)} usable spectra out of {len(group_indices_in_filtered)}")
             total_plots += 1
             
             # Setup x_axis
@@ -1790,20 +2007,25 @@ class PCACorrector:
             ax_masked.tick_params(labelsize=8)
             
             # Coefficients heatmap
+            # Plot coefficient magnitudes heatmap
             ax_coeff = fig.add_axes([4*padding + 3*plot_width, 0.05, plot_width, 0.45])
-            all_coeffs = []
+            all_coefficients = []
             for idx in usable_global_indices:
                 if idx in correction_details and 'coefficients' in correction_details[idx]:
-                    all_coeffs.append(correction_details[idx]['coefficients'])
+                    # Get the coefficients for this spectrum
+                    all_coefficients.append(correction_details[idx]['coefficients'])
                 else:
-                    all_coeffs.append(np.zeros(len(self.components)))
+                    # Zero coefficients for spectra without correction details
+                    all_coefficients.append(np.zeros(len(self.components)))
             
-            all_coeffs = np.array(all_coeffs)[:n_display]
+            all_coefficients = np.array(all_coefficients)[:n_display]
+            coeff_magnitudes = np.abs(all_coefficients)
+            
             # Display with component number on X-axis, spectrum number on Y-axis
-            im_coeff = ax_coeff.imshow(all_coeffs, aspect='auto',
+            im_coeff = ax_coeff.imshow(coeff_magnitudes, aspect='auto',
                                       extent=[0, len(self.components), n_display, 0],
-                                      interpolation='nearest', cmap='RdBu_r')
-            ax_coeff.set_title(f'Coefficients\nCutoff: False', fontsize=10)
+                                      interpolation='nearest', cmap='viridis')
+            ax_coeff.set_title(f'Coefficient Magnitudes', fontsize=10)
             ax_coeff.set_xlabel('Component #', fontsize=9)
             ax_coeff.set_ylabel('Spectrum #', fontsize=9)
             fig.colorbar(im_coeff, ax=ax_coeff, pad=0.02)
@@ -1871,8 +2093,8 @@ class PCACorrector:
                                           plot_width, spec_height])
                 
                 # Plot original, corrected, and component contribution
-                ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=0.5, alpha=0.5, label='Orig')
-                ax_ex_comp.plot(x_axis, corrected_ex, color='gray', lw=0.8, alpha=0.7, label='Corr')
+                ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=1.5, alpha=0.8, label='Orig', color="black", zorder=1)
+                ax_ex_comp.plot(x_axis, corrected_ex, color='gray', lw=0.5, alpha=0.5, label='Corr', zorder=2)
                 
                 scaled_comp = coeffs[comp_idx] * self.components[comp_idx]
                 ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')
@@ -2116,6 +2338,12 @@ Examples:
         default=None,
         help='Only process spectra from this TELESCOP (for testing specific combinations)'
     )
+    parser.add_argument(
+        '--mission-id',
+        type=str,
+        default=None,
+        help='Only process spectra from this MISSION_ID (e.g., 2016-05-18_GR_F298)'
+    )
     
     # Output options (plot-dir default will be set from config)
     parser.add_argument(
@@ -2129,9 +2357,9 @@ Examples:
         help='Directory for output plots (default: from config [output][pca_plots_dir])'
     )
     parser.add_argument(
-        '--overwrite',
+        '--no-overwrite',
         action='store_true',
-        help='Overwrite output file if exists'
+        help='Do NOT overwrite output file if exists (default: overwrite enabled)'
     )
     
     # Logging
@@ -2434,7 +2662,7 @@ Examples:
             hdu_index=args.hdu,
             spectrum_col=args.spectrum_column,
             object_filter=object_filter,
-            overwrite=args.overwrite,
+            overwrite=not args.no_overwrite,
             generate_plots=args.plot,
             output_dir=args.plot_dir,
             config_window=config_line_window if config_line_window else (tuple(args.config_window) if args.config_window else None),
@@ -2442,9 +2670,9 @@ Examples:
             scan_filter=args.scan,
             subscan_filter=args.subscan,
             telescope_filter=args.telescope,
+            mission_id_filter=args.mission_id,
             mission_decompositions=mission_decompositions_to_use
         )
-        
         # Print summary
         logger.info("\n=== Correction Summary ===")
         logger.info(f"Total spectra: {stats['total']}")

@@ -1,12 +1,6 @@
 [input]
 
-#fits_file = "/home/diskB/data_soft/tests/SKYCHOPDIFF/cycle6.fits"
-#fits_file = "/home/diskB/data_soft/oi_zeigt/clean_data.fits"
-#fits_file = "/home/diskB/data_soft/oi_zeigt/rejected_data.fits"
-fits_file="/home/diskB/sofiaobsdata/m51/m51_data_acquisc/kalibrated_all/m51_central_tile_singlehdu.fits"
-#fits_file="/home/diskB/sofiaobsdata/m51/m51_data_acquisc/fits_files_processed/clean_data.fits"
-#fits_file="/home/diskB/sofiaobsdata/m51/m51_data_acquisc/kalibrate_d/M51CENTER_UNKNOWN_central_tile_CB_GR_01_2016_05_12.fits"
-#fits_file="/home/diskB/sofiaobsdata/m51/m51_data_acquisc/kalibrate_d/M51CENTER_UNKNOWN_central_tile_CB_flight1_20170201_LFA_L1.fits"
+fits_file="/home/diskB/sofiaobsdata/m51/m51_data_acquisc/kalibrated_all/m51_central_tile_1hdu.fits"
 
 [parameters]
 # Object name substring for filtering (PCA correction will only process spectra containing this substring)
@@ -49,8 +43,8 @@ smoothing_kernel_size= 20
 rolling_noise_window = 11
 noise_cutoff = false
 cutoff = false
-global_noise_ratio_cutoff = 15
-noise_ratio_cutoff = 15
+global_noise_ratio_cutoff = 20
+noise_ratio_cutoff = 20
 line_kernel_size = 51
 
 
@@ -62,4 +56,5 @@ averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files
 datacube = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/datacube.fits"
 prepared_for_pca="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/prepared_for_pca.fits"
 pcad_fits="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/pca_corrected.fits"
+post_filtered_fits="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/post_filtered.fits"
 pca_plots_dir="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/pca_plots"

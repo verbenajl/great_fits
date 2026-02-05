@@ -464,9 +464,10 @@ def filter_and_save_fits(hdul: fits.HDUList,
                         output_rejected: Optional[Union[str, Path]] = None,
                         remove_column: Optional[str] = None,
                         remove_values: Optional[list] = None,
-                        apply_to_all: bool = False) -> Tuple[Path, Path]:
+                        apply_to_all: bool = False,
+                        filter_zero_spectra: bool = False) -> Tuple[Path, Path]:
     """
-    Filter FITS data by object and NaN content, with optional column value removal.
+    Filter FITS data by object and NaN content, with optional column value removal and zero-spectrum filtering.
     
     This function:
     1. Processes ALL HDUs with SPECTRUM columns (important for combined files)
@@ -474,8 +475,9 @@ def filter_and_save_fits(hdul: fits.HDUList,
     3. Filters spectra to keep only those with < nan_threshold NaN channels
        - If apply_to_all=False: Only filters target object spectra (default behavior)
        - If apply_to_all=True: Filters ALL spectra regardless of object
-    4. Optionally removes rows where a specified column matches given values
-    5. Saves two FITS files:
+    4. Optionally removes spectra where all channels are 0 (if filter_zero_spectra=True)
+    5. Optionally removes rows where a specified column matches given values
+    6. Saves two FITS files:
        - output_clean: Filtered spectra (clean data)
        - output_rejected: Spectra that were filtered out or removed
     
@@ -505,6 +507,10 @@ def filter_and_save_fits(hdul: fits.HDUList,
     apply_to_all : bool, optional
         If True, apply NaN filtering to ALL spectra (regardless of object).
         If False (default), apply NaN filtering only to target object spectra.
+    filter_zero_spectra : bool, optional
+        If True, also filter out spectra where all channels are 0.
+        These spectra are moved to the rejected file.
+        Default: False (keep zero spectra).
     
     Returns
     -------
@@ -513,6 +519,13 @@ def filter_and_save_fits(hdul: fits.HDUList,
             Path to the clean FITS file
         - rejected_path : Path
             Path to the rejected FITS file
+        - stats : dict
+            Dictionary containing filtering statistics:
+            - 'clean_count': Number of spectra in clean file
+            - 'rejected_total': Total number of rejected spectra
+            - 'rejected_nan': Count of spectra rejected for NaN threshold violation
+            - 'rejected_zero': Count of spectra rejected for being all-zero
+            - 'rejected_removed': Count of spectra rejected by --remove criteria
     
     Examples
     --------
@@ -535,6 +548,16 @@ def filter_and_save_fits(hdul: fits.HDUList,
     ...     output_clean="all_clean.fits",
     ...     output_rejected="all_rejected.fits",
     ...     apply_to_all=True  # Filter ALL spectra
+    ... )
+    
+    >>> # Also filter out all-zero spectra
+    >>> clean_path, rejected_path = filter_and_save_fits(
+    ...     hdul, 
+    ...     object_name="M51",
+    ...     nan_threshold=0.20,
+    ...     output_clean="clean_no_zeros.fits",
+    ...     output_rejected="rejected_with_zeros.fits",
+    ...     filter_zero_spectra=True  # Remove all-zero spectra
     ... )
     >>> print(f"Clean: {clean_path}, Rejected: {rejected_path}")
     """
@@ -597,6 +620,10 @@ def filter_and_save_fits(hdul: fits.HDUList,
         clean_combined = all_data[clean_mask]
         all_rejected = all_data[rejected_mask]
         
+        # Track statistics
+        nan_rejected_count = np.sum(rejected_mask)
+        removed_count = len(removed_data)
+        
         # Add the removed data to rejected
         if len(removed_data) > 0:
             all_rejected = np.concatenate([all_rejected, removed_data])
@@ -622,6 +649,10 @@ def filter_and_save_fits(hdul: fits.HDUList,
         target_clean = target_data[clean_target_mask]
         target_rejected = target_data[rejected_target_mask]
         
+        # Track statistics
+        nan_rejected_count = np.sum(rejected_target_mask)
+        removed_count = len(removed_data)
+        
         # Add the removed data to rejected
         if len(removed_data) > 0:
             target_rejected = np.concatenate([target_rejected, removed_data])
@@ -629,6 +660,37 @@ def filter_and_save_fits(hdul: fits.HDUList,
         # Combine other objects with clean target objects
         clean_combined = np.concatenate([other_data, target_clean])
         all_rejected = target_rejected
+    
+    # Filter out all-zero spectra if requested
+    zero_rejected_count = 0
+    if filter_zero_spectra:
+        # Apply zero filtering to clean_combined BEFORE returning
+        # This catches zeros in both target and non-target objects
+        # A spectrum is considered "all-zero" if:
+        # - All non-NaN channels are exactly 0, OR
+        # - All channels are NaN or 0
+        zero_mask = np.array([])
+        for spectrum in clean_combined['SPECTRUM']:
+            valid_mask = ~np.isnan(spectrum)
+            if np.sum(valid_mask) == 0:
+                # All NaN - consider it zero
+                is_zero = True
+            else:
+                # Check if all non-NaN values are 0
+                valid_values = spectrum[valid_mask]
+                is_zero = np.all(valid_values == 0)
+            zero_mask = np.append(zero_mask, is_zero)
+        
+        zero_mask = zero_mask.astype(bool)
+        
+        if np.any(zero_mask):
+            zero_rejected_count = np.sum(zero_mask)
+            # Move zero spectra to rejected file
+            zero_spectra = clean_combined[zero_mask]
+            all_rejected = np.concatenate([all_rejected, zero_spectra]) if len(all_rejected) > 0 else zero_spectra
+            
+            # Keep only non-zero spectra in clean file
+            clean_combined = clean_combined[~zero_mask]
     
     # Set default output paths
     if output_clean is None:
@@ -688,7 +750,16 @@ def filter_and_save_fits(hdul: fits.HDUList,
         hdul_rejected = fits.HDUList([primary_rejected])
         hdul_rejected.writeto(output_rejected, overwrite=True)
     
-    return output_clean, output_rejected
+    # Return paths and statistics
+    stats = {
+        'clean_count': len(clean_combined),
+        'rejected_total': len(all_rejected),
+        'rejected_nan': nan_rejected_count,
+        'rejected_zero': zero_rejected_count,
+        'rejected_removed': removed_count
+    }
+    
+    return output_clean, output_rejected, stats
 
 
 def baseline_subtract(spectrum: np.ndarray,
@@ -1388,15 +1459,18 @@ def reduce_spectra(hdul: fits.HDUList,
     else:
         filtered_data = data
     
+    # Create table from filtered data - this preserves ALL columns from the input
     table = Table(filtered_data)
     
     # Replace the spectrum column with reduced spectra (now in original dtype)
     # After extraction+baseline, the spectrum is reduced and extracted
     table[spectrum_column] = spectra
     
-    # Keep all columns including VELOCITY, DELTAV, CRPIX1
+    # All columns from the input are preserved, including:
+    # - VELOCITY, DELTAV, CRPIX1 (reference values for original spectrum)
+    # - OBJECT, SCAN, AOR_ID, etc. (metadata)
+    # - Quality/measurement columns like RMSRATIO, SQUALITY, ROLL_RMS_N, CHI_SQR, ERR_PWV, etc.
     # These are preserved for reference and downstream analysis
-    # (They refer to the original full spectrum, not the extracted range)
     
     # Add velocity axis column for easier plotting and calculations
     # This will correspond to the extracted velocity range (or full range if no extraction)

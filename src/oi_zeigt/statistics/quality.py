@@ -100,6 +100,7 @@ def get_spechistogram(hdul: fits.HDUList,
         - 'tau_atm': Atmospheric optical depth
         - 'chi_sqr': Chi-square fit value
         - 'err_pwv': PWV error
+        - 'rms_baseline': RMS baseline metric
     object_filter : str, optional
         Filter spectra by object name (substring match, case-insensitive).
         If None, all spectra are included.
@@ -130,6 +131,7 @@ def get_spechistogram(hdul: fits.HDUList,
         'tau_atm': ('TAU-ATM', 'Atmospheric Optical Depth (τ)'),
         'chi_sqr': ('CHI_SQR', 'Chi-square'),
         'err_pwv': ('ERR_PWV', 'PWV Error'),
+        'rms_baseline': ('RMS_BASELINE', 'RMS Baseline'),
     }
 
     # Validate metrics

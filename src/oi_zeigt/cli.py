@@ -33,20 +33,64 @@ def _print_fits_details(hdul):
     click.echo("\n" + "="*70)
     click.echo("FITS FILE INFORMATION")
     click.echo("="*70)
-    hdul.info()
+    
+    # Try to print file info, but handle corrupted headers gracefully
+    try:
+        hdul.info()
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        click.echo(f"WARNING: Could not read full file info: {e}")
+        click.echo("Attempting basic HDU listing...")
+        # Fall back to manual HDU listing
+        try:
+            click.echo(f"Number of HDUs: {len(hdul)}")
+            for i in range(len(hdul)):
+                try:
+                    hdu = hdul[i]
+                    click.echo(f"  HDU {i}: {hdu.name if hasattr(hdu, 'name') else 'UNKNOWN'}")
+                except (OSError, UnicodeDecodeError, ValueError):
+                    click.echo(f"  HDU {i}: (Could not read header)")
+        except Exception as e2:
+            click.echo(f"Could not list HDUs: {e2}")
+    
     click.echo("="*70 + "\n")
     
     # Print additional details
     click.echo(f"Number of HDUs: {len(hdul)}\n")
     
-    for i, hdu in enumerate(hdul):
-        click.echo(f"HDU {i}: {hdu.name} ({type(hdu).__name__})")
-        if hdu.data is not None:
-            click.echo(f"  Data shape: {hdu.data.shape}")
-            click.echo(f"  Data type: {hdu.data.dtype}")
-        if hdu.header:
-            click.echo(f"  Header keywords: {len(hdu.header)}")
-        click.echo()
+    for i in range(len(hdul)):
+        try:
+            hdu = hdul[i]
+            click.echo(f"HDU {i}: {hdu.name} ({type(hdu).__name__})")
+            
+            # For BinTableHDU, get shape from header without loading data
+            if isinstance(hdu, fits.BinTableHDU):
+                nrows = hdu.header.get('NAXIS2', 0)
+                ncols = hdu.header.get('TFIELDS', 0)
+                click.echo(f"  Data shape: ({nrows}, {ncols})")
+                click.echo(f"  Data type: BinTable (Large file - data not loaded)")
+                
+                # Show column names
+                if hasattr(hdu, 'columns') and hdu.columns.names:
+                    click.echo(f"  Columns: {', '.join(hdu.columns.names)}")
+            elif hasattr(hdu, 'data'):
+                try:
+                    # Try to get shape safely
+                    if hasattr(hdu.data, 'shape'):
+                        click.echo(f"  Data shape: {hdu.data.shape}")
+                        if hasattr(hdu.data, 'dtype'):
+                            click.echo(f"  Data type: {hdu.data.dtype}")
+                except (TypeError, MemoryError):
+                    # File too large to load
+                    if 'NAXIS2' in hdu.header:
+                        click.echo(f"  Data shape: ({hdu.header['NAXIS2']}, {hdu.header.get('TFIELDS', '?')})")
+                    click.echo(f"  Data type: (Large file - data not loaded)")
+            
+            if hdu.header:
+                click.echo(f"  Header keywords: {len(hdu.header)}")
+            click.echo()
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            click.echo(f"HDU {i}: (Could not read: {e})")
+            click.echo()
 
 
 def _print_object_info(hdul, object_filter=None):
@@ -62,124 +106,149 @@ def _print_object_info(hdul, object_filter=None):
     """
     # Look for OBJECT column in binary tables
     for hdu in hdul:
-        if hasattr(hdu, 'data') and hdu.data is not None:
-            # Check if 'OBJECT' column exists
-            if 'OBJECT' in hdu.data.dtype.names:
-                objects = hdu.data['OBJECT']
-                
-                # Get unique objects and their counts
-                from collections import Counter
-                object_counts = Counter(objects)
-                
-                click.echo("="*70)
-                click.echo("UNIQUE OBJECTS IN FITS FILE")
-                click.echo("="*70)
-                click.echo(f"Total unique objects: {len(object_counts)}\n")
-                
-                # Sort by count (descending)
-                sorted_objects = sorted(object_counts.items(), key=lambda x: x[1], reverse=True)
-                
-                max_obj_len = max(len(obj.decode() if isinstance(obj, bytes) else obj) 
-                                  for obj, _ in sorted_objects)
-                
-                for obj, count in sorted_objects:
-                    obj_str = obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()
-                    click.echo(f"  {obj_str:<{max_obj_len}}  : {count:6d} entries")
-                
-                click.echo("="*70 + "\n")
-            
-            # Filter data by object if object_filter is provided
-            if object_filter and 'OBJECT' in hdu.data.dtype.names:
-                objects = hdu.data['OBJECT']
-                mask = np.array([
-                    object_filter.upper() in (obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()).upper()
-                    for obj in objects
-                ])
-                filtered_data = hdu.data[mask]
-                
-                click.echo("="*70)
-                click.echo(f"FILTERED DATA (OBJECT contains '{object_filter}')")
-                click.echo("="*70)
-                click.echo(f"Total entries matching filter: {np.sum(mask)}\n")
-                
-                # Show AOR_IDs for filtered data
-                if 'AOR_ID' in hdu.data.dtype.names:
-                    filtered_aor_ids = filtered_data['AOR_ID']
-                    aor_id_counts = Counter(filtered_aor_ids)
+        try:
+            if isinstance(hdu, fits.BinTableHDU):
+                # Check if 'OBJECT' column exists via header
+                if 'OBJECT' in hdu.columns.names:
+                    # Try to access the data with error handling
+                    try:
+                        objects = hdu.data['OBJECT']
+                    except (OSError, ValueError):
+                        # If normal access fails, try with memmap=False by re-opening
+                        # For now, just warn the user
+                        click.echo("="*70)
+                        click.echo("OBJECT COLUMN INFORMATION")
+                        click.echo("="*70)
+                        click.echo(f"OBJECT column exists but could not be read (file may have encoding issues)")
+                        click.echo("Consider regenerating the FITS file with proper encoding.\n")
+                        return
                     
-                    click.echo(f"AOR_IDs in filtered data ({len(aor_id_counts)} unique):")
-                    sorted_aor_ids = sorted(aor_id_counts.items(), key=lambda x: x[1], reverse=True)
-                    max_aor_len = max(len(aor_id.decode() if isinstance(aor_id, bytes) else aor_id) 
-                                      for aor_id, _ in sorted_aor_ids)
+                    # Get unique objects and their counts
+                    from collections import Counter
+                    object_counts = Counter(objects)
                     
-                    for aor_id, count in sorted_aor_ids:
-                        aor_id_str = aor_id.decode().strip() if isinstance(aor_id, bytes) else str(aor_id).strip()
-                        click.echo(f"  {aor_id_str:<{max_aor_len}}  : {count:6d} entries")
-                
-                # Show MISSION_IDs for filtered data
-                if 'MISSION_ID' in hdu.data.dtype.names:
-                    filtered_mission_ids = filtered_data['MISSION_ID']
-                    mission_id_counts = Counter(filtered_mission_ids)
+                    click.echo("="*70)
+                    click.echo("UNIQUE OBJECTS IN FITS FILE")
+                    click.echo("="*70)
+                    click.echo(f"Total unique objects: {len(object_counts)}\n")
                     
-                    click.echo(f"\nMISSION_IDs in filtered data ({len(mission_id_counts)} unique):")
-                    sorted_mission_ids = sorted(mission_id_counts.items(), key=lambda x: x[1], reverse=True)
-                    max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id) 
-                                          for mission_id, _ in sorted_mission_ids)
+                    # Sort by count (descending)
+                    sorted_objects = sorted(object_counts.items(), key=lambda x: x[1], reverse=True)
                     
-                    for mission_id, count in sorted_mission_ids:
-                        mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
-                        click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
+                    max_obj_len = max(len(obj.decode() if isinstance(obj, bytes) else obj) 
+                                      for obj, _ in sorted_objects)
+                    
+                    for obj, count in sorted_objects:
+                        obj_str = obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()
+                        click.echo(f"  {obj_str:<{max_obj_len}}  : {count:6d} entries")
+                    
+                    click.echo("="*70 + "\n")
                 
-                click.echo("="*70 + "\n")
-                return  # Skip the general AOR/MISSION display if we're showing filtered data
-            
-            # Check for AOR_ID column (only if not filtered)
-            if 'AOR_ID' in hdu.data.dtype.names:
-                aor_ids = hdu.data['AOR_ID']
+                # Filter data by object if object_filter is provided
+                if object_filter and 'OBJECT' in hdu.columns.names:
+                    try:
+                        objects = hdu.data['OBJECT']
+                        mask = np.array([
+                            object_filter.upper() in (obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()).upper()
+                            for obj in objects
+                        ])
+                        filtered_data = hdu.data[mask]
+                        
+                        click.echo("="*70)
+                        click.echo(f"FILTERED DATA (OBJECT contains '{object_filter}')")
+                        click.echo("="*70)
+                        click.echo(f"Total entries matching filter: {np.sum(mask)}\n")
+                        
+                        # Show AOR_IDs for filtered data
+                        if 'AOR_ID' in hdu.columns.names:
+                            filtered_aor_ids = filtered_data['AOR_ID']
+                            aor_id_counts = Counter(filtered_aor_ids)
+                            
+                            click.echo(f"AOR_IDs in filtered data ({len(aor_id_counts)} unique):")
+                            sorted_aor_ids = sorted(aor_id_counts.items(), key=lambda x: x[1], reverse=True)
+                            max_aor_len = max(len(aor_id.decode() if isinstance(aor_id, bytes) else aor_id) 
+                                              for aor_id, _ in sorted_aor_ids)
+                            
+                            for aor_id, count in sorted_aor_ids:
+                                aor_id_str = aor_id.decode().strip() if isinstance(aor_id, bytes) else str(aor_id).strip()
+                                click.echo(f"  {aor_id_str:<{max_aor_len}}  : {count:6d} entries")
+                        
+                        # Show MISSION_IDs for filtered data
+                        if 'MISSION_ID' in hdu.columns.names:
+                            filtered_mission_ids = filtered_data['MISSION_ID']
+                            mission_id_counts = Counter(filtered_mission_ids)
+                            
+                            click.echo(f"\nMISSION_IDs in filtered data ({len(mission_id_counts)} unique):")
+                            sorted_mission_ids = sorted(mission_id_counts.items(), key=lambda x: x[1], reverse=True)
+                            max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id) 
+                                                  for mission_id, _ in sorted_mission_ids)
+                            
+                            for mission_id, count in sorted_mission_ids:
+                                mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
+                                click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
+                        
+                        click.echo("="*70 + "\n")
+                        return  # Skip the general AOR/MISSION display if we're showing filtered data
+                    except (OSError, ValueError, TypeError):
+                        # If filtered data access fails, skip filtering info
+                        pass
                 
-                # Get unique AOR_IDs and their counts
-                aor_id_counts = Counter(aor_ids)
+                # Check for AOR_ID column (only if not filtered)
+                try:
+                    if 'AOR_ID' in hdu.columns.names:
+                        aor_ids = hdu.data['AOR_ID']
+                        
+                        # Get unique AOR_IDs and their counts
+                        aor_id_counts = Counter(aor_ids)
+                        
+                        click.echo("="*70)
+                        click.echo("UNIQUE AOR_IDS IN FITS FILE")
+                        click.echo("="*70)
+                        click.echo(f"Total unique AOR_IDs: {len(aor_id_counts)}\n")
+                        
+                        # Sort by count (descending)
+                        sorted_aor_ids = sorted(aor_id_counts.items(), key=lambda x: x[1], reverse=True)
+                        
+                        max_aor_len = max(len(aor_id.decode() if isinstance(aor_id, bytes) else aor_id) 
+                                          for aor_id, _ in sorted_aor_ids)
+                        
+                        for aor_id, count in sorted_aor_ids:
+                            aor_id_str = aor_id.decode().strip() if isinstance(aor_id, bytes) else str(aor_id).strip()
+                            click.echo(f"  {aor_id_str:<{max_aor_len}}  : {count:6d} entries")
+                        
+                        click.echo("="*70 + "\n")
+                except (OSError, ValueError, TypeError):
+                    pass
                 
-                click.echo("="*70)
-                click.echo("UNIQUE AOR_IDS IN FITS FILE")
-                click.echo("="*70)
-                click.echo(f"Total unique AOR_IDs: {len(aor_id_counts)}\n")
-                
-                # Sort by count (descending)
-                sorted_aor_ids = sorted(aor_id_counts.items(), key=lambda x: x[1], reverse=True)
-                
-                max_aor_len = max(len(aor_id.decode() if isinstance(aor_id, bytes) else aor_id) 
-                                  for aor_id, _ in sorted_aor_ids)
-                
-                for aor_id, count in sorted_aor_ids:
-                    aor_id_str = aor_id.decode().strip() if isinstance(aor_id, bytes) else str(aor_id).strip()
-                    click.echo(f"  {aor_id_str:<{max_aor_len}}  : {count:6d} entries")
-                
-                click.echo("="*70 + "\n")
-            
-            # Check for MISSION_ID column (only if not filtered)
-            if 'MISSION_ID' in hdu.data.dtype.names:
-                mission_ids = hdu.data['MISSION_ID']
-                
-                # Get unique MISSION_IDs and their counts
-                mission_id_counts = Counter(mission_ids)
-                
-                click.echo("="*70)
-                click.echo("UNIQUE MISSION_IDS IN FITS FILE")
-                click.echo("="*70)
-                click.echo(f"Total unique MISSION_IDs: {len(mission_id_counts)}\n")
-                
-                # Sort by count (descending)
-                sorted_mission_ids = sorted(mission_id_counts.items(), key=lambda x: x[1], reverse=True)
-                
-                max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id) 
-                                      for mission_id, _ in sorted_mission_ids)
-                
-                for mission_id, count in sorted_mission_ids:
-                    mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
-                    click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
-                
-                click.echo("="*70 + "\n")
+                # Check for MISSION_ID column (only if not filtered)
+                try:
+                    if 'MISSION_ID' in hdu.columns.names:
+                        mission_ids = hdu.data['MISSION_ID']
+                        
+                        # Get unique MISSION_IDs and their counts
+                        mission_id_counts = Counter(mission_ids)
+                        
+                        click.echo("="*70)
+                        click.echo("UNIQUE MISSION_IDS IN FITS FILE")
+                        click.echo("="*70)
+                        click.echo(f"Total unique MISSION_IDs: {len(mission_id_counts)}\n")
+                        
+                        # Sort by count (descending)
+                        sorted_mission_ids = sorted(mission_id_counts.items(), key=lambda x: x[1], reverse=True)
+                        
+                        max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id) 
+                                              for mission_id, _ in sorted_mission_ids)
+                        
+                        for mission_id, count in sorted_mission_ids:
+                            mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
+                            click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
+                        
+                        click.echo("="*70 + "\n")
+                except (OSError, ValueError, TypeError):
+                    pass
+        
+        except (OSError, UnicodeDecodeError, ValueError, TypeError, MemoryError) as e:
+            click.echo(f"WARNING: Could not read object information from HDU: {e}")
 
 
 @click.command()
@@ -213,13 +282,25 @@ def _print_object_info(hdul, object_filter=None):
     default=False,
     help="Print info from output.prepared_for_pca in config.toml"
 )
-def print_fits_info(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool):
+@click.option(
+    "--pcad",
+    is_flag=True,
+    default=False,
+    help="Print info from output.pcad_fits (PCA-corrected) in config.toml"
+)
+@click.option(
+    "--rejected",
+    is_flag=True,
+    default=False,
+    help="Print info from output.rejected_fits in config.toml"
+)
+def print_fits_info(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool, pcad: bool, rejected: bool):
     """
     Print basic information about a FITS file.
     
     Can read the FITS file path from a config.toml file or directly specify it.
     
-    Use --reduced, --clean, or --prepared flags to read from output paths in config.toml
+    Use --reduced, --clean, --prepared, --pcad, or --rejected flags to read from output paths in config.toml
     
     Examples:
     
@@ -235,6 +316,12 @@ def print_fits_info(config: Optional[str], fits: Optional[str], reduced: bool, c
         # Read FITS file from output.prepared_for_pca in config.toml
         print_fits_info --config config.toml --prepared
         
+        # Read FITS file from output.pcad_fits (PCA-corrected) in config.toml
+        print_fits_info --config config.toml --pcad
+        
+        # Read FITS file from output.rejected_fits in config.toml
+        print_fits_info --config config.toml --rejected
+        
         # Read FITS file directly
         print_fits_info --fits /path/to/file.fits
         
@@ -244,7 +331,7 @@ def print_fits_info(config: Optional[str], fits: Optional[str], reduced: bool, c
     try:
         # Load config to get object filter if available
         object_filter = None
-        if config or (reduced or clean or prepared):
+        if config or (reduced or clean or prepared or pcad or rejected):
             try:
                 import tomllib
             except ModuleNotFoundError:
@@ -257,7 +344,7 @@ def print_fits_info(config: Optional[str], fits: Optional[str], reduced: bool, c
                 object_filter = parameters_cfg.get('object', None)
                 
                 # Handle output file flags
-                if reduced or clean or prepared:
+                if reduced or clean or prepared or pcad or rejected:
                     output_cfg = cfg.get('output', {})
                     if reduced and 'reduced_fits' in output_cfg:
                         fits = output_cfg['reduced_fits']
@@ -268,7 +355,13 @@ def print_fits_info(config: Optional[str], fits: Optional[str], reduced: bool, c
                     elif prepared and 'prepared_for_pca' in output_cfg:
                         fits = output_cfg['prepared_for_pca']
                         click.echo(f"Reading from output.prepared_for_pca: {fits}")
-                    elif reduced or clean or prepared:
+                    elif pcad and 'pcad_fits' in output_cfg:
+                        fits = output_cfg['pcad_fits']
+                        click.echo(f"Reading from output.pcad_fits: {fits}")
+                    elif rejected and 'rejected_fits' in output_cfg:
+                        fits = output_cfg['rejected_fits']
+                        click.echo(f"Reading from output.rejected_fits: {fits}")
+                    elif reduced or clean or prepared or pcad or rejected:
                         click.echo(click.style(
                             f"Error: Requested output file not found in config.toml",
                             fg="red"
@@ -916,7 +1009,7 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     "--fits",
     type=click.Path(exists=True),
     default=None,
-    help="Path to FITS file to read directly"
+    help="Path to FITS file to read (default: input.fits_file from config.toml)"
 )
 @click.option(
     "--object",
@@ -933,13 +1026,13 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     "--output-clean",
     type=click.Path(),
     default=None,
-    help="Output path for clean FITS file (default: clean_data.fits)"
+    help="Output path for clean FITS file (default: output.clean_fts)"
 )
 @click.option(
     "--output-rejected",
     type=click.Path(),
     default=None,
-    help="Output path for rejected FITS file (default: rejected_data.fits)"
+    help="Output path for rejected FITS file (default: output.rejected_fits)"
 )
 @click.option(
     "--remove",
@@ -960,24 +1053,41 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     default=False,
     help="Apply NaN filtering only to target object (not to all spectra)"
 )
+@click.option(
+    "--filter-zero",
+    is_flag=True,
+    default=False,
+    help="Filter out spectra that are all zeros (entire spectrum = 0)"
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
                 nan_threshold: float, output_clean: Optional[str], 
                 output_rejected: Optional[str], remove: Optional[str],
-                remove_values: tuple, apply_only_to_object: bool):
+                remove_values: tuple, apply_only_to_object: bool, filter_zero: bool):
     """
-    Filter FITS data by object, NaN content, and/or column values.
+    Filter FITS data by object, NaN content, all-zero spectra, and/or column values.
     
     Creates two FITS files:
-    1. Clean file: Spectra passing NaN threshold filter
+    1. Clean file: Spectra passing NaN threshold filter (and not all-zero if --filter-zero)
     2. Rejected file: Spectra failing NaN threshold filter or matching removal criteria
+    
+    Input file priority: --fits option > config.toml [input][fits_file]
+    Output file defaults: From config.toml [output][clean_fits] and [output][rejected_fits]
     
     By default, NaN filtering is applied to ALL spectra. Use --apply-only-to-object
     to filter only the target object and keep all other objects regardless of NaN content.
     
+    All-zero spectra filtering:
+    - When --filter-zero is used, removes any spectrum where all channels are 0
+    - Useful for identifying corrupted or non-existent observations
+    - Applied to all spectra regardless of object filtering mode
+    
     Examples:
     
-        # Filter ALL spectra by NaN threshold (default)
+        # Use config defaults for input and output files
         filter_fits --config config.toml
+        
+        # Override input file, use config defaults for output
+        filter_fits --config config.toml --fits custom_input.fits
         
         # Filter only M51 spectra, keep all other objects
         filter_fits --config config.toml --apply-only-to-object
@@ -985,13 +1095,17 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         # Filter all with custom thresholds
         filter_fits --config config.toml --nan-threshold 0.75
         
+        # Filter out all-zero spectra (corrupted/empty data)
+        filter_fits --config config.toml --filter-zero
+        
         # Filter specific object and specify output files
         filter_fits --config config.toml --object "M51" \\
             --output-clean m51_clean.fits --output-rejected m51_rejected.fits
         
-        # Remove specific AOR_ID values AND filter all spectra
+        # Remove specific AOR_ID values AND filter all spectra and zero spectra
         filter_fits --config config.toml --remove AOR_ID \\
-            --remove-values 04_0116_0020609 --remove-values 04_0116_0020506
+            --remove-values 04_0116_0020609 --remove-values 04_0116_0020506 \\
+            --filter-zero
     """
     try:
         # Always try to load config
@@ -1003,16 +1117,25 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         except FileNotFoundError:
             config_data = {}
         
-        # Read FITS file
+        # Read FITS file - prioritize explicit --fits flag, then config input.fits_file
         if fits:
             click.echo(f"Reading FITS file: {fits}")
             hdul = read_fits(fits)
-        elif config:
-            click.echo(f"Reading config from: {config}")
-            hdul = read_fits_from_config(config)
         else:
-            click.echo("Reading config from default location...")
-            hdul = read_fits_from_config()
+            # Try to get from config
+            try:
+                fits_from_config = config_data.get("input", {}).get("fits_file")
+                if fits_from_config:
+                    click.echo(f"Reading FITS file from config [input][fits_file]: {fits_from_config}")
+                    hdul = read_fits(fits_from_config)
+                else:
+                    # Fallback to old behavior
+                    click.echo(f"Reading config from: {config or 'default'}")
+                    hdul = read_fits_from_config(config)
+            except (FileNotFoundError, KeyError):
+                # Fallback to old behavior
+                click.echo(f"Reading config from: {config or 'default'}")
+                hdul = read_fits_from_config(config)
         
         # Get object name from argument or config
         if object is None and config:
@@ -1062,12 +1185,16 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         click.echo(f"Keeping spectra with < {nan_threshold:.1%} NaN channels")
         click.echo(f"Rejecting spectra with >= {nan_threshold:.1%} NaN channels\n")
         
+        # Check for zero filtering
+        if filter_zero:
+            click.echo(f"Also filtering out all-zero spectra\n")
+        
         # Check for removal criteria
         if remove and remove_values:
             click.echo(f"Also removing rows where {remove} = {', '.join(remove_values)}\n")
         
         # Filter and save
-        clean_path, rejected_path = filter_and_save_fits(
+        clean_path, rejected_path, stats = filter_and_save_fits(
             hdul,
             object_name=object,
             nan_threshold=nan_threshold,
@@ -1075,7 +1202,8 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             output_rejected=output_rejected,
             remove_column=remove,
             remove_values=list(remove_values) if remove_values else None,
-            apply_to_all=not apply_only_to_object
+            apply_to_all=not apply_only_to_object,
+            filter_zero_spectra=filter_zero
         )
         
         # Get statistics before closing
@@ -1101,7 +1229,15 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         click.echo(f"  (Only M51 spectra with < {nan_threshold:.1%} NaN channels)")
         click.echo(f"\nRejected FITS file: {rejected_path}")
         click.echo(f"  Records: {n_rejected}")
-        click.echo(f"  (Contains only {object} spectra with >= {nan_threshold:.1%} NaN channels)")
+        
+        # Print detailed rejection statistics
+        click.echo(f"\n  Rejection breakdown:")
+        click.echo(f"    - NaN threshold violations: {stats['rejected_nan']}")
+        if filter_zero:
+            click.echo(f"    - All-zero spectra: {stats['rejected_zero']}")
+        if stats['rejected_removed'] > 0:
+            click.echo(f"    - Removed by --remove criteria: {stats['rejected_removed']}")
+        
         click.echo()
         
     except FileNotFoundError as e:
@@ -1214,7 +1350,7 @@ def apply_baseline(config, fits, order, window, output):
 @click.option('--baseline-order', type=int, default=None,
               help='Polynomial order for baseline (default: read from config or 1).')
 @click.option('--baseline-window', type=(int, int), default=None,
-              help='Channel range [start end] to exclude from baseline fitting.')
+              help='Channel range [start end] to exclude from baseline fitting (default: read from config [reduction].line_window or None to use all channels).')
 @click.option('--smooth', is_flag=True, default=False,
               help='Apply smoothing.')
 @click.option('--smooth-window', type=int, default=5,
@@ -1599,8 +1735,20 @@ def average_cmd(config, reduced, output, object, group_by, no_group, plot):
 @click.command()
 @click.option('--config', type=click.Path(exists=True), 
               help='Path to config.toml file.')
+@click.option('--fits', type=click.Path(exists=True), 
+              help='Path to FITS file (overrides config [input].fits_file).')
 @click.option('--reduced', is_flag=True, default=False,
               help='Use reduced_data.fits instead of the input data.')
+@click.option('--clean', is_flag=True, default=False,
+              help='Use clean_data.fits from config [output].clean_fits.')
+@click.option('--rejected', is_flag=True, default=False,
+              help='Use rejected_data.fits from config [output].rejected_fits.')
+@click.option('--prepared', is_flag=True, default=False,
+              help='Use prepared_for_pca.fits from config [output].prepared_for_pca.')
+@click.option('--pcad', is_flag=True, default=False,
+              help='Use pcad.fits from config [output].pcad_fits.')
+@click.option('--postfiltered', is_flag=True, default=False,
+              help='Use post_filtered.fits from config [output].post_filtered_fits.')
 @click.option('--object', type=str, default=None,
               help='Filter by object name. If not specified, uses "object" from config.toml if available.')
 @click.option('--all', 'all_metrics', is_flag=True, default=False,
@@ -1621,20 +1769,22 @@ def average_cmd(config, reduced, output, object, group_by, no_group, plot):
               help='Include chi-square metric.')
 @click.option('--err-pwv', is_flag=True, default=False,
               help='Include PWV error metric.')
+@click.option('--rms-baseline', is_flag=True, default=False,
+              help='Include RMS baseline metric.')
 @click.option('--bins', type=int, default=30,
               help='Number of histogram bins (default: 30).')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for plot. If not specified, plot is shown but not saved.')
-def spechistogram_cmd(config, reduced, object, all_metrics, rmsratio, squality, roll_rms_n, mh2o, 
-                      tsys, tau_atm, chi_sqr, err_pwv, bins, plot):
+def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, postfiltered, object, all_metrics, rmsratio, squality, roll_rms_n, mh2o, 
+                      tsys, tau_atm, chi_sqr, err_pwv, rms_baseline, bins, plot):
     """
     Generate histograms of multiple spectral quality metrics.
     
     Creates a combined multi-panel figure showing histograms of selected quality metrics.
     Each metric shows mean and median lines.
     
-    Reads input file from config.toml [input].fits_file by default, or uses
-    [output].reduced_fits if --reduced flag is specified.
+    Input file priority: --fits option > output flags (--clean, --rejected, --prepared, --pcad, --postfiltered) > 
+                        config [input].fits_file > --reduced flag > config [output].reduced_fits
     
     Available metrics:
     - --rmsratio: RMS ratio quality metric
@@ -1645,31 +1795,98 @@ def spechistogram_cmd(config, reduced, object, all_metrics, rmsratio, squality, 
     - --tau-atm: Atmospheric optical depth
     - --chi-sqr: Chi-square fit value
     - --err-pwv: PWV error
+    - --rms-baseline: RMS baseline metric
     
     Use --all to include all available metrics.
     
     Examples:
         spechistogram --config config.toml --rmsratio --tsys
+        spechistogram --config config.toml --fits custom_data.fits --rmsratio
+        spechistogram --config config.toml --clean --all
+        spechistogram --config config.toml --prepared --rmsratio
         spechistogram --config config.toml --reduced --all
         spechistogram --config config.toml --all --object M51 --plot metrics.png
     """
     try:
+        # Import fits module with alias to avoid collision with 'fits' parameter
+        from astropy.io import fits as fits_module
+        
         # Load config
         config_path = config if config else None
         cfg = get_config(config_path) if config_path else {}
         
         # Determine FITS file to process
-        if reduced:
-            # Use reduced_data.fits from config
+        # Priority: --fits option > output flags (--clean, --rejected, --prepared, --pcad, --postfiltered) > 
+        #           config [input].fits_file > --reduced flag > config [output].reduced_fits
+        fits_file = None
+        
+        if fits:
+            fits_file = fits
+            file_description = f"custom FITS file"
+        elif clean:
             output_cfg = cfg.get('output', {})
-            reduced_fits_path = output_cfg.get('reduced_fits', None)
-            if not reduced_fits_path:
+            fits_file = output_cfg.get('clean_fits')
+            file_description = f"clean data"
+            if not fits_file:
+                click.echo(click.style("Error: --clean flag specified but [output].clean_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
+        elif rejected:
+            output_cfg = cfg.get('output', {})
+            fits_file = output_cfg.get('rejected_fits')
+            file_description = f"rejected data"
+            if not fits_file:
+                click.echo(click.style("Error: --rejected flag specified but [output].rejected_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
+        elif prepared:
+            output_cfg = cfg.get('output', {})
+            fits_file = output_cfg.get('prepared_for_pca')
+            file_description = f"prepared for PCA"
+            if not fits_file:
+                click.echo(click.style("Error: --prepared flag specified but [output].prepared_for_pca not defined in config", fg="red"), err=True)
+                sys.exit(1)
+        elif pcad:
+            output_cfg = cfg.get('output', {})
+            fits_file = output_cfg.get('pcad_fits')
+            file_description = f"PCAD"
+            if not fits_file:
+                click.echo(click.style("Error: --pcad flag specified but [output].pcad_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
+        elif postfiltered:
+            output_cfg = cfg.get('output', {})
+            fits_file = output_cfg.get('post_filtered_fits')
+            file_description = f"post-filtered"
+            if not fits_file:
+                click.echo(click.style("Error: --postfiltered flag specified but [output].post_filtered_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
+        elif reduced:
+            output_cfg = cfg.get('output', {})
+            fits_file = output_cfg.get('reduced_fits')
+            file_description = f"reduced data"
+            if not fits_file:
                 click.echo(click.style("Error: --reduced flag specified but [output].reduced_fits not defined in config", fg="red"), err=True)
                 sys.exit(1)
-            hdul = fits.open(reduced_fits_path)
         else:
-            # Use input file from config
-            hdul = read_fits_from_config(config_path)
+            # Try to get from config input.fits_file
+            try:
+                fits_from_config = cfg.get("input", {}).get("fits_file")
+                if fits_from_config:
+                    fits_file = fits_from_config
+                    file_description = f"input data"
+                else:
+                    # Fallback to read_fits_from_config
+                    click.echo("Reading FITS file from config (default input)...")
+                    hdul = read_fits_from_config(config_path)
+                    fits_file = None
+            except (FileNotFoundError, KeyError):
+                # Fallback to old behavior
+                click.echo("Reading FITS file from config (default input)...")
+                hdul = read_fits_from_config(config_path)
+                fits_file = None
+        
+        # Open FITS file if we have a path
+        if fits_file:
+            click.echo(f"Analyzing {file_description}: {fits_file}")
+            hdul = fits_module.open(fits_file)
         
         # Determine object filter
         if object is None:
@@ -1685,7 +1902,7 @@ def spechistogram_cmd(config, reduced, object, all_metrics, rmsratio, squality, 
         
         # If --all is specified, enable all metrics
         if all_metrics:
-            metrics = ['rmsratio', 'squality', 'roll_rms_n', 'mh2o', 'tsys', 'tau_atm', 'chi_sqr', 'err_pwv']
+            metrics = ['rmsratio', 'squality', 'roll_rms_n', 'mh2o', 'tsys', 'tau_atm', 'chi_sqr', 'err_pwv', 'rms_baseline']
         else:
             # Build list from individual flags
             if rmsratio:
@@ -1704,9 +1921,11 @@ def spechistogram_cmd(config, reduced, object, all_metrics, rmsratio, squality, 
                 metrics.append('chi_sqr')
             if err_pwv:
                 metrics.append('err_pwv')
+            if rms_baseline:
+                metrics.append('rms_baseline')
         
         if not metrics:
-            click.echo(click.style("Error: No metrics selected. Use --all or at least one of: --rmsratio, --squality, --roll-rms-n, --mh2o, --tsys, --tau-atm, --chi-sqr, --err-pwv", fg="red"), err=True)
+            click.echo(click.style("Error: No metrics selected. Use --all or at least one of: --rmsratio, --squality, --roll-rms-n, --mh2o, --tsys, --tau-atm, --chi-sqr, --err-pwv, --rms-baseline", fg="red"), err=True)
             sys.exit(1)
         
         # Generate histograms
@@ -1764,18 +1983,30 @@ def spechistogram_cmd(config, reduced, object, all_metrics, rmsratio, squality, 
               help='Path to config.toml file.')
 @click.option('--reduced', is_flag=True, default=False,
               help='Use reduced_data.fits instead of the input data.')
+@click.option('--clean', is_flag=True, default=False,
+              help='Use clean_fits from config.toml instead of the input data.')
+@click.option('--rejected', is_flag=True, default=False,
+              help='Use rejected_fits from config.toml instead of the input data.')
+@click.option('--prepared', is_flag=True, default=False,
+              help='Use prepared_for_pca from config.toml instead of the input data.')
+@click.option('--pcad', is_flag=True, default=False,
+              help='Use pcad_fits (PCA-corrected) from config.toml instead of the input data.')
 @click.option('--object', type=str, default=None,
               help='Filter by object name (e.g., "M51"). Defaults to "object" from config.toml if not specified. If not in config either, all spectra are analyzed.')
 @click.option('--bins', type=int, default=30,
               help='Number of histogram bins (default: 30).')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for plot (e.g., rmsratio_hist.png). If not specified, plot is shown but not saved.')
-def rmsratio_cmd(config, reduced, object, bins, plot):
+def rmsratio_cmd(config, reduced, clean, rejected, prepared, pcad, object, bins, plot):
     """
     Analyze RMSRATIO quality metric and generate histogram.
     
-    Reads input file from config.toml [input].fits_file by default, or uses
-    [output].reduced_fits if --reduced flag is specified.
+    Reads input file from config.toml [input].fits_file by default, or uses one of:
+    - [output].reduced_fits if --reduced flag is specified
+    - [output].clean_fits if --clean flag is specified
+    - [output].rejected_fits if --rejected flag is specified
+    - [output].prepared_for_pca if --prepared flag is specified
+    - [output].pcad_fits if --pcad flag is specified
     
     Computes statistics and creates a histogram of RMSRATIO values
     for all spectra or a specific object.
@@ -1791,6 +2022,10 @@ def rmsratio_cmd(config, reduced, object, bins, plot):
     Examples:
         rmsratio --config config.toml
         rmsratio --config config.toml --reduced
+        rmsratio --config config.toml --clean
+        rmsratio --config config.toml --rejected
+        rmsratio --config config.toml --prepared
+        rmsratio --config config.toml --pcad
         rmsratio --config config.toml --object M51
         rmsratio --config config.toml --bins 50 --plot hist.png
     """
@@ -1800,14 +2035,29 @@ def rmsratio_cmd(config, reduced, object, bins, plot):
         cfg = get_config(config_path) if config_path else {}
         
         # Determine FITS file to process
-        if reduced:
-            # Use reduced_data.fits from config
+        fits_path = None
+        if reduced or clean or rejected or prepared or pcad:
             output_cfg = cfg.get('output', {})
-            reduced_fits_path = output_cfg.get('reduced_fits', None)
-            if not reduced_fits_path:
-                click.echo(click.style("Error: --reduced flag specified but [output].reduced_fits not defined in config", fg="red"), err=True)
+            if reduced:
+                fits_path = output_cfg.get('reduced_fits', None)
+                flag_name = "reduced_fits"
+            elif clean:
+                fits_path = output_cfg.get('clean_fits', None)
+                flag_name = "clean_fits"
+            elif rejected:
+                fits_path = output_cfg.get('rejected_fits', None)
+                flag_name = "rejected_fits"
+            elif prepared:
+                fits_path = output_cfg.get('prepared_for_pca', None)
+                flag_name = "prepared_for_pca"
+            elif pcad:
+                fits_path = output_cfg.get('pcad_fits', None)
+                flag_name = "pcad_fits"
+            
+            if not fits_path:
+                click.echo(click.style(f"Error: --{flag_name.replace('_', '-')} flag specified but [output].{flag_name} not defined in config", fg="red"), err=True)
                 sys.exit(1)
-            hdul = fits.open(reduced_fits_path)
+            hdul = fits.open(fits_path)
         else:
             # Use input file from config
             hdul = read_fits_from_config(config_path)
@@ -2018,6 +2268,14 @@ def map_column_cmd(config, reduced, clean, object, column, beamsize, pixsize, sc
               help='Use reduced_data.fits instead of the input data.')
 @click.option('--clean', is_flag=True, default=False,
               help='Use clean_fits instead of the input data.')
+@click.option('--pcad', is_flag=True, default=False,
+              help='Use pca_corrected.fits (output.pcad_fits from config).')
+@click.option('--rejected', is_flag=True, default=False,
+              help='Use rejected_data.fits (output.rejected_fits from config).')
+@click.option('--postfiltered', is_flag=True, default=False,
+              help='Use post_filtered_fits (output.post_filtered_fits from config).')
+@click.option('--prepared', is_flag=True, default=False,
+              help='Use prepared_for_pca.fits (output.prepared_for_pca from config).')
 @click.option('--object', type=str, default=None,
               help='Filter by object name (partial match). If not specified, uses "object" from config.toml if available.')
 @click.option('--beamsize', type=float, default=None,
@@ -2032,28 +2290,33 @@ def map_column_cmd(config, reduced, clean, object, column, beamsize, pixsize, sc
               help='Output path for plot (e.g., integrated_map.png). If not specified, plot is shown but not saved.')
 @click.option('--fits-output', type=click.Path(), default=None,
               help='Output path for FITS file (e.g., integrated_map.fits). If not specified, FITS is not saved.')
-def map_integrated_cmd(config, fits, reduced, clean, object, beamsize, pixsize, velocity_range, scatter, plot, fits_output):
+def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltered, prepared, object, beamsize, pixsize, velocity_range, scatter, plot, fits_output):
     """
     Create a spatial map of integrated spectral intensity.
     
     Integrates the spectrum across all frequency channels (or specified velocity range)
     for each observation, then creates a WCS-based spatial map with cygrid gridding.
     
-    Reads input file from:
+    Reads input file from (in order of priority):
     1. --fits parameter if specified (overrides config)
-    2. [output].reduced_fits if --reduced flag is specified
-    3. [input].fits_file from config.toml otherwise
+    2. --pcad flag (uses output.pcad_fits from config)
+    3. --rejected flag (uses output.rejected_fits from config)
+    4. --postfiltered flag (uses output.post_filtered_fits from config)
+    5. --prepared flag (uses output.prepared_for_pca from config)
+    6. --reduced flag (uses output.reduced_fits from config)
+    7. --clean flag (uses output.clean_fits from config)
+    8. [input].fits_file from config.toml otherwise
     
     Gridding parameters read from config.toml [gridding] section if not specified on command line.
 
     Examples:
         map_integrated --config config.toml
         map_integrated --config config.toml --fits /path/to/data.fits
+        map_integrated --config config.toml --pcad --object M51
         map_integrated --config config.toml --reduced --object M51
-        map_integrated --config config.toml --fits data.fits --beamsize 0.3 --plot integrated.png
-        map_integrated --config config.toml --fits data.fits --pixsize 0.05 --object M51
-        map_integrated --config config.toml --fits data.fits --velocity-range 450 500
-        map_integrated --config config.toml --reduced --velocity-range -50 50 --plot map_narrow_range.png
+        map_integrated --config config.toml --prepared --beamsize 0.3 --plot integrated.png
+        map_integrated --config config.toml --rejected --velocity-range 450 500
+        map_integrated --config config.toml --postfiltered --velocity-range -50 50 --plot map_narrow_range.png
     """
     try:
         from oi_zeigt.mapping.gridding import get_gridding_params_from_config
@@ -2074,6 +2337,42 @@ def map_integrated_cmd(config, fits, reduced, clean, object, beamsize, pixsize, 
             # Use directly specified FITS file (overrides everything)
             click.echo(f"Reading FITS file: {fits}")
             hdul = read_fits(fits)
+        elif pcad:
+            # Use pca_corrected.fits from config
+            output_cfg = cfg.get('output', {})
+            pcad_fits_path = output_cfg.get('pcad_fits', None)
+            if not pcad_fits_path:
+                click.echo(click.style("Error: --pcad flag specified but [output].pcad_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
+            click.echo(f"Reading FITS file: {pcad_fits_path}")
+            hdul = read_fits(pcad_fits_path)
+        elif rejected:
+            # Use rejected_data.fits from config
+            output_cfg = cfg.get('output', {})
+            rejected_fits_path = output_cfg.get('rejected_fits', None)
+            if not rejected_fits_path:
+                click.echo(click.style("Error: --rejected flag specified but [output].rejected_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
+            click.echo(f"Reading FITS file: {rejected_fits_path}")
+            hdul = read_fits(rejected_fits_path)
+        elif postfiltered:
+            # Use post_filtered_fits from config
+            output_cfg = cfg.get('output', {})
+            postfiltered_fits_path = output_cfg.get('post_filtered_fits', None)
+            if not postfiltered_fits_path:
+                click.echo(click.style("Error: --postfiltered flag specified but [output].post_filtered_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
+            click.echo(f"Reading FITS file: {postfiltered_fits_path}")
+            hdul = read_fits(postfiltered_fits_path)
+        elif prepared:
+            # Use prepared_for_pca.fits from config
+            output_cfg = cfg.get('output', {})
+            prepared_fits_path = output_cfg.get('prepared_for_pca', None)
+            if not prepared_fits_path:
+                click.echo(click.style("Error: --prepared flag specified but [output].prepared_for_pca not defined in config", fg="red"), err=True)
+                sys.exit(1)
+            click.echo(f"Reading FITS file: {prepared_fits_path}")
+            hdul = read_fits(prepared_fits_path)
         elif reduced:
             # Use reduced_data.fits from config
             output_cfg = cfg.get('output', {})
@@ -2408,8 +2707,21 @@ def combine_fits(input, output, single_hdu):
     default=None,
     help="Object substring to filter for (default: parameters.object from config.toml, e.g., M51CENTER)"
 )
+@click.option(
+    "--mission-id",
+    type=str,
+    default=None,
+    help="Filter to specific mission ID (e.g., 2016-05-12_GR_F296) for faster testing"
+)
+@click.option(
+    "--scan",
+    type=int,
+    default=None,
+    help="Filter to specific SCAN number (e.g., 13686) for faster testing"
+)
 def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional[str],
-                   pca_source: Optional[str], object: Optional[str]):
+                   pca_source: Optional[str], object: Optional[str], mission_id: Optional[str],
+                   scan: Optional[int]):
     """
     Prepare FITS data for PCA analysis.
     
@@ -2432,6 +2744,12 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
         
         # Override config settings
         prepare_for_pca --config config.toml --pca-source SKYCHOPDIFF --object M51CENTER
+        
+        # Fast testing with single mission (7x speedup)
+        prepare_for_pca --config config.toml --mission-id 2016-05-12_GR_F296
+        
+        # Very fast testing with single scan (38x speedup)
+        prepare_for_pca --config config.toml --mission-id 2016-05-12_GR_F296 --scan 13686
     """
     try:
         from .pca_analysis.prepare_for_pca import prepare_for_pca as prepare_func
@@ -2445,7 +2763,9 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
             output_fits=output,
             config=config,
             pca_source=pca_source,
-            object_filter=object
+            object_filter=object,
+            mission_id=mission_id,
+            scan=scan
         )
         
         click.echo("\n" + "="*70)

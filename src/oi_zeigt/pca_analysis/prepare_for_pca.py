@@ -95,9 +95,14 @@ def get_telluric_indices(mission_id: str, velocity_axis_kms: np.ndarray) -> Opti
 
 def fill_telluric_with_noise(fits_file: str, output_fits: str, 
                             pca_source: str = "SKYCHOPDIFF",
-                            object_filter: str = "M51CENTER") -> None:
+                            object_filter: str = "M51CENTER",
+                            mission_id: Optional[str] = None,
+                            scan: Optional[int] = None) -> None:
     """
     Filter FITS file and fill telluric lines with Gaussian noise.
+    
+    Also associates each M51CENTER spectrum with its corresponding TSYS and TAU_SIG
+    measurements, storing the indices as new columns in the output.
     
     Parameters
     ----------
@@ -109,6 +114,10 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         Source to filter for (default: SKYCHOPDIFF)
     object_filter : str
         Object substring to filter for (default: M51CENTER)
+    mission_id : str, optional
+        Filter to specific mission_id (e.g., "2017-02-01_GR_F367")
+    scan : int, optional
+        Filter to specific SCAN number
     """
     logger.info(f"Opening {fits_file}...")
     
@@ -145,22 +154,49 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
             velocity_axis_kms = np.arange(n_channels)
         
         # Filter data
-        logger.info(f"Filtering to OBJECT = '{pca_source}' or '{object_filter}'...")
+        logger.info(f"Filtering to OBJECT = '{pca_source}' or '{object_filter}' or TSYS/TAU_SIG...")
         
         # Get masks for filtering
         objects = np.array([s.strip() for s in data['OBJECT']])
         mission_ids = np.array([s.strip() for s in data['MISSION_ID']])
         
         # Keep spectra where OBJECT equals either pca_source or object_filter
-        combined_mask = (objects == pca_source) | (objects == object_filter)
+        # Also include TSYS and TAU_SIG rows
+        combined_mask = (objects == pca_source) | (objects == object_filter) | \
+                       (objects == 'TSYS') | (objects == 'TAU_SIG')
+        
+        # Apply mission_id filter if specified
+        if mission_id:
+            logger.info(f"Filtering to MISSION_ID = '{mission_id}'...")
+            mission_filter = mission_ids == mission_id
+            before_filter = np.sum(combined_mask)
+            combined_mask = combined_mask & mission_filter
+            after_filter = np.sum(combined_mask)
+            logger.info(f"  After mission_id filter: {after_filter}/{before_filter} rows kept")
+        
+        # Apply scan filter if specified
+        if scan is not None:
+            logger.info(f"Filtering to SCAN = {scan}...")
+            scans = np.array(data['SCAN'])
+            scan_filter = scans == scan
+            before_filter = np.sum(combined_mask)
+            combined_mask = combined_mask & scan_filter
+            after_filter = np.sum(combined_mask)
+            logger.info(f"  After scan filter: {after_filter}/{before_filter} rows kept")
         
         n_original = len(data)
         n_filtered = np.sum(combined_mask)
+        n_tsys = np.sum(objects[combined_mask] == 'TSYS')
+        n_tau_sig = np.sum(objects[combined_mask] == 'TAU_SIG')
         logger.info(f"Filtered from {n_original} to {n_filtered} spectra")
+        logger.info(f"  - {np.sum((objects[combined_mask] == pca_source) | (objects[combined_mask] == object_filter))} science spectra")
+        logger.info(f"  - {n_tsys} TSYS spectra")
+        logger.info(f"  - {n_tau_sig} TAU_SIG spectra")
         
         # Filter all data
         filtered_data = data[combined_mask]
         filtered_mission_ids = mission_ids[combined_mask]
+        filtered_objects = objects[combined_mask]
         
         # Fill telluric lines with Gaussian noise
         logger.info("Filling telluric lines with Gaussian noise...")
@@ -168,6 +204,11 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         n_filled = 0
         current_mission_id = None
         for idx, spectrum in enumerate(filtered_data['SPECTRUM']):
+            # Skip TSYS and TAU_SIG rows - they should not be modified
+            if filtered_objects[idx] in ('TSYS', 'TAU_SIG'):
+                logger.debug(f"Skipping telluric fill for {filtered_objects[idx]} spectrum")
+                continue
+            
             mission_id = filtered_mission_ids[idx]
             
             # Log when we start processing a new mission_id
@@ -210,17 +251,157 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         
         logger.info(f"Filled telluric lines in {n_filled} spectra")
         
-        # Create output FITS
-        logger.info(f"Writing output to {output_fits}...")
+        # Create index columns for linking M51CENTER to TSYS and TAU_SIG
+        logger.info("Creating TSYS and TAU_SIG index columns...")
         
-        os.makedirs(os.path.dirname(output_fits) or '.', exist_ok=True)
+        # Initialize index columns with -1 (indicating no match)
+        tsys_indices = np.full(len(filtered_data), -1, dtype=np.int32)
+        tau_sig_indices = np.full(len(filtered_data), -1, dtype=np.int32)
+        
+        # Build structured lookup for TSYS and TAU_SIG with subscan info
+        # Structure: {(mission_id, scan) -> [(subscan, idx, ut_time), ...]}
+        tsys_lookup = {}  # (mission_id, scan) -> [(subscan, idx, ut_time), ...]
+        tau_sig_lookup = {}  # (mission_id, scan) -> [(subscan, idx, ut_time), ...]
+        
+        # Check if UT or LST columns exist for temporal fallback
+        has_ut_col = 'UT' in filtered_data.dtype.names
+        has_lst_col = 'LST' in filtered_data.dtype.names
+        time_col = 'UT' if has_ut_col else ('LST' if has_lst_col else None)
+        
+        for idx in range(len(filtered_data)):
+            obj = filtered_objects[idx]
+            if obj in ('TSYS', 'TAU_SIG'):
+                key = (filtered_mission_ids[idx], filtered_data['SCAN'][idx])
+                subscan = filtered_data['SUBSCAN'][idx]
+                
+                # Build timestamp for temporal fallback (UT or LST in fractional days)
+                timestamp = None
+                if time_col:
+                    try:
+                        timestamp = float(filtered_data[time_col][idx])
+                    except:
+                        pass
+                
+                entry = (subscan, idx, timestamp)
+                
+                if obj == 'TSYS':
+                    if key not in tsys_lookup:
+                        tsys_lookup[key] = []
+                    tsys_lookup[key].append(entry)
+                else:  # TAU_SIG
+                    if key not in tau_sig_lookup:
+                        tau_sig_lookup[key] = []
+                    tau_sig_lookup[key].append(entry)
+        
+        logger.info(f"Found {len(tsys_lookup)} TSYS groups and {len(tau_sig_lookup)} TAU_SIG groups")
+        
+        # Link M51CENTER spectra to TSYS and TAU_SIG
+        n_tsys_linked = 0
+        n_tsys_fallback = 0
+        n_tau_sig_linked = 0
+        n_tau_sig_fallback = 0
+        
+        for idx in range(len(filtered_data)):
+            if filtered_objects[idx] == object_filter:  # M51CENTER
+                key = (filtered_mission_ids[idx], filtered_data['SCAN'][idx])
+                m51_subscan = filtered_data['SUBSCAN'][idx]
+                m51_timestamp = None
+                
+                if time_col:
+                    try:
+                        m51_timestamp = float(filtered_data[time_col][idx])
+                    except:
+                        pass
+                
+                # Link to TSYS using pattern-aware matching
+                if key in tsys_lookup and len(tsys_lookup[key]) > 0:
+                    # Pattern-aware: look for TSYS with subscan = M51CENTER_subscan - 1
+                    tsys_entries = tsys_lookup[key]
+                    
+                    # First try: exact pattern match (TSYS subscan = M51CENTER subscan - 1)
+                    pattern_matches = [entry for entry in tsys_entries if entry[0] == m51_subscan - 1]
+                    
+                    if pattern_matches:
+                        # Use the first pattern match
+                        tsys_indices[idx] = pattern_matches[0][1]
+                        n_tsys_linked += 1
+                        logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TSYS idx={pattern_matches[0][1]} subscan={pattern_matches[0][0]} (pattern match)")
+                    else:
+                        # Fallback: use nearest TSYS by time if available, else use first TSYS
+                        if m51_timestamp is not None and any(entry[2] is not None for entry in tsys_entries):
+                            # Find TSYS with closest timestamp
+                            valid_entries = [e for e in tsys_entries if e[2] is not None]
+                            nearest = min(valid_entries, key=lambda e: abs(e[2] - m51_timestamp))
+                            tsys_indices[idx] = nearest[1]
+                            n_tsys_fallback += 1
+                            logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TSYS idx={nearest[1]} subscan={nearest[0]} (temporal fallback)")
+                        else:
+                            # Last resort: use first TSYS in group
+                            tsys_indices[idx] = tsys_entries[0][1]
+                            n_tsys_fallback += 1
+                            logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TSYS idx={tsys_entries[0][1]} subscan={tsys_entries[0][0]} (first match fallback)")
+                
+                # Link to TAU_SIG using pattern-aware matching
+                if key in tau_sig_lookup and len(tau_sig_lookup[key]) > 0:
+                    # Pattern-aware: look for TAU_SIG with subscan = M51CENTER_subscan - 1
+                    tau_sig_entries = tau_sig_lookup[key]
+                    
+                    # First try: exact pattern match (TAU_SIG subscan = M51CENTER subscan - 1)
+                    pattern_matches = [entry for entry in tau_sig_entries if entry[0] == m51_subscan - 1]
+                    
+                    if pattern_matches:
+                        # Use the first pattern match
+                        tau_sig_indices[idx] = pattern_matches[0][1]
+                        n_tau_sig_linked += 1
+                        logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TAU_SIG idx={pattern_matches[0][1]} subscan={pattern_matches[0][0]} (pattern match)")
+                    else:
+                        # Fallback: use nearest TAU_SIG by time if available, else use first TAU_SIG
+                        if m51_timestamp is not None and any(entry[2] is not None for entry in tau_sig_entries):
+                            # Find TAU_SIG with closest timestamp
+                            valid_entries = [e for e in tau_sig_entries if e[2] is not None]
+                            nearest = min(valid_entries, key=lambda e: abs(e[2] - m51_timestamp))
+                            tau_sig_indices[idx] = nearest[1]
+                            n_tau_sig_fallback += 1
+                            logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TAU_SIG idx={nearest[1]} subscan={nearest[0]} (temporal fallback)")
+                        else:
+                            # Last resort: use first TAU_SIG in group
+                            tau_sig_indices[idx] = tau_sig_entries[0][1]
+                            n_tau_sig_fallback += 1
+                            logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TAU_SIG idx={tau_sig_entries[0][1]} subscan={tau_sig_entries[0][0]} (first match fallback)")
+        
+        m51_total = np.sum(filtered_objects == object_filter)
+        logger.info(f"Linked {n_tsys_linked}/{m51_total} M51CENTER spectra to TSYS (pattern-aware)")
+        logger.info(f"Linked {n_tsys_fallback}/{m51_total} M51CENTER spectra to TSYS (fallback)")
+        logger.info(f"Linked {n_tau_sig_linked}/{m51_total} M51CENTER spectra to TAU_SIG (pattern-aware)")
+        logger.info(f"Linked {n_tau_sig_fallback}/{m51_total} M51CENTER spectra to TAU_SIG (fallback)")
+        
+        # Add the index columns to filtered_data by extending the table
+        # Build column list from filtered data arrays
+        col_list = []
+        for name in filtered_data.columns.names:
+            col_array = filtered_data[name]  # Get sliced data
+            col_format = filtered_data.columns[name].format
+            col_list.append(fits.Column(name=name, format=col_format, array=col_array))
+        
+        # Add TSYS_INDEX and TAU_SIG_INDEX columns as simple int32 arrays
+        col_list.append(fits.Column(name='TSYS_INDEX', format='J', array=tsys_indices.astype(np.int32)))
+        col_list.append(fits.Column(name='TAU_SIG_INDEX', format='J', array=tau_sig_indices.astype(np.int32)))
+        
+        # Create new table with all columns
+        filtered_data_with_indices = fits.BinTableHDU.from_columns(col_list)
+        # Don't modify the header - use astropy's default which should be clean
         
         # Create new HDU with filtered data
-        primary_hdu = fits.PrimaryHDU(header=hdul[0].header)
-        table_hdu = fits.BinTableHDU(filtered_data, header=header)
+        primary_hdu = fits.PrimaryHDU()
+        table_hdu = filtered_data_with_indices
+        
+        # Create output FITS
+        logger.info(f"Writing output to {output_fits}...")
+        os.makedirs(os.path.dirname(output_fits) or '.', exist_ok=True)
         
         hdul_out = fits.HDUList([primary_hdu, table_hdu])
-        hdul_out.writeto(output_fits, overwrite=True)
+        # Use overwrite=True and ensure checksum is not used to avoid encoding issues
+        hdul_out.writeto(output_fits, overwrite=True, checksum=False)
         
         logger.info(f"✓ Wrote {n_filtered} spectra to {output_fits}")
 
@@ -229,7 +410,9 @@ def prepare_for_pca(fits_file: Optional[str] = None,
                    output_fits: Optional[str] = None,
                    config: Optional[str] = None,
                    pca_source: Optional[str] = None,
-                   object_filter: Optional[str] = None) -> None:
+                   object_filter: Optional[str] = None,
+                   mission_id: Optional[str] = None,
+                   scan: Optional[int] = None) -> None:
     """
     Main entry point for prepare_for_pca functionality.
     
@@ -247,6 +430,10 @@ def prepare_for_pca(fits_file: Optional[str] = None,
         PCA source to filter for (overrides config)
     object_filter : str, optional
         Object substring to filter for (overrides config)
+    mission_id : str, optional
+        Filter to specific mission_id (e.g., "2017-02-01_GR_F367")
+    scan : int, optional
+        Filter to specific SCAN number
     """
     # Configure logging to display output
     if not logger.handlers:
@@ -310,6 +497,11 @@ def prepare_for_pca(fits_file: Optional[str] = None,
     
     logger.info(f"PCA source filter: {pca_source}")
     logger.info(f"Object filter: {object_filter}")
+    if mission_id:
+        logger.info(f"Mission ID filter: {mission_id}")
+    if scan is not None:
+        logger.info(f"Scan filter: {scan}")
     
     # Process the file
-    fill_telluric_with_noise(fits_file, output_fits, pca_source, object_filter)
+    fill_telluric_with_noise(fits_file, output_fits, pca_source, object_filter, 
+                            mission_id=mission_id, scan=scan)

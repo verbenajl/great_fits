@@ -79,12 +79,15 @@ def load_spectra_by_mission(fits_file: str) -> Dict[str, Dict]:
     logger.info(f"Loading FITS file: {fits_file}")
     
     with fits.open(fits_file) as hdul:
-        # Find the binary table HDU
+        # Find the binary table HDU with MISSION_ID and TELESCOP columns
+        # Accept HDUs with standard names OR empty names (from prepare_for_pca)
         spectra_hdu = None
         for hdu in hdul:
-            if hdu.name in ['SPECTRA', 'MATRIX', 'AVERAGE']:
-                if hasattr(hdu, 'data') and hdu.data is not None:
-                    if 'MISSION_ID' in hdu.data.dtype.names and 'TELESCOP' in hdu.data.dtype.names:
+            # Check if this HDU has the required columns first
+            if hasattr(hdu, 'data') and hdu.data is not None:
+                if 'MISSION_ID' in hdu.data.dtype.names and 'TELESCOP' in hdu.data.dtype.names:
+                    # Accept either standard names or empty name (from prepare_for_pca)
+                    if hdu.name in ['SPECTRA', 'MATRIX', 'AVERAGE', '']:
                         spectra_hdu = hdu
                         break
         
