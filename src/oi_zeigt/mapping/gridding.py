@@ -713,17 +713,25 @@ def create_integrated_map(hdul: fits.HDUList,
                          pixsize: Optional[float] = None,
                          figsize: Tuple[int, int] = (10, 8),
                          show_scatter: bool = False,
-                         velocity_range: Optional[Tuple[float, float]] = None) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+                         velocity_range: Optional[Tuple[float, float]] = None,
+                         weight_column: Optional[str] = None) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
-    Create a spatial map from integrated spectral intensity.
+    Create a spatial map from integrated spectral intensity with optional per-spectrum weighting.
     
     Integrates spectra across all channels (or specified velocity range), then grids with proper WCS.
+    Can optionally weight each integrated spectrum by a quality metric (e.g., RMSRATIO).
     
     Parameters
     ----------
     velocity_range : tuple or None
         (v_min, v_max) in km/s to restrict integration to this velocity range.
         If None, integrates entire spectrum.
+    weight_column : str, optional
+        Column name for per-spectrum weighting (e.g., 'RMSRATIO').
+        If None, all spectra are weighted equally (uniform weighting).
+        For RMSRATIO, weights are calculated as: weight = exp(-(RMSRATIO - 1.0)^2 / (2*sigma^2))
+        where sigma=0.5 (favors values close to 1.0, ideal quality).
+        Final map is normalized: map = (sum of intensity*weight) / (sum of weights)
     """
     # Find ALL binary tables with the required spectrum column (supports multi-HDU files)
     matrix_hdus = []
@@ -807,14 +815,53 @@ def create_integrated_map(hdul: fits.HDUList,
         except (KeyError, ValueError, TypeError, AttributeError) as e:
             raise ValueError(f"Cannot compute velocity axis from data/header: {e}")
     
+    # Extract per-spectrum weights if requested
+    weights = None
+    if weight_column is not None:
+        if weight_column not in data.dtype.names:
+            raise ValueError(f"Weight column '{weight_column}' not found in FITS file")
+        
+        weight_values = data[weight_column]
+        
+        # Apply object filter to weights if applicable
+        if object_filter:
+            weight_values = weight_values[mask]
+        
+        # Calculate weights based on quality metric
+        # For RMSRATIO: optimal value is 1.0, so use Gaussian centered at 1.0
+        # weight = exp(-(RMSRATIO - 1.0)^2 / (2*sigma^2))
+        # sigma=0.5 gives reasonable falloff (0.6 at ±0.5, 0.14 at ±1.0)
+        weights = np.zeros_like(weight_values, dtype=np.float64)
+        valid_weights = np.isfinite(weight_values)
+        
+        if 'RMSRATIO' in weight_column.upper():
+            # Gaussian weighting centered at 1.0 for RMSRATIO
+            sigma = 0.5
+            weights[valid_weights] = np.exp(-((weight_values[valid_weights] - 1.0) ** 2) / (2 * sigma ** 2))
+        else:
+            # Generic inverse weighting for other columns (lower is better)
+            weights[valid_weights & (weight_values != 0)] = 1.0 / np.abs(weight_values[valid_weights & (weight_values != 0)])
+            # Normalize to [0, 1] range
+            max_weight = np.max(weights[weights > 0])
+            if max_weight > 0:
+                weights[weights > 0] /= max_weight
+    
     # Compute integrated intensity
     integrated = np.nansum(spectra, axis=1)
+    
+    # Apply per-spectrum weighting if available
+    if weights is not None:
+        integrated = integrated * weights
     
     # Filter valid points
     valid = np.isfinite(ras) & np.isfinite(decs) & np.isfinite(integrated)
     ras = ras[valid]
     decs = decs[valid]
     integrated = integrated[valid]
+    
+    # Also filter weights if they exist
+    if weights is not None:
+        weights = weights[valid]
     
     if len(integrated) < 3:
         raise ValueError(f"Not enough valid data points ({len(integrated)})")
@@ -872,11 +919,32 @@ def create_integrated_map(hdul: fits.HDUList,
             hpx_maxres,
         )
         
-        # Add data points
-        gridder.grid(ras, decs, integrated)
-        
-        # Get the gridded data
-        grid_map = gridder.get_datacube()  # Returns 2D array (naxis2, naxis1)
+        # Add data points with proper weight normalization
+        if weights is not None:
+            # Grid weighted intensities
+            gridder.grid(ras, decs, integrated)
+            grid_map_weighted = gridder.get_datacube()
+            
+            # Grid the weights separately to normalize
+            gridder2 = cygrid.WcsGrid(wcs_header_dict)
+            gridder2.set_kernel(
+                kernel_type,
+                kernel_params,
+                kernel_support,
+                hpx_maxres,
+            )
+            gridder2.grid(ras, decs, weights)
+            grid_map_weights = gridder2.get_datacube()
+            
+            # Normalize: divide weighted sum by sum of weights
+            # Avoid division by zero where no data exists
+            grid_map = np.divide(grid_map_weighted, grid_map_weights,
+                                where=grid_map_weights > 0,
+                                out=np.zeros_like(grid_map_weighted))
+        else:
+            # Uniform weighting (no normalization needed)
+            gridder.grid(ras, decs, integrated)
+            grid_map = gridder.get_datacube()  # Returns 2D array (naxis2, naxis1)
     else:
         # Fallback to scipy (cygrid not available)
         warnings.warn("cygrid not available - using scipy griddata instead (less accurate for astronomical data)", UserWarning)
@@ -887,7 +955,21 @@ def create_integrated_map(hdul: fits.HDUList,
         ra_mesh, dec_mesh = np.meshgrid(ra_grid, dec_grid)
         
         points = np.column_stack([ras, decs])
-        grid_map = griddata(points, integrated, (ra_mesh, dec_mesh), method='linear')
+        
+        if weights is not None:
+            # Grid weighted intensities
+            grid_map_weighted = griddata(points, integrated, (ra_mesh, dec_mesh), method='linear')
+            
+            # Grid weights separately to normalize
+            grid_map_weights = griddata(points, weights, (ra_mesh, dec_mesh), method='linear')
+            
+            # Normalize: divide weighted sum by sum of weights
+            grid_map = np.divide(grid_map_weighted, grid_map_weights,
+                                where=grid_map_weights > 0,
+                                out=np.zeros_like(grid_map_weighted))
+        else:
+            # Uniform weighting
+            grid_map = griddata(points, integrated, (ra_mesh, dec_mesh), method='linear')
     
     # Create WCS header
     wcs_header = create_wcs_header(
@@ -927,7 +1009,8 @@ def create_integrated_map(hdul: fits.HDUList,
     ax.set_xlabel('RA (h:m:s)', fontsize=12)
     ax.set_ylabel('Dec (°:′:″)', fontsize=12)
     gridding_method = 'cygrid' if HAS_CYGRID else 'scipy'
-    ax.set_title(f'Integrated Intensity Map ({gridding_method}, beam={beamsize_deg*3600:.1f}″)',
+    weight_info = f', weighted by {weight_column}' if weight_column else ''
+    ax.set_title(f'Integrated Intensity Map ({gridding_method}, beam={beamsize_deg*3600:.1f}″{weight_info})',
                 fontsize=13, fontweight='bold')
     if show_scatter:
         ax.legend(loc='best')

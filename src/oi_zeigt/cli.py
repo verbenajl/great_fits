@@ -1189,9 +1189,20 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         if filter_zero:
             click.echo(f"Also filtering out all-zero spectra\n")
         
-        # Check for removal criteria
+        # Check for removal criteria from CLI args
         if remove and remove_values:
             click.echo(f"Also removing rows where {remove} = {', '.join(remove_values)}\n")
+        
+        # Check for removal criteria from config file
+        if not remove and config:
+            try:
+                remove_aor_id = config_data.get("filters", {}).get("remove_aor_id")
+                if remove_aor_id:
+                    remove = "AOR_ID"
+                    remove_values = (remove_aor_id,)  # Convert to tuple for consistency
+                    click.echo(f"Also removing rows where AOR_ID = {remove_aor_id} (from config [filters][remove_aor_id])\n")
+            except (NameError, KeyError):
+                pass
         
         # Filter and save
         clean_path, rejected_path, stats = filter_and_save_fits(
@@ -2284,18 +2295,21 @@ def map_column_cmd(config, reduced, clean, object, column, beamsize, pixsize, sc
               help='Map pixel size in degrees. If not specified, uses beamsize/3 or config [gridding].pixel_size_arcsec.')
 @click.option('--velocity-range', type=(float, float), default=None, nargs=2,
               help='Velocity range in km/s (e.g., --velocity-range 450 500). If not specified, integrates entire spectrum.')
+@click.option('--weight-column', type=str, default=None,
+              help='Column name for per-spectrum weighting (e.g., RMSRATIO). If specified, each integrated spectrum is weighted by 1/weight_value (lower values get higher weight).')
 @click.option('--scatter', is_flag=True, default=False,
               help='Show observation points as scatter plot on map.')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for plot (e.g., integrated_map.png). If not specified, plot is shown but not saved.')
 @click.option('--fits-output', type=click.Path(), default=None,
               help='Output path for FITS file (e.g., integrated_map.fits). If not specified, FITS is not saved.')
-def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltered, prepared, object, beamsize, pixsize, velocity_range, scatter, plot, fits_output):
+def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltered, prepared, object, beamsize, pixsize, velocity_range, weight_column, scatter, plot, fits_output):
     """
-    Create a spatial map of integrated spectral intensity.
+    Create a spatial map of integrated spectral intensity with optional per-spectrum weighting.
     
     Integrates the spectrum across all frequency channels (or specified velocity range)
     for each observation, then creates a WCS-based spatial map with cygrid gridding.
+    Optionally weights each integrated spectrum by a quality metric (e.g., RMSRATIO).
     
     Reads input file from (in order of priority):
     1. --fits parameter if specified (overrides config)
@@ -2317,6 +2331,7 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
         map_integrated --config config.toml --prepared --beamsize 0.3 --plot integrated.png
         map_integrated --config config.toml --rejected --velocity-range 450 500
         map_integrated --config config.toml --postfiltered --velocity-range -50 50 --plot map_narrow_range.png
+        map_integrated --config config.toml --pcad --object M51 --weight-column RMSRATIO --plot weighted_map.png
     """
     try:
         from oi_zeigt.mapping.gridding import get_gridding_params_from_config
@@ -2411,7 +2426,8 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
             beamsize_deg=beamsize_deg,
             pixsize=pixsize_deg,
             show_scatter=scatter,
-            velocity_range=velocity_range
+            velocity_range=velocity_range,
+            weight_column=weight_column
         )
 
         click.echo(f"\n✓ Integrated intensity map created")
@@ -2420,6 +2436,8 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
             click.echo(f"  Pixel size: {pixsize_deg*3600:.3f}\"")
         if object_filter:
             click.echo(f"  Object filter: {object_filter}")
+        if weight_column:
+            click.echo(f"  Per-spectrum weighting: {weight_column} (using 1/value)")
         if velocity_range:
             click.echo(f"  Velocity range: {velocity_range[0]:.1f} - {velocity_range[1]:.1f} km/s")
         click.echo(f"  Map dimensions: {grid_map.shape[1]} × {grid_map.shape[0]}")

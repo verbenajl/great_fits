@@ -388,8 +388,16 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         col_list.append(fits.Column(name='TAU_SIG_INDEX', format='J', array=tau_sig_indices.astype(np.int32)))
         
         # Create new table with all columns
-        filtered_data_with_indices = fits.BinTableHDU.from_columns(col_list)
-        # Don't modify the header - use astropy's default which should be clean
+        # CRITICAL: Preserve all header keywords from original filtered_data
+        # BinTableHDU.from_columns() creates a new table but may not preserve all keywords
+        header_keywords_to_preserve = dict(header)
+        filtered_data_with_indices = fits.BinTableHDU.from_columns(col_list, header=header)
+        
+        # Restore any keywords that might have been lost during table creation
+        for key, value in header_keywords_to_preserve.items():
+            if key not in filtered_data_with_indices.header:
+                logger.debug(f"Restoring header keyword {key}")
+                filtered_data_with_indices.header[key] = value
         
         # Create new HDU with filtered data
         primary_hdu = fits.PrimaryHDU()

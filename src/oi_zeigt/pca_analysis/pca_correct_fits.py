@@ -654,14 +654,33 @@ class PCACorrector:
         component_std = np.nanstd(scaled_comp)
         
         # Apply smoothing if kernel size provided (like original pca_correct.py)
+        # CRITICAL: Handle NaNs properly - convolve() does NOT ignore NaNs!
         if smoothing_kernel_size and smoothing_kernel_size > 0:
+            # Replace NaNs with interpolated values before convolution
+            nan_mask = np.isnan(scaled_spectrum)
+            if np.any(nan_mask):
+                # Interpolate NaNs before smoothing
+                valid_idx = np.where(~nan_mask)[0]
+                if len(valid_idx) > 0:
+                    spectrum_for_smooth = scaled_spectrum.copy()
+                    spectrum_for_smooth[nan_mask] = np.interp(
+                        np.where(nan_mask)[0], 
+                        valid_idx, 
+                        scaled_spectrum[valid_idx]
+                    )
+                else:
+                    # All NaN - can't smooth
+                    spectrum_for_smooth = scaled_spectrum
+            else:
+                spectrum_for_smooth = scaled_spectrum
+            
             kernel = np.ones(smoothing_kernel_size) / smoothing_kernel_size
-            spectrum_smoothed = np.convolve(scaled_spectrum, kernel, mode="same")
+            spectrum_smoothed = np.convolve(spectrum_for_smooth, kernel, mode="same")
             spectrum_std = np.nanstd(spectrum_smoothed)
         
         # Handle edge cases that could produce NaN or inf
         if np.isnan(spectrum_std) or np.isnan(component_std):
-            # If either std is NaN, we have bad/masked data
+            # If either std is NaN, we have bad/masked data (all NaN)
             return np.inf
         
         # Prevent division by zero with a minimum threshold
@@ -1407,14 +1426,45 @@ class PCACorrector:
                     n_remapped = np.sum(new_tau_indices >= 0)
                     logger.debug(f"Remapped TAU_SIG_INDEX: {n_remapped} entries now point to correct rows in output file")
                 
+                # Preserve ALL header keywords before table restructuring
+                header_keywords_to_preserve = dict(header)
+                
                 output_table = fits.BinTableHDU(filtered_data, header=header)
+                
+                # Restore any header keywords that were lost during table restructuring
+                for key, value in header_keywords_to_preserve.items():
+                    if key not in output_table.header:
+                        logger.debug(f"Restoring header keyword {key} that was lost during table restructuring")
+                        output_table.header[key] = value
+                        
             elif scan_filter is not None or subscan_filter is not None or telescope_filter or mission_id_filter:
                 logger.info(f"Filters applied - writing only {len(indices)} filtered spectra to output")
                 filtered_data = data[indices]
+                
+                # Preserve ALL header keywords before table restructuring
+                header_keywords_to_preserve = dict(header)
+                
                 output_table = fits.BinTableHDU(filtered_data, header=header)
+                
+                # Restore any header keywords that were lost during table restructuring
+                for key, value in header_keywords_to_preserve.items():
+                    if key not in output_table.header:
+                        logger.debug(f"Restoring header keyword {key} that was lost during table restructuring")
+                        output_table.header[key] = value
+                        
             else:
                 logger.info(f"No filters applied - writing all {len(data)} spectra to output")
+                
+                # Preserve ALL header keywords before table restructuring
+                header_keywords_to_preserve = dict(header)
+                
                 output_table = fits.BinTableHDU(data, header=header)
+                
+                # Restore any header keywords that were lost during table restructuring
+                for key, value in header_keywords_to_preserve.items():
+                    if key not in output_table.header:
+                        logger.debug(f"Restoring header keyword {key} that was lost during table restructuring")
+                        output_table.header[key] = value
             
             # Write output FITS
             os.makedirs(os.path.dirname(output_fits) or '.', exist_ok=True)
