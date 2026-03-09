@@ -936,6 +936,255 @@ def plot_skies(config: Optional[str], fits: Optional[str], reduced: bool, clean:
     help="Path to FITS file to read directly"
 )
 @click.option(
+    "--reduced",
+    is_flag=True,
+    default=False,
+    help="Read from output.reduced_fits in config"
+)
+@click.option(
+    "--clean",
+    is_flag=True,
+    default=False,
+    help="Read from output.clean_fits in config"
+)
+@click.option(
+    "--prepared",
+    is_flag=True,
+    default=False,
+    help="Read from output.prepared_for_pca in config"
+)
+@click.option(
+    "--num-plots",
+    type=int,
+    default=8,
+    help="Number of S-H_OBS/S-H_SKY comparisons to show (default: 8)"
+)
+@click.option(
+    "--output",
+    type=click.Path(),
+    default=None,
+    help="Output file for the plot (PNG or PDF). If not specified, show plot."
+)
+def plot_skyobsfit(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, 
+                   prepared: bool, num_plots: int, output: Optional[str]):
+    """
+    Compare observed vs fitted sky spectra (S-H_OBS vs S-H_SKY/S-H_FIT).
+    
+    Displays side-by-side comparisons of observed sky spectra and their fitted 
+    counterparts for visual inspection of how well the sky model fits the data.
+    
+    Examples:
+    
+        plot_skyobsfit --config config.toml
+        plot_skyobsfit --config config.toml --num-plots 12
+        plot_skyobsfit --fits /path/to/file.fits --output skyfit_comparison.pdf
+    """
+    try:
+        # Handle output file flags
+        if reduced or clean or prepared:
+            try:
+                import tomllib
+            except ModuleNotFoundError:
+                import tomli as tomllib
+            
+            config_path = config or "config.toml"
+            with open(config_path, 'rb') as f:
+                cfg = tomllib.load(f)
+                output_cfg = cfg.get('output', {})
+                if reduced and 'reduced_fits' in output_cfg:
+                    fits = output_cfg['reduced_fits']
+                    click.echo(f"Reading from output.reduced_fits: {fits}")
+                elif clean and 'clean_fits' in output_cfg:
+                    fits = output_cfg['clean_fits']
+                    click.echo(f"Reading from output.clean_fits: {fits}")
+                elif prepared and 'prepared_for_pca' in output_cfg:
+                    fits = output_cfg['prepared_for_pca']
+                    click.echo(f"Reading from output.prepared_for_pca: {fits}")
+                elif reduced or clean or prepared:
+                    click.echo(click.style(
+                        f"Error: Requested output file not found in config.toml",
+                        fg="red"
+                    ), err=True)
+                    sys.exit(1)
+        
+        # Read FITS file
+        if fits:
+            hdul = read_fits(fits)
+        elif config:
+            hdul = read_fits_from_config(config)
+        else:
+            hdul = read_fits_from_config()
+        
+        # Find binary table HDU with spectra
+        matrix_hdu = None
+        for hdu in hdul:
+            if hasattr(hdu, 'data') and hdu.data is not None:
+                if 'SPECTRUM' in hdu.data.dtype.names:
+                    matrix_hdu = hdu
+                    break
+        
+        if matrix_hdu is None:
+            raise ValueError("No HDU with SPECTRUM column found")
+        
+        data = matrix_hdu.data
+        
+        # Find S-H_OBS and S-H_SKY/S-H_FIT spectra
+        obs_indices = []
+        sky_indices = []
+        
+        for i, obj in enumerate(data['OBJECT']):
+            obj_str = obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()
+            if 'S-H_OBS' in obj_str:
+                obs_indices.append(i)
+            elif 'S-H_SKY' in obj_str or 'S-H_FIT' in obj_str:
+                sky_indices.append(i)
+        
+        if len(obs_indices) == 0:
+            click.echo(click.style("No S-H_OBS (observed sky) spectra found", fg="red"), err=True)
+            sys.exit(1)
+        
+        if len(sky_indices) == 0:
+            click.echo(click.style("No S-H_SKY or S-H_FIT (fitted sky) spectra found", fg="red"), err=True)
+            sys.exit(1)
+        
+        # Create pairs: match by proximity or index order
+        # Simple strategy: pair consecutive indices
+        pairs = []
+        for i in range(min(len(obs_indices), len(sky_indices))):
+            pairs.append((obs_indices[i], sky_indices[i]))
+        
+        # Limit to requested number of plots
+        num_to_show = min(num_plots, len(pairs))
+        pairs = pairs[:num_to_show]
+        
+        if len(pairs) == 0:
+            click.echo(click.style("Could not create any S-H_OBS/S-H_SKY pairs", fg="red"), err=True)
+            sys.exit(1)
+        
+        click.echo(f"Plotting {len(pairs)} S-H_OBS vs S-H_SKY comparisons")
+        click.echo(f"(Found {len(obs_indices)} observed and {len(sky_indices)} fitted sky spectra)\n")
+        
+        # Create plot with side-by-side comparisons
+        fig, axes = plt.subplots(len(pairs), 2, figsize=(14, 3.5*len(pairs)))
+        
+        # Ensure axes is always 2D array
+        if len(pairs) == 1:
+            axes = axes.reshape(1, 2)
+        
+        # Plot each pair
+        for pair_num, (obs_idx, sky_idx) in enumerate(pairs):
+            obs_spectrum = data[obs_idx]['SPECTRUM']
+            sky_spectrum = data[sky_idx]['SPECTRUM']
+            
+            obs_obj = data[obs_idx]['OBJECT'].decode().strip() if isinstance(data[obs_idx]['OBJECT'], bytes) else str(data[obs_idx]['OBJECT']).strip()
+            sky_obj = data[sky_idx]['OBJECT'].decode().strip() if isinstance(data[sky_idx]['OBJECT'], bytes) else str(data[sky_idx]['OBJECT']).strip()
+            
+            obs_nan_mask, obs_nan_frac = detect_nan_channels(obs_spectrum)
+            sky_nan_mask, sky_nan_frac = detect_nan_channels(sky_spectrum)
+            
+            # Left plot: observed sky
+            ax_obs = axes[pair_num, 0]
+            ax_obs.plot(obs_spectrum, linewidth=0.8, label='S-H_OBS', color='blue')
+            
+            # Color code by NaN fraction
+            if obs_nan_frac == 0:
+                title_color_obs = 'green'
+                nan_indicator_obs = "✓"
+            elif obs_nan_frac < 0.1:
+                title_color_obs = 'blue'
+                nan_indicator_obs = "~"
+            elif obs_nan_frac < 0.3:
+                title_color_obs = 'orange'
+                nan_indicator_obs = "!"
+            else:
+                title_color_obs = 'red'
+                nan_indicator_obs = "✗"
+            
+            ax_obs.set_title(
+                f"{nan_indicator_obs} Row {obs_idx}: {obs_obj} ({obs_nan_frac:.1%} NaN)",
+                fontsize=10,
+                color=title_color_obs,
+                weight='bold'
+            )
+            ax_obs.set_xlabel("Channel")
+            ax_obs.set_ylabel("Intensity")
+            ax_obs.grid(True, alpha=0.3)
+            ax_obs.legend(loc='upper right', fontsize=9)
+            
+            # Right plot: fitted sky
+            ax_sky = axes[pair_num, 1]
+            ax_sky.plot(sky_spectrum, linewidth=0.8, label='S-H_SKY/FIT', color='orange')
+            
+            # Color code by NaN fraction
+            if sky_nan_frac == 0:
+                title_color_sky = 'green'
+                nan_indicator_sky = "✓"
+            elif sky_nan_frac < 0.1:
+                title_color_sky = 'blue'
+                nan_indicator_sky = "~"
+            elif sky_nan_frac < 0.3:
+                title_color_sky = 'orange'
+                nan_indicator_sky = "!"
+            else:
+                title_color_sky = 'red'
+                nan_indicator_sky = "✗"
+            
+            ax_sky.set_title(
+                f"{nan_indicator_sky} Row {sky_idx}: {sky_obj} ({sky_nan_frac:.1%} NaN)",
+                fontsize=10,
+                color=title_color_sky,
+                weight='bold'
+            )
+            ax_sky.set_xlabel("Channel")
+            ax_sky.set_ylabel("Intensity")
+            ax_sky.grid(True, alpha=0.3)
+            ax_sky.legend(loc='upper right', fontsize=9)
+        
+        # Add legend explaining NaN indicators
+        legend_text = (
+            "Legend: ✓ = No NaNs (green) | ~ = <10% NaNs (blue) | "
+            "! = 10-30% NaNs (orange) | ✗ = >30% NaNs (red)"
+        )
+        fig.text(0.5, 0.01, legend_text, ha='center', fontsize=9,
+                style='italic', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 1])
+        
+        # Save or show
+        if output:
+            plt.savefig(output, dpi=150, bbox_inches='tight')
+            click.echo(click.style(f"✓ Plot saved to {output}", fg="green"))
+        else:
+            plt.show()
+            click.echo(click.style("✓ Done", fg="green"))
+        
+        hdul.close()
+        
+    except FileNotFoundError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        sys.exit(1)
+
+
+@click.command()
+@click.option(
+    "--config",
+    type=click.Path(exists=False),
+    default=None,
+    help="Path to config.toml file"
+)
+@click.option(
+    "--fits",
+    type=click.Path(exists=False),
+    default=None,
+    help="Path to FITS file to read directly"
+)
+@click.option(
     "--sample-size",
     type=int,
     default=100,
