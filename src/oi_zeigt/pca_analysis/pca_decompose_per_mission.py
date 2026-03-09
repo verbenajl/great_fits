@@ -252,11 +252,12 @@ def preprocess_spectra(spectra: np.ndarray) -> np.ndarray:
     return spectra
 
 
-def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarray, 
-                              flight_date: str, n_components: int = 5, 
-                              velocity_axis: np.ndarray = None, 
+def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarray,
+                              flight_date: str, n_components: int = 5,
+                              velocity_axis: np.ndarray = None,
                               line_window_kms: tuple = None,
-                              spectrum_indices: np.ndarray = None) -> DecompositionResult:
+                              spectrum_indices: np.ndarray = None,
+                              smoothing_kernel_size: int = None) -> DecompositionResult:
     """
     Perform PCA decomposition on spectra from a single mission/telescope combination.
     
@@ -278,7 +279,10 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
         (v_min, v_max) in km/s to mask emission lines during decomposition
     spectrum_indices : np.ndarray, optional
         Indices of these spectra in the original FITS file
-    
+    smoothing_kernel_size : int, optional
+        If set, apply a boxcar convolution of this length to each PCA component
+        after fitting. Matches legacy smooth_pca_components() in pca_decompose.py.
+
     Returns
     -------
     DecompositionResult
@@ -326,7 +330,18 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
     logger.info(f"Fitting PCA with {n_components} components...")
     decomposer = PCADecomposer(n_components=n_components, scale=False)
     decomposer.fit(spectra)
-    
+
+    # Smooth PCA components with a boxcar kernel (matches legacy smooth_pca_components()
+    # in pca_decompose.py, which used np.convolve with mode='same').
+    if smoothing_kernel_size:
+        kernel_size = int(smoothing_kernel_size)
+        kernel = np.ones(kernel_size) / kernel_size
+        smoothed = []
+        for component in decomposer.pca_model.components_:
+            smoothed.append(np.convolve(component.copy(), kernel, mode='same'))
+        decomposer.pca_model.components_ = np.array(smoothed)
+        logger.info(f"Smoothed {len(smoothed)} components with boxcar kernel size {kernel_size}")
+
     # Create result
     if spectrum_indices is not None:
         logger.info(f"Creating DecompositionResult with {len(spectrum_indices)} spectrum indices")
@@ -567,7 +582,8 @@ def main_cli():
                 n_components=args.n_components,
                 velocity_axis=velocity_axis,
                 line_window_kms=mission_line_windows.get(mission_id),
-                spectrum_indices=spectrum_indices
+                spectrum_indices=spectrum_indices,
+                smoothing_kernel_size=config.get('pca', {}).get('smoothing_kernel_size')
             )
             
             if result is None:

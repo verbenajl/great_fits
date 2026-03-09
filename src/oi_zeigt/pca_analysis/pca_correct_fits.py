@@ -88,7 +88,9 @@ def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel
     
     spectra = np.asarray(spectra)
     if len(spectra.shape) == 1:
-        spectra = spectra.reshape(1, -1)
+        # Duplicate 10 times so the 2D Gaussian blur behaves the same as in
+        # the legacy find_lines() call in pca_correct.py (lines 1238-1242).
+        spectra = np.vstack([spectra] * 10)
     
     n_spectra, n_channels = spectra.shape
     logger.debug(f"Line detection: input shape {n_spectra}x{n_channels}, kernel_size={kernel_size}, cutoff_std={cutoff_std}")
@@ -162,20 +164,20 @@ def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel
     initial_detections = np.sum(threshold > 0)
     logger.debug(f"  Initial detections: {initial_detections} pixels")
     
-    # Iterative refinement: recalculate threshold excluding detected regions
+    # Iterative refinement: recalculate threshold excluding detected regions.
+    # new_gray is created once and accumulates zeroed-out regions across iterations,
+    # matching the legacy find_lines() behaviour in pca_utilities.py.
     new_mean = 0
     new_std = 0
-    iterations = 0
-    max_iterations = 10
-    
-    while ((not np.isclose(new_mean, mean)) or (not np.isclose(new_std, std))) and iterations < max_iterations:
+    new_gray = gray.copy()
+
+    while (not np.isclose(new_mean, mean).all()) and (not np.isclose(new_std, std).all()):
         new_mean = mean
         new_std = std
-        
-        # Mask out detected regions
-        new_gray = gray.copy()
+
+        # Accumulate detected regions into new_gray (do not reset each iteration)
         new_gray[np.where(threshold == 1)] = 0
-        
+
         # Recalculate statistics on remaining data
         valid_pixels = new_gray[np.where(new_gray != 0)]
         if len(valid_pixels) > 0:
@@ -184,15 +186,13 @@ def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel
         else:
             mean = 0
             std = 1
-        
-        # Recalculate threshold
+
+        # Recalculate threshold against the original blurred image
         threshold_val = mean + cutoff_std * std
         _, threshold = cv.threshold(gray, threshold_val, 1, cv.THRESH_BINARY)
-        
-        iterations += 1
     
     final_detections = np.sum(threshold > 0)
-    logger.debug(f"  After {iterations} iterations: {final_detections} pixels detected")
+    logger.debug(f"  Final detections: {final_detections} pixels")
     
     # Convert to boolean mask
     mask = threshold.astype(bool)
@@ -1196,10 +1196,13 @@ class PCACorrector:
                         if hasattr(self, 'line_window_velocities') and self.line_window_velocities:
                             line_window_kms = tuple(self.line_window_velocities)
                         
+                        # Match legacy behaviour: raise cutoff_std to 3 on the
+                        # final iteration (pca_correct.py line 1252-1253).
+                        this_cutoff_std = 3 if iteration == 2 else self.line_cutoff_std
                         group_threshold = find_science_lines(
                             group_corrected_spectra,
                             kernel_size=self.line_kernel_size,
-                            cutoff_std=self.line_cutoff_std,
+                            cutoff_std=this_cutoff_std,
                             smoothing_kernel=self.smoothing_kernel_size,
                             velocity_axis_kms=velocity_axis_kms,
                             velocity_window_kms=line_window_kms
@@ -2642,17 +2645,26 @@ Examples:
         
         # Create corrector and apply correction
         logger.info("Initializing PCA corrector...")
-        
+
+        # Resolve final parameter values: CLI args take precedence over config file.
+        # This must happen BEFORE constructing PCACorrector so the corrector receives
+        # the correct values (previously these merges were done after construction).
+        cutoff_variance = args.variance_cutoff if args.variance_cutoff is not None else config_variance_cutoff
+        cutoff_noise_ratio = args.noise_ratio_cutoff if args.noise_ratio_cutoff is not None else config_noise_ratio_cutoff
+        line_kernel_size = args.line_kernel_size if args.line_kernel_size != 51 else config_line_kernel_size
+        line_cutoff_std = args.line_cutoff_std if args.line_cutoff_std != 2.0 else config_line_cutoff_std
+        smoothing_kernel = args.smoothing_kernel if args.smoothing_kernel is not None else config_smoothing_kernel
+
         # Get line_window from [reduction] section (already extracted above)
         line_window_velocities = tuple(config_line_window) if config_line_window else None
-        
+
         if decomposition_file:
             # Use single decomposition file
             corrector = PCACorrector(
                 str(decomp_path),
-                line_kernel_size=args.line_kernel_size,
-                line_cutoff_std=args.line_cutoff_std,
-                smoothing_kernel_size=args.smoothing_kernel,
+                line_kernel_size=line_kernel_size,
+                line_cutoff_std=line_cutoff_std,
+                smoothing_kernel_size=smoothing_kernel,
                 line_window_velocities=line_window_velocities
             )
             mission_decompositions_to_use = None
@@ -2674,28 +2686,21 @@ Examples:
             with tempfile.NamedTemporaryFile(mode='wb', suffix='.pkl', delete=False) as tf:
                 pickle.dump(temp_decomp, tf)
                 temp_decomp_path = tf.name
-            
+
             try:
                 corrector = PCACorrector(
                     temp_decomp_path,
-                    line_kernel_size=args.line_kernel_size,
-                    line_cutoff_std=args.line_cutoff_std,
-                    smoothing_kernel_size=args.smoothing_kernel,
+                    line_kernel_size=line_kernel_size,
+                    line_cutoff_std=line_cutoff_std,
+                    smoothing_kernel_size=smoothing_kernel,
                     line_window_velocities=line_window_velocities
                 )
             finally:
                 # Clean up temp file
                 os.unlink(temp_decomp_path)
             mission_decompositions_to_use = mission_decompositions
-        
+
         logger.info("Applying PCA correction...")
-        
-        # Use CLI args if provided, otherwise use config values
-        cutoff_variance = args.variance_cutoff if args.variance_cutoff is not None else config_variance_cutoff
-        cutoff_noise_ratio = args.noise_ratio_cutoff if args.noise_ratio_cutoff is not None else config_noise_ratio_cutoff
-        line_kernel_size = args.line_kernel_size if args.line_kernel_size != 51 else config_line_kernel_size
-        line_cutoff_std = args.line_cutoff_std if args.line_cutoff_std != 2.0 else config_line_cutoff_std
-        smoothing_kernel = args.smoothing_kernel if args.smoothing_kernel is not None else config_smoothing_kernel
         
         logger.info(f"Correction parameters:")
         logger.info(f"  Variance cutoff: {cutoff_variance}")
