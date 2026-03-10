@@ -230,15 +230,21 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                 # Get noise level from surrounding channels, ignoring NaNs
                 non_telluric = ~telluric_mask
                 if np.any(non_telluric):
-                    # Use nanstd to ignore NaN values
+                    # Use nanstd to ignore NaN values; need at least 2 valid values
                     non_telluric_values = spectrum[non_telluric]
-                    noise_level = np.nanstd(non_telluric_values)
-                    
+                    n_valid = np.sum(~np.isnan(non_telluric_values))
+                    if n_valid >= 2:
+                        noise_level = np.nanstd(non_telluric_values)
+                    else:
+                        noise_level = np.nan
+
                     # If all non-telluric values are NaN, use the full spectrum
                     if np.isnan(noise_level):
-                        noise_level = np.nanstd(spectrum)
+                        n_valid_full = np.sum(~np.isnan(spectrum))
+                        noise_level = np.nanstd(spectrum) if n_valid_full >= 2 else np.nan
                 else:
-                    noise_level = np.nanstd(spectrum)
+                    n_valid_full = np.sum(~np.isnan(spectrum))
+                    noise_level = np.nanstd(spectrum) if n_valid_full >= 2 else np.nan
                 
                 # Only fill if we have a valid noise level
                 if not np.isnan(noise_level) and noise_level > 0:

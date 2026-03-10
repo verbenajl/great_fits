@@ -421,7 +421,15 @@ def main_cli():
     parser = argparse.ArgumentParser(
         description="PCA decomposition of spectral reference data per MISSION_ID/TELESCOPE combination",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example:\n  pca_decompose --config config.toml --n-components 5"
+        epilog=(
+            "Input FITS file resolution order (first found is used):\n"
+            "  1. --fits argument\n"
+            "  2. [output].prepared_for_pca from config.toml  (default)\n"
+            "  3. [output].reduced_fits from config.toml\n"
+            "  4. [input].fits_file from config.toml\n\n"
+            "Example:\n"
+            "  pca_decompose --config config.toml --n-components 5"
+        )
     )
     parser.add_argument(
         "--config",

@@ -11,9 +11,12 @@ from typing import Any, Dict, Optional, Union
 import logging
 
 try:
-    import toml
+    import tomllib  # Built-in for Python 3.11+
 except ImportError:
-    toml = None
+    try:
+        import tomli as tomllib  # Fallback for Python < 3.11
+    except ImportError:
+        tomllib = None
 
 try:
     import yaml
@@ -77,13 +80,14 @@ class ConfigLoader:
         if not config_file.exists():
             raise ConfigurationError(f"Configuration file not found: {config_file}")
         
-        if toml is None:
-            raise ConfigurationError("toml library not available. Install with: pip install toml")
-        
+        if tomllib is None:
+            raise ConfigurationError("toml library not available. Install tomli: pip install tomli")
+
         try:
-            self.config_dict = toml.load(str(config_file))
+            with open(config_file, "rb") as f:
+                self.config_dict = tomllib.load(f)
             logger.info(f"Loaded configuration from {config_file}")
-        except toml.TomlDecodeError as e:
+        except Exception as e:
             raise ConfigurationError(f"Failed to parse configuration file: {e}")
         except Exception as e:
             raise ConfigurationError(f"Error loading configuration: {e}")

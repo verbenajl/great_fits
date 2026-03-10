@@ -1315,11 +1315,10 @@ class PCACorrector:
                         n_line = np.sum(line_regions)
                         stats['lines_detected'] = True
                     
-                    # Also exclude telluric lines
+                    # Exclude telluric lines from fitting only (not subtraction), matching legacy behaviour
                     if telluric_line_mask is not None:
                         telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask)-1)]
                         good_channels_for_fitting = good_channels_for_fitting & ~telluric_regions
-                        good_channels_for_subtraction = good_channels_for_subtraction & ~telluric_regions
 
                     
                     if not np.any(good_channels_for_fitting):
@@ -2146,7 +2145,7 @@ class PCACorrector:
                                           plot_width, spec_height])
                 
                 # Plot original, corrected, and component contribution
-                ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=1.5, alpha=0.8, label='Orig', color="black", zorder=1)
+                ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=1.5, alpha=0.8, label='Orig', zorder=1)
                 ax_ex_comp.plot(x_axis, corrected_ex, color='gray', lw=0.5, alpha=0.5, label='Corr', zorder=2)
                 
                 scaled_comp = coeffs[comp_idx] * self.components[comp_idx]
@@ -2261,6 +2260,11 @@ def main_correct_cli():
         description='Apply PCA-based correction to spectral data in FITS files',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Input FITS file resolution order (first found is used):
+  1. --input argument
+  2. [output].prepared_for_pca from config.toml  (default)
+  3. [output].reduced_fits from config.toml
+
 Examples:
   # Correct using decomposition from same mission
   pca_correct --input reduced_data.fits --decomposition decomp.pkl \\

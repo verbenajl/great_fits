@@ -21,9 +21,8 @@ try:
     import cygrid
     HAS_CYGRID = True
 except (ImportError, ValueError) as e:
-    # ValueError can occur due to numpy binary incompatibility
-    # Warning will be shown only when gridding is actually attempted (not at module import)
-    pass
+    import logging as _logging
+    _logging.getLogger(__name__).warning(f"cygrid import failed: {e}")
 
 
 def get_gridding_params_from_config(config_path: Optional[str] = None,
