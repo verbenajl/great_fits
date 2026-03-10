@@ -127,6 +127,7 @@ def create_wcs_header(naxis1: int, naxis2: int, naxis3: int,
                       cdelt1: float, cdelt2: float, cdelt3: float,
                       beamsize_deg: float, velo_lsr: float,
                       restfreq: float, object_name: str = "",
+                      telescop: str = "",
                       extra_header: Optional[Dict] = None) -> fits.Header:
     """
     Create a WCS-compliant FITS header for a 3D map.
@@ -213,7 +214,7 @@ def create_wcs_header(naxis1: int, naxis2: int, naxis3: int,
     header['TIMESYS'] = 'UTC'
     
     # Instrument info
-    header['TELESCOP'] = 'SOFIA/GREAT'
+    header['TELESCOP'] = telescop
     header['ORIGIN'] = 'OI-ZEIGT'
     
     # Add extra keywords if provided
@@ -457,8 +458,89 @@ def _get_celestial_coords(hdul: fits.HDUList) -> Tuple[np.ndarray, np.ndarray]:
     # Dec = CRVAL3 + CDELT3 (in degrees)
     ras = crval2 + data['CDELT2']
     decs = crval3 + data['CDELT3']
-    
+
     return ras, decs
+
+
+def grid_to_map(ras: np.ndarray, decs: np.ndarray, values: np.ndarray,
+                wcs_header_dict: dict,
+                naxis1: int, naxis2: int,
+                beamsize_deg: float,
+                ra_min: float, ra_max: float,
+                dec_min: float, dec_max: float,
+                weights: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Grid irregularly-sampled (ra, dec, value) triplets onto a regular 2D map.
+
+    This is the single shared gridding primitive used by all higher-level
+    mapping functions.  It handles the cygrid / scipy fallback and optional
+    per-sample weight normalisation in one place.
+
+    Parameters
+    ----------
+    ras, decs : ndarray
+        Observation coordinates in degrees (already filtered to finite values).
+    values : ndarray
+        Data values to grid.  For weighted gridding pass ``values * weight``
+        here and supply the raw weights in *weights* so the function can
+        normalise correctly.
+    wcs_header_dict : dict
+        WCS header produced by :func:`create_wcs_header` (used by cygrid).
+    naxis1, naxis2 : int
+        Output map dimensions (pixels).
+    beamsize_deg : float
+        Gaussian kernel FWHM in degrees.
+    ra_min, ra_max, dec_min, dec_max : float
+        Map bounding box in degrees (used by the scipy fallback).
+    weights : ndarray, optional
+        Per-sample weights.  When provided the output is
+        ``sum(value * weight) / sum(weight)`` per pixel.
+
+    Returns
+    -------
+    grid_map : ndarray, shape (naxis2, naxis1)
+        Gridded 2D map as float32.
+    """
+    kernelsize_sigma = beamsize_deg / 2.355
+    kernel_type = 'gauss1d'
+    kernel_params = (kernelsize_sigma,)
+    kernel_support = 3.0 * kernelsize_sigma
+    hpx_maxres = kernelsize_sigma / 2.0
+
+    if HAS_CYGRID:
+        gridder = cygrid.WcsGrid(wcs_header_dict)
+        gridder.set_kernel(kernel_type, kernel_params, kernel_support, hpx_maxres)
+        gridder.grid(ras, decs, values)
+        grid_map = gridder.get_datacube().astype(np.float32)
+
+        if weights is not None:
+            gridder_w = cygrid.WcsGrid(wcs_header_dict)
+            gridder_w.set_kernel(kernel_type, kernel_params, kernel_support, hpx_maxres)
+            gridder_w.grid(ras, decs, weights)
+            grid_weights = gridder_w.get_datacube().astype(np.float32)
+            grid_map = np.divide(grid_map, grid_weights,
+                                 where=grid_weights > 0,
+                                 out=np.zeros_like(grid_map))
+    else:
+        warnings.warn(
+            "cygrid not available - using scipy griddata instead "
+            "(less accurate for astronomical data)", UserWarning)
+        from scipy.interpolate import griddata
+        ra_grid = np.linspace(ra_min, ra_max, naxis1)
+        dec_grid = np.linspace(dec_min, dec_max, naxis2)
+        ra_mesh, dec_mesh = np.meshgrid(ra_grid, dec_grid)
+        points = np.column_stack([ras, decs])
+
+        grid_map = griddata(points, values, (ra_mesh, dec_mesh),
+                            method='linear').astype(np.float32)
+        if weights is not None:
+            grid_weights = griddata(points, weights, (ra_mesh, dec_mesh),
+                                    method='linear').astype(np.float32)
+            grid_map = np.divide(grid_map, grid_weights,
+                                 where=grid_weights > 0,
+                                 out=np.zeros_like(grid_map))
+
+    return grid_map
 
 
 def grid_spectra_with_cygrid(hdul: fits.HDUList,
@@ -580,52 +662,26 @@ def grid_spectra_with_cygrid(hdul: fits.HDUList,
     restfreq = header.get('RESTFREQ', 1.0)
     object_name = header.get('OBJECT', '').strip()
     
-    # Grid using cygrid if available, otherwise use scipy
-    if HAS_CYGRID:
-        kernelsize_sigma = beamsize_deg / 2.355
-        kernel_type = 'gauss1d'
-        kernel_params = (kernelsize_sigma,)
-        kernel_support = 3.0 * kernelsize_sigma
-        hpx_maxres = kernelsize_sigma / 2.0
-        
-        # Create WCS header for cygrid
-        wcs_header_dict = create_wcs_header(
-            naxis1=naxis1, naxis2=naxis2, naxis3=1,
-            crval_ra=ra_center, crval_dec=dec_center,
-            crpix1=crpix1, crpix2=crpix2, crpix3=crpix_spec,
-            cdelt1=-pixsize, cdelt2=pixsize, cdelt3=1.0,
-            beamsize_deg=beamsize_deg,
-            velo_lsr=velo_lsr,
-            restfreq=restfreq,
-            object_name=object_name,
-        )
-        
-        # Create cygrid gridder with WCS header
-        gridder = cygrid.WcsGrid(wcs_header_dict)
-        gridder.set_kernel(
-            kernel_type,
-            kernel_params,
-            kernel_support,
-            hpx_maxres,
-        )
-        
-        # Add data points
-        gridder.grid(ras, decs, values)
-        
-        # Get the gridded data
-        grid_map = gridder.get_datacube()  # Returns 2D array (naxis2, naxis1)
-    else:
-        # Fallback to scipy (cygrid not available)
-        warnings.warn("cygrid not available - using scipy griddata instead (less accurate for astronomical data)", UserWarning)
-        from scipy.interpolate import griddata
-        
-        ra_grid = np.linspace(ra_min, ra_max, naxis1)
-        dec_grid = np.linspace(dec_min, dec_max, naxis2)
-        ra_mesh, dec_mesh = np.meshgrid(ra_grid, dec_grid)
-        
-        points = np.column_stack([ras, decs])
-        grid_map = griddata(points, values, (ra_mesh, dec_mesh), method='linear')
-    
+    wcs_header_dict = create_wcs_header(
+        naxis1=naxis1, naxis2=naxis2, naxis3=1,
+        crval_ra=ra_center, crval_dec=dec_center,
+        crpix1=crpix1, crpix2=crpix2, crpix3=crpix_spec,
+        cdelt1=-pixsize, cdelt2=pixsize, cdelt3=1.0,
+        beamsize_deg=beamsize_deg,
+        velo_lsr=velo_lsr,
+        restfreq=restfreq,
+        object_name=object_name,
+    )
+
+    grid_map = grid_to_map(
+        ras, decs, values,
+        wcs_header_dict=wcs_header_dict,
+        naxis1=naxis1, naxis2=naxis2,
+        beamsize_deg=beamsize_deg,
+        ra_min=ra_min, ra_max=ra_max,
+        dec_min=dec_min, dec_max=dec_max,
+    )
+
     # Create WCS header
     wcs_header = create_wcs_header(
         naxis1=naxis1, naxis2=naxis2, naxis3=1,
@@ -889,86 +945,26 @@ def create_integrated_map(hdul: fits.HDUList,
     restfreq = header.get('RESTFREQ', 1.0)
     object_name = header.get('OBJECT', '').strip()
     
-    # Grid using cygrid if available, otherwise use scipy
-    if HAS_CYGRID:
-        kernelsize_sigma = beamsize_deg / 2.355
-        kernel_type = 'gauss1d'
-        kernel_params = (kernelsize_sigma,)
-        kernel_support = 3.0 * kernelsize_sigma
-        hpx_maxres = kernelsize_sigma / 2.0
-        
-        # Create WCS header for cygrid
-        wcs_header_dict = create_wcs_header(
-            naxis1=naxis1, naxis2=naxis2, naxis3=1,
-            crval_ra=ra_center, crval_dec=dec_center,
-            crpix1=crpix1, crpix2=crpix2, crpix3=crpix_spec,
-            cdelt1=-pixsize, cdelt2=pixsize, cdelt3=1.0,
-            beamsize_deg=beamsize_deg,
-            velo_lsr=velo_lsr,
-            restfreq=restfreq,
-            object_name=object_filter or "",
-        )
-        
-        # Create cygrid gridder with WCS header
-        gridder = cygrid.WcsGrid(wcs_header_dict)
-        gridder.set_kernel(
-            kernel_type,
-            kernel_params,
-            kernel_support,
-            hpx_maxres,
-        )
-        
-        # Add data points with proper weight normalization
-        if weights is not None:
-            # Grid weighted intensities
-            gridder.grid(ras, decs, integrated)
-            grid_map_weighted = gridder.get_datacube()
-            
-            # Grid the weights separately to normalize
-            gridder2 = cygrid.WcsGrid(wcs_header_dict)
-            gridder2.set_kernel(
-                kernel_type,
-                kernel_params,
-                kernel_support,
-                hpx_maxres,
-            )
-            gridder2.grid(ras, decs, weights)
-            grid_map_weights = gridder2.get_datacube()
-            
-            # Normalize: divide weighted sum by sum of weights
-            # Avoid division by zero where no data exists
-            grid_map = np.divide(grid_map_weighted, grid_map_weights,
-                                where=grid_map_weights > 0,
-                                out=np.zeros_like(grid_map_weighted))
-        else:
-            # Uniform weighting (no normalization needed)
-            gridder.grid(ras, decs, integrated)
-            grid_map = gridder.get_datacube()  # Returns 2D array (naxis2, naxis1)
-    else:
-        # Fallback to scipy (cygrid not available)
-        warnings.warn("cygrid not available - using scipy griddata instead (less accurate for astronomical data)", UserWarning)
-        from scipy.interpolate import griddata
-        
-        ra_grid = np.linspace(ra_min, ra_max, naxis1)
-        dec_grid = np.linspace(dec_min, dec_max, naxis2)
-        ra_mesh, dec_mesh = np.meshgrid(ra_grid, dec_grid)
-        
-        points = np.column_stack([ras, decs])
-        
-        if weights is not None:
-            # Grid weighted intensities
-            grid_map_weighted = griddata(points, integrated, (ra_mesh, dec_mesh), method='linear')
-            
-            # Grid weights separately to normalize
-            grid_map_weights = griddata(points, weights, (ra_mesh, dec_mesh), method='linear')
-            
-            # Normalize: divide weighted sum by sum of weights
-            grid_map = np.divide(grid_map_weighted, grid_map_weights,
-                                where=grid_map_weights > 0,
-                                out=np.zeros_like(grid_map_weighted))
-        else:
-            # Uniform weighting
-            grid_map = griddata(points, integrated, (ra_mesh, dec_mesh), method='linear')
+    wcs_header_dict = create_wcs_header(
+        naxis1=naxis1, naxis2=naxis2, naxis3=1,
+        crval_ra=ra_center, crval_dec=dec_center,
+        crpix1=crpix1, crpix2=crpix2, crpix3=crpix_spec,
+        cdelt1=-pixsize, cdelt2=pixsize, cdelt3=1.0,
+        beamsize_deg=beamsize_deg,
+        velo_lsr=velo_lsr,
+        restfreq=restfreq,
+        object_name=object_filter or "",
+    )
+
+    grid_map = grid_to_map(
+        ras, decs, integrated,
+        wcs_header_dict=wcs_header_dict,
+        naxis1=naxis1, naxis2=naxis2,
+        beamsize_deg=beamsize_deg,
+        ra_min=ra_min, ra_max=ra_max,
+        dec_min=dec_min, dec_max=dec_max,
+        weights=weights,
+    )
     
     # Create WCS header
     wcs_header = create_wcs_header(
@@ -1077,7 +1073,7 @@ def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
     header.set('BPA', beam_pa_deg, comment='beam position angle in degrees')
     
     # Create primary HDU with data and header
-    primary_hdu = fits.PrimaryHDU(data=grid_map, header=header)
+    primary_hdu = fits.PrimaryHDU(data=grid_map.astype(np.float32), header=header)
     
     # Create HDU list
     hdul = fits.HDUList([primary_hdu])
@@ -1132,7 +1128,8 @@ def create_spectral_datacube(hdul: fits.HDUList,
                             pixsize: Optional[float] = None,
                             object_filter: Optional[str] = None,
                             figsize: Tuple[float, float] = (12, 5),
-                            output_file: Optional[str] = None) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+                            output_file: Optional[str] = None,
+                            telescop: str = "") -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -1273,80 +1270,42 @@ def create_spectral_datacube(hdul: fits.HDUList,
     crpix2 = naxis2 / 2.0 + 1
     
     # Initialize datacube
-    datacube = np.full((nvel, naxis2, naxis1), np.nan, dtype=np.float64)
-    
+    datacube = np.full((nvel, naxis2, naxis1), np.nan, dtype=np.float32)
+
+    # Build WCS header dict once (same geometry for every channel)
+    wcs_header_dict_ch = create_wcs_header(
+        naxis1=naxis1, naxis2=naxis2, naxis3=1,
+        crval_ra=ra_center, crval_dec=dec_center,
+        crpix1=crpix1, crpix2=crpix2, crpix3=crpix1_spec,
+        cdelt1=-pixsize, cdelt2=pixsize, cdelt3=1.0,
+        beamsize_deg=beamsize_deg,
+        velo_lsr=velo_lsr,
+        restfreq=restfreq,
+        object_name=object_filter or "",
+    )
+
     # Grid each velocity channel
     print(f"Creating datacube: {nvel} channels × {naxis2} × {naxis1} pixels...")
-    
+
     for ichannel in range(nvel):
         if ichannel % max(1, nvel // 10) == 0:
             print(f"  Channel {ichannel+1}/{nvel}...", end='\r')
-        
+
         channel_data = spectra[:, ichannel]
-        
+
         # Filter valid points
         valid = np.isfinite(ras) & np.isfinite(decs) & np.isfinite(channel_data)
         if not np.any(valid):
             continue
-        
-        ras_valid = ras[valid]
-        decs_valid = decs[valid]
-        data_valid = channel_data[valid]
-        
-        if HAS_CYGRID:
-            try:
-                # Use cygrid with proper kernel parameters
-                kernelsize_sigma = beamsize_deg / 2.355
-                kernel_type = 'gauss1d'
-                kernel_params = (kernelsize_sigma,)
-                kernel_support = 3.0 * kernelsize_sigma
-                hpx_maxres = kernelsize_sigma / 2.0
-                
-                # Create WCS header for cygrid
-                wcs_header_dict = create_wcs_header(
-                    naxis1=naxis1, naxis2=naxis2, naxis3=1,
-                    crval_ra=ra_center, crval_dec=dec_center,
-                    crpix1=crpix1, crpix2=crpix2, crpix3=crpix1_spec,
-                    cdelt1=-pixsize, cdelt2=pixsize, cdelt3=1.0,
-                    beamsize_deg=beamsize_deg,
-                    velo_lsr=velo_lsr,
-                    restfreq=restfreq,
-                    object_name=object_filter or "",
-                )
-                
-                # Create cygrid gridder with WCS header
-                gridder = cygrid.WcsGrid(wcs_header_dict)
-                gridder.set_kernel(
-                    kernel_type,
-                    kernel_params,
-                    kernel_support,
-                    hpx_maxres,
-                )
-                
-                # Grid data
-                gridder.grid(ras_valid, decs_valid, data_valid)
-                
-                # Get the gridded data
-                channel_map = gridder.get_datacube()  # Returns 2D array (naxis2, naxis1)
-            except Exception:
-                # Fallback to scipy
-                from scipy.interpolate import griddata
-                ra_grid = np.linspace(ra_min, ra_max, naxis1)
-                dec_grid = np.linspace(dec_min, dec_max, naxis2)
-                ra_mesh, dec_mesh = np.meshgrid(ra_grid, dec_grid)
-                points = np.column_stack([ras_valid, decs_valid])
-                channel_map = griddata(points, data_valid, (ra_mesh, dec_mesh), method='linear')
-        else:
-            # Use scipy (cygrid not available)
-            warnings.warn("cygrid not available - using scipy griddata instead (less accurate for astronomical data)", UserWarning)
-            from scipy.interpolate import griddata
-            ra_grid = np.linspace(ra_min, ra_max, naxis1)
-            dec_grid = np.linspace(dec_min, dec_max, naxis2)
-            ra_mesh, dec_mesh = np.meshgrid(ra_grid, dec_grid)
-            points = np.column_stack([ras_valid, decs_valid])
-            channel_map = griddata(points, data_valid, (ra_mesh, dec_mesh), method='linear')
-        
-        datacube[ichannel] = channel_map
+
+        datacube[ichannel] = grid_to_map(
+            ras[valid], decs[valid], channel_data[valid],
+            wcs_header_dict=wcs_header_dict_ch,
+            naxis1=naxis1, naxis2=naxis2,
+            beamsize_deg=beamsize_deg,
+            ra_min=ra_min, ra_max=ra_max,
+            dec_min=dec_min, dec_max=dec_max,
+        )
     
     print(f"  Channel {nvel}/{nvel}... Done!")
     
@@ -1363,6 +1322,7 @@ def create_spectral_datacube(hdul: fits.HDUList,
         velo_lsr=velo_lsr,
         restfreq=restfreq,
         object_name=object_filter or "",
+        telescop=telescop,
     )
     
     # Create visualization of a sample slice

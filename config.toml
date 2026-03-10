@@ -25,7 +25,8 @@ method = "cygrid"  # Options: "cygrid" or "scipy" (auto-falls back if cygrid una
 beamsize_arcsec = 14.1  # Beam size in arcseconds
 #pixel_size_arcsec = 14.0  # Pixel size in arcseconds (will be calculated from beamsize if not specified)
 spectra_weighting = "rmsratio"  # Options: "uniform" or "rmsratio"
-channel_weighting = true  
+channel_weighting = true
+telescop = "IRAM-30M"  # Telescope name written to FITS header (must be recognised by CLASS)
 
 [pca_prepare]
 fill_with_noise=true
@@ -54,7 +55,7 @@ clean_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_pr
 rejected_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/rejected_data.fits"
 reduced_fits = "/home/verbena/data/m51_processed_data/reduced_data.fits"
 averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/averaged_data.fits"
-datacube = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/datacube.fits"
+datacube = "/home/verbena/data/m51_processed_data/datacube.fits"
 prepared_for_pca="/home/verbena/data/m51_processed_data/prepared_for_pca.fits"
 pcad_fits="/home/verbena/data/m51_processed_data/pca_corrected.fits"
 post_filtered_fits="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/post_filtered.fits"

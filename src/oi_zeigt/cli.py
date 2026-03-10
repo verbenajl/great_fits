@@ -2728,7 +2728,11 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
 @click.option('--config', type=click.Path(exists=True), 
               help='Path to config.toml file.')
 @click.option('--reduced', is_flag=True, default=False,
-              help='Use reduced_data.fits instead of the input data.')
+              help='Use reduced_data.fits (output.reduced_fits from config).')
+@click.option('--pcad', is_flag=True, default=False,
+              help='Use pca_corrected.fits (output.pcad_fits from config).')
+@click.option('--prepared', is_flag=True, default=False,
+              help='Use prepared_for_pca.fits (output.prepared_for_pca from config).')
 @click.option('--object', type=str, default=None,
               help='Filter by object name. If not specified, uses "object" from config.toml if available.')
 @click.option('--beamsize', type=float, default=None,
@@ -2739,7 +2743,7 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
               help='Output FITS file path. If not specified, uses "datacube" from config.toml or ./datacube.fits.')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for diagnostic plot (e.g., datacube_slices.png). If not specified, plot is shown but not saved.')
-def create_datacube_cmd(config, reduced, object, beamsize, pixsize, output, plot):
+def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsize, output, plot):
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -2747,18 +2751,23 @@ def create_datacube_cmd(config, reduced, object, beamsize, pixsize, output, plot
     (nvel, dec, ra) with WCS headers. Uses cygrid for optimal Gaussian kernel gridding
     with scipy fallback.
     
-    Reads input file from config.toml [input].fits_file by default, or uses
-    [output].reduced_fits if --reduced flag is specified.
-    
+    Reads input file from (in order of priority):
+    1. --pcad flag (uses output.pcad_fits from config)
+    2. --prepared flag (uses output.prepared_for_pca from config)
+    3. --reduced flag (uses output.reduced_fits from config)
+    4. [input].fits_file from config.toml otherwise
+
     Output file path is determined by (in order of priority):
     1. --output command line option
     2. [output].datacube from config.toml
     3. Default: ./datacube.fits
 
     Gridding parameters read from config.toml [gridding] section if not specified on command line.
-    
+
     Examples:
         create_datacube --config config.toml
+        create_datacube --config config.toml --pcad --object M51
+        create_datacube --config config.toml --prepared --object M51
         create_datacube --config config.toml --reduced --object M51
         create_datacube --config config.toml --output my_datacube.fits --plot slices.png
         create_datacube --config config.toml --beamsize 0.3 --pixsize 0.05
@@ -2778,14 +2787,28 @@ def create_datacube_cmd(config, reduced, object, beamsize, pixsize, output, plot
         )
 
         # Determine FITS file to process
-        if reduced:
-            # Use reduced_data.fits from config
-            output_cfg = cfg.get('output', {})
-            reduced_fits_path = output_cfg.get('reduced_fits', None)
-            if not reduced_fits_path:
+        output_cfg = cfg.get('output', {})
+        if pcad:
+            fits_path = output_cfg.get('pcad_fits', None)
+            if not fits_path:
+                click.echo(click.style("Error: --pcad flag specified but [output].pcad_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
+            click.echo(f"Reading FITS file: {fits_path}")
+            hdul = fits.open(fits_path)
+        elif prepared:
+            fits_path = output_cfg.get('prepared_for_pca', None)
+            if not fits_path:
+                click.echo(click.style("Error: --prepared flag specified but [output].prepared_for_pca not defined in config", fg="red"), err=True)
+                sys.exit(1)
+            click.echo(f"Reading FITS file: {fits_path}")
+            hdul = fits.open(fits_path)
+        elif reduced:
+            fits_path = output_cfg.get('reduced_fits', None)
+            if not fits_path:
                 click.echo(click.style("Error: --reduced flag specified but [output].reduced_fits not defined in config", fg="red"), err=True)
                 sys.exit(1)
-            hdul = fits.open(reduced_fits_path)
+            click.echo(f"Reading FITS file: {fits_path}")
+            hdul = fits.open(fits_path)
         else:
             # Use input file from config
             hdul = read_fits_from_config(config_path)
@@ -2811,12 +2834,16 @@ def create_datacube_cmd(config, reduced, object, beamsize, pixsize, output, plot
         # Create datacube
         from oi_zeigt.mapping.gridding import create_spectral_datacube
         
+        gridding_cfg = cfg.get('gridding', {})
+        telescop = gridding_cfg.get('telescop', '')
+
         datacube, wcs_header, fig = create_spectral_datacube(
             hdul,
             beamsize_deg=beamsize_deg,
             pixsize=pixsize_deg,
             object_filter=object_filter,
-            output_file=output_file
+            output_file=output_file,
+            telescop=telescop,
         )
 
         click.echo(f"\n✓ Spectral datacube created")
