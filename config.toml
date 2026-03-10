@@ -1,5 +1,5 @@
 [input]
-fits_file="/home/diskB/sofiaobsdata/m51/m51_data_acquisc/kalibrated_all/m51_central_tile_1hdu.fits"
+fits_file="/home/verbena/data/m51_processed_data/m51_central_tile_1hdu.fits"
 
 [parameters]
 # Object name substring for filtering (PCA correction will only process spectra containing this substring)
@@ -51,7 +51,7 @@ line_kernel_size = 51
 
 
 [output]
-clean_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/clean_data.fits"
+clean_fits = "/home/verbena/data/m51_processed_data/clean_data.fits"
 rejected_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/rejected_data.fits"
 reduced_fits = "/home/verbena/data/m51_processed_data/reduced_data.fits"
 averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/averaged_data.fits"

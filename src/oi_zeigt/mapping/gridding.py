@@ -7,6 +7,7 @@ Falls back to scipy griddata if cygrid is not available.
 """
 
 from typing import Optional, Tuple, Dict, Any
+import os
 import numpy as np
 from astropy.io import fits
 from astropy import units as u
@@ -1123,13 +1124,59 @@ def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
         print(f"    Reference velocity: {velo_ref:.2f} km/s at channel {spectral_params['crpix1_spec']-1:.0f}")
 
 
+# ---------------------------------------------------------------------------
+# Multiprocessing worker functions for parallel channel gridding.
+# Must be module-level (not nested) so they can be pickled by multiprocessing.
+# ---------------------------------------------------------------------------
+
+_gridding_worker_state: dict = {}
+
+
+def _init_gridding_worker(ras, decs, wcs_header_dict,
+                          naxis1, naxis2, beamsize_deg,
+                          ra_min, ra_max, dec_min, dec_max):
+    """Pool initializer — stores shared geometry in each worker process once."""
+    global _gridding_worker_state
+    _gridding_worker_state = dict(
+        ras=ras, decs=decs,
+        wcs_header_dict=wcs_header_dict,
+        naxis1=naxis1, naxis2=naxis2,
+        beamsize_deg=beamsize_deg,
+        ra_min=ra_min, ra_max=ra_max,
+        dec_min=dec_min, dec_max=dec_max,
+    )
+
+
+def _grid_channel_worker(args):
+    """Worker: grid one spectral channel and return (ichannel, 2D map or None)."""
+    ichannel, channel_data = args
+    s = _gridding_worker_state
+    valid = (np.isfinite(s['ras']) & np.isfinite(s['decs']) &
+             np.isfinite(channel_data))
+    if not np.any(valid):
+        return ichannel, None
+    channel_map = grid_to_map(
+        s['ras'][valid], s['decs'][valid], channel_data[valid],
+        wcs_header_dict=s['wcs_header_dict'],
+        naxis1=s['naxis1'], naxis2=s['naxis2'],
+        beamsize_deg=s['beamsize_deg'],
+        ra_min=s['ra_min'], ra_max=s['ra_max'],
+        dec_min=s['dec_min'], dec_max=s['dec_max'],
+    )
+    return ichannel, channel_map
+
+
+# ---------------------------------------------------------------------------
+
+
 def create_spectral_datacube(hdul: fits.HDUList,
                             beamsize_deg: float = 0.25,
                             pixsize: Optional[float] = None,
                             object_filter: Optional[str] = None,
                             figsize: Tuple[float, float] = (12, 5),
                             output_file: Optional[str] = None,
-                            telescop: str = "") -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+                            telescop: str = "",
+                            n_jobs: int = -1) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -1284,30 +1331,55 @@ def create_spectral_datacube(hdul: fits.HDUList,
         object_name=object_filter or "",
     )
 
-    # Grid each velocity channel
-    print(f"Creating datacube: {nvel} channels × {naxis2} × {naxis1} pixels...")
+    # Resolve n_jobs: -1 means use all available CPUs
+    n_workers = os.cpu_count() if n_jobs == -1 else max(1, n_jobs)
+    n_workers = min(n_workers, nvel)  # No point having more workers than channels
 
-    for ichannel in range(nvel):
-        if ichannel % max(1, nvel // 10) == 0:
-            print(f"  Channel {ichannel+1}/{nvel}...", end='\r')
+    print(f"Creating datacube: {nvel} channels × {naxis2} × {naxis1} pixels "
+          f"(n_jobs={n_workers})...")
 
-        channel_data = spectra[:, ichannel]
+    channel_args = [(ichannel, np.array(spectra[:, ichannel], dtype=np.float32))
+                    for ichannel in range(nvel)]
 
-        # Filter valid points
-        valid = np.isfinite(ras) & np.isfinite(decs) & np.isfinite(channel_data)
-        if not np.any(valid):
-            continue
+    if n_workers == 1:
+        # Sequential path — useful for debugging
+        for ichannel, channel_data in channel_args:
+            if ichannel % max(1, nvel // 10) == 0:
+                print(f"  Channel {ichannel+1}/{nvel}...", end='\r')
+            valid = np.isfinite(ras) & np.isfinite(decs) & np.isfinite(channel_data)
+            if not np.any(valid):
+                continue
+            datacube[ichannel] = grid_to_map(
+                ras[valid], decs[valid], channel_data[valid],
+                wcs_header_dict=wcs_header_dict_ch,
+                naxis1=naxis1, naxis2=naxis2,
+                beamsize_deg=beamsize_deg,
+                ra_min=ra_min, ra_max=ra_max,
+                dec_min=dec_min, dec_max=dec_max,
+            )
+    else:
+        from multiprocessing import Pool
+        with Pool(
+            processes=n_workers,
+            initializer=_init_gridding_worker,
+            initargs=(
+                np.array(ras, dtype=np.float32),
+                np.array(decs, dtype=np.float32),
+                wcs_header_dict_ch,
+                naxis1, naxis2, beamsize_deg,
+                ra_min, ra_max, dec_min, dec_max,
+            ),
+        ) as pool:
+            n_done = 0
+            for ichannel, channel_map in pool.imap_unordered(
+                    _grid_channel_worker, channel_args):
+                if channel_map is not None:
+                    datacube[ichannel] = channel_map
+                n_done += 1
+                if n_done % max(1, nvel // 10) == 0:
+                    print(f"  {n_done}/{nvel} channels done...", end='\r')
 
-        datacube[ichannel] = grid_to_map(
-            ras[valid], decs[valid], channel_data[valid],
-            wcs_header_dict=wcs_header_dict_ch,
-            naxis1=naxis1, naxis2=naxis2,
-            beamsize_deg=beamsize_deg,
-            ra_min=ra_min, ra_max=ra_max,
-            dec_min=dec_min, dec_max=dec_max,
-        )
-    
-    print(f"  Channel {nvel}/{nvel}... Done!")
+    print(f"  {nvel}/{nvel} channels done.    ")
     
     # Create WCS header for 3D cube (spectral, dec, ra)
     # Note: CDELT3 should be deltav (velocity spacing per channel in m/s)

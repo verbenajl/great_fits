@@ -919,13 +919,33 @@ def apply_baseline_to_hdul(hdul: fits.HDUList,
 
     data = matrix_hdu.data
 
+    # Determine which rows are calibration spectra (must not be baselined)
+    calibration_objects = {'TSYS', 'TAU_SIG'}
+    if 'OBJECT' in data.dtype.names:
+        row_objects = np.array([str(s).strip() for s in data['OBJECT']])
+    else:
+        row_objects = np.array([''] * len(data))
+
     # Build new spectra array by applying baseline_subtract per row
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
+    n_skipped = {obj: 0 for obj in calibration_objects}
     new_spectra = []
-    for spec in data[spectrum_column]:
-        corrected = baseline_subtract(np.array(spec, dtype=float), 
-                                      order=order, 
-                                      window=window)
-        new_spectra.append(corrected)
+    for i, spec in enumerate(data[spectrum_column]):
+        if row_objects[i] in calibration_objects:
+            # Leave calibration spectra untouched — their absolute values are needed
+            new_spectra.append(np.array(spec, dtype=float))
+            n_skipped[row_objects[i]] += 1
+        else:
+            corrected = baseline_subtract(np.array(spec, dtype=float),
+                                          order=order,
+                                          window=window)
+            new_spectra.append(corrected)
+
+    for obj, count in n_skipped.items():
+        if count > 0:
+            _logger.info(f"Baseline subtraction: skipped {count} {obj} spectra "
+                         f"(calibration rows — absolute values preserved)")
 
     # Convert to astropy Table for easy column replacement
     from astropy.table import Table

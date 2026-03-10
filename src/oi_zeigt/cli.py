@@ -2743,7 +2743,9 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
               help='Output FITS file path. If not specified, uses "datacube" from config.toml or ./datacube.fits.')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for diagnostic plot (e.g., datacube_slices.png). If not specified, plot is shown but not saved.')
-def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsize, output, plot):
+@click.option('--n-jobs', type=int, default=-1,
+              help='Number of parallel workers for channel gridding. -1 = all CPUs (default), 1 = sequential.')
+def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsize, output, plot, n_jobs):
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -2844,6 +2846,7 @@ def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsi
             object_filter=object_filter,
             output_file=output_file,
             telescop=telescop,
+            n_jobs=n_jobs,
         )
 
         click.echo(f"\n✓ Spectral datacube created")
