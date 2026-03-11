@@ -1467,6 +1467,13 @@ def reduce_spectra(hdul: fits.HDUList,
         window_size = params.get('window_size', 5)
         spectra = _reduce_smooth(spectra, window_size=window_size)
 
+    if 'decimate' in methods:
+        factor = methods['decimate'].get('factor', 1)
+        if factor > 1:
+            spectra = spectra[:, ::factor]
+            methods['_decimate_factor'] = factor
+            print(f"Decimated by factor {factor}: {spectra.shape[1]} channels remaining")
+
     # Convert spectra back to original data type to preserve file size
     spectra = spectra.astype(original_spectrum_dtype)
 
@@ -1508,8 +1515,15 @@ def reduce_spectra(hdul: fits.HDUList,
             ch_min = methods['_extract_ch_min']
             ch_max = methods['_extract_ch_max']
             velocity_axis = velocity_axis[ch_min:ch_max+1]
-        
-        # Create velocity axis column (repeat for all spectra)
+
+        # If decimation was done, decimate the velocity axis to match
+        if '_decimate_factor' in methods:
+            velocity_axis = velocity_axis[::methods['_decimate_factor']]
+
+        # NOTE: This stores the velocity axis once per spectrum (shape: nspectra × nchannels),
+        # making it as large as the SPECTRUM column itself and roughly doubling the output file size.
+        # It is redundant — the velocity axis can always be recomputed from VELOCITY, DELTAV,
+        # and CRPIX1 in the header. Left here intentionally for convenience.
         velocity_axis_column = np.tile(velocity_axis, (len(spectra), 1))
         table['VELOCITY_AXIS'] = velocity_axis_column
     except (ValueError, KeyError) as e:

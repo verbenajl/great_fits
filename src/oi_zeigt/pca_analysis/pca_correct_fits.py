@@ -336,6 +336,155 @@ def get_telluric_line_mask(mission_id, velocity_axis_kms, n_spectra):
     return mask
 
 
+# =============================================================================
+# Module-level standalone functions for parallel PCA spectrum correction
+# =============================================================================
+
+_pca_worker_state: dict = {}
+
+
+def _pca_get_decomp(mission_id, telescope, mission_decompositions):
+    """Select the right PCA decomposition for a given mission/telescope."""
+    key = (mission_id, telescope)
+    if key in mission_decompositions:
+        return mission_decompositions[key]
+    if len(telescope) > 4 and telescope[:4] in ('LFAH', 'LFAI', 'LFAV', 'LFBI', 'LFBH', 'PRISM'):
+        base_key = (mission_id, telescope[:4])
+        if base_key in mission_decompositions:
+            return mission_decompositions[base_key]
+    if mission_id in mission_decompositions:
+        return mission_decompositions[mission_id]
+    return None
+
+
+def _pca_apply_correction(spectrum, components, variance_ratio,
+                          good_channels_fit, good_channels_sub,
+                          cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size):
+    """
+    Pure-function PCA correction for one spectrum.
+
+    Mirrors PCACorrector.apply_correction but takes components/variance_ratio
+    explicitly so it can run in worker processes without a class instance.
+    """
+    # Fit coefficients
+    if not np.all(good_channels_fit):
+        coeff = np.dot(components[:, good_channels_fit], spectrum[good_channels_fit])
+    else:
+        coeff = np.dot(components, spectrum)
+
+    corrected = spectrum.copy()
+    used_components = []
+    component_info = {}
+
+    for i, (comp, var_ratio) in enumerate(zip(components, variance_ratio)):
+        if cutoff_variance is not None and var_ratio < cutoff_variance:
+            component_info[i] = {'used': False, 'reason': 'variance_cutoff',
+                                 'coeff': coeff[i], 'variance': var_ratio}
+            continue
+
+        scaled_comp = coeff[i] * comp
+
+        # Noise ratio (mirrors PCACorrector.get_noise_ratio)
+        spectrum_std = np.nanstd(spectrum)
+        component_std = np.nanstd(scaled_comp)
+        if smoothing_kernel_size and smoothing_kernel_size > 0:
+            nan_mask = np.isnan(spectrum)
+            if np.any(nan_mask):
+                valid_idx = np.where(~nan_mask)[0]
+                s4s = spectrum.copy()
+                if len(valid_idx) > 0:
+                    s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spectrum[valid_idx])
+            else:
+                s4s = spectrum
+            kernel = np.ones(smoothing_kernel_size) / smoothing_kernel_size
+            spectrum_std = np.nanstd(np.convolve(s4s, kernel, mode='same'))
+        eps = 1e-15
+        if np.isnan(spectrum_std) or np.isnan(component_std):
+            noise_ratio = np.inf
+        elif component_std < eps:
+            noise_ratio = 1e10
+        elif spectrum_std < eps:
+            noise_ratio = 1e5
+        else:
+            noise_ratio = spectrum_std / component_std
+        if not np.isfinite(noise_ratio):
+            noise_ratio = 1e10
+
+        if np.isnan(noise_ratio):
+            component_info[i] = {'used': False, 'reason': 'bad_noise_ratio',
+                                 'coeff': coeff[i], 'noise_ratio': noise_ratio}
+            continue
+
+        if cutoff_noise_ratio is not None and noise_ratio > cutoff_noise_ratio:
+            component_info[i] = {'used': False, 'reason': 'noise_ratio_cutoff',
+                                 'coeff': coeff[i], 'noise_ratio': noise_ratio}
+            continue
+
+        corrected[good_channels_sub] -= scaled_comp[good_channels_sub]
+        used_components.append(i)
+        component_info[i] = {'used': True, 'coeff': coeff[i],
+                             'variance': var_ratio, 'noise_ratio': noise_ratio}
+
+    details = {
+        'coefficients': coeff,
+        'n_components_used': len(used_components),
+        'used_components': used_components,
+        'component_info': component_info,
+    }
+    return corrected, details
+
+
+def _init_pca_worker(mission_decompositions, default_components, default_variance_ratio,
+                     cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size):
+    """Initializer for PCA correction worker processes."""
+    global _pca_worker_state
+    _pca_worker_state = {
+        'mission_decompositions': mission_decompositions,
+        'default_components': default_components,
+        'default_variance_ratio': default_variance_ratio,
+        'cutoff_variance': cutoff_variance,
+        'cutoff_noise_ratio': cutoff_noise_ratio,
+        'smoothing_kernel_size': smoothing_kernel_size,
+    }
+
+
+def _pca_spectrum_worker(args):
+    """
+    Worker function for parallel PCA spectrum correction.
+
+    Returns (idx, corrected, details):
+      - details is None           → no decomposition found for this spectrum
+      - details['status']=='ok'   → successful correction
+      - details['status']!='ok'   → skip (bad channels or exception), corrected=original
+    """
+    idx, spectrum, gcf, gcs, mission_id, telescope = args
+    s = _pca_worker_state
+    try:
+        if s['mission_decompositions'] and mission_id is not None:
+            decomp = _pca_get_decomp(mission_id, telescope, s['mission_decompositions'])
+            if decomp is None:
+                return idx, None, None  # signal: no decomposition
+            components = decomp.components
+            variance_ratio = decomp.explained_variance_ratio
+        else:
+            components = s['default_components']
+            variance_ratio = s['default_variance_ratio']
+
+        if not np.any(gcf):
+            return idx, spectrum.copy(), {'status': 'skip_bad_channels',
+                                          'n_components_used': 0, 'skipped': True}
+
+        corrected, details = _pca_apply_correction(
+            spectrum, components, variance_ratio, gcf, gcs,
+            s['cutoff_variance'], s['cutoff_noise_ratio'], s['smoothing_kernel_size']
+        )
+        details['status'] = 'ok'
+        return idx, corrected, details
+    except Exception as e:
+        return idx, spectrum.copy(), {'status': 'error', 'error': str(e),
+                                      'n_components_used': 0, 'skipped': True}
+
+
 class PCACorrector:
     """Apply PCA-based correction to spectra in FITS files."""
     
@@ -868,7 +1017,8 @@ class PCACorrector:
                          object_filter=None, overwrite=False, generate_plots=False,
                          output_dir='output/pca_corrected', config_window=None,
                          detect_science_lines=True, scan_filter=None, subscan_filter=None,
-                         telescope_filter=None, mission_id_filter=None, mission_decompositions=None):
+                         telescope_filter=None, mission_id_filter=None, mission_decompositions=None,
+                     n_jobs=1):
         """
         Correct all spectra in a FITS file.
         
@@ -1075,7 +1225,11 @@ class PCACorrector:
                 'components_used': [],
                 'lines_detected': False
             }
-            
+
+            n_workers = os.cpu_count() if n_jobs == -1 else max(1, int(n_jobs))
+            if n_workers > 1:
+                logger.info(f"Parallel correction enabled: {n_workers} workers (n_jobs={n_jobs})")
+
             # ============================================================================
             # ITERATIVE LINE DETECTION FOLLOWING ORIGINAL pca_correct.py APPROACH
             # ============================================================================
@@ -1092,61 +1246,92 @@ class PCACorrector:
             else:
                 logger.info("Using single default decomposition for all spectra")
             
-            for spec_idx, idx in enumerate(indices):
-                try:
-                    spectrum = data[spectrum_col][idx]
-                    
-                    # Select correct decomposition for this spectrum if using per-mission decompositions
-                    if mission_decompositions:
-                        spec_mission_id = data['MISSION_ID'][idx].strip()
-                        spec_telescope = data['TELESCOP'][idx].strip()
-                        decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
-                        if decomp is None:
-                            if spec_idx < 3:  # Log only first 3 misses
-                                logger.warning(f"Spectrum {idx}: No decomposition found for {spec_mission_id}/{spec_telescope} - keeping original (uncorrected)")
-                            # Keep original spectrum uncorrected instead of skipping
-                            prelim_corrected_spectra[idx] = spectrum
-                            correction_details[idx] = {'n_components_used': 0, 'skipped': True, 'reason': 'no_decomposition'}
-                            stats['failed'] += 1
-                            continue
-                        saved_components = self.components
-                        saved_variance_ratio = self.explained_variance_ratio
-                        self.components = decomp.components
-                        self.explained_variance_ratio = decomp.explained_variance_ratio
-                    
-                    # Check for bad channels only (no line mask yet)
+            if n_workers > 1:
+                # --- Parallel Phase 1 ---
+                phase1_args = []
+                for spec_idx, idx in enumerate(indices):
+                    spectrum = np.array(data[spectrum_col][idx], dtype=float)
+                    mission_id_s = data['MISSION_ID'][idx].strip() if mission_decompositions else None
+                    telescope_s = data['TELESCOP'][idx].strip() if mission_decompositions else None
                     bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
-                    good_channels_for_fitting = ~bad_channels
-                    
-                    if not np.any(good_channels_for_fitting):
-                        correction_details[idx] = {'n_components_used': 0, 'skipped': True}
+                    gcf = ~bad_channels
+                    phase1_args.append((idx, spectrum, gcf, gcf.copy(), mission_id_s, telescope_s))
+                from multiprocessing import Pool
+                chunk = max(1, len(phase1_args) // (n_workers * 4))
+                with Pool(processes=n_workers, initializer=_init_pca_worker,
+                          initargs=(mission_decompositions, self.components,
+                                    self.explained_variance_ratio,
+                                    cutoff_variance, cutoff_noise_ratio,
+                                    self.smoothing_kernel_size)) as pool:
+                    for idx_r, corrected_r, details_r in pool.imap_unordered(
+                            _pca_spectrum_worker, phase1_args, chunksize=chunk):
+                        status = None if details_r is None else details_r.get('status', 'ok')
+                        if status is None:  # no decomposition
+                            correction_details[idx_r] = {'n_components_used': 0, 'skipped': True,
+                                                         'reason': 'no_decomposition'}
+                            stats['failed'] += 1
+                        elif status in ('skip_bad_channels', 'error'):
+                            correction_details[idx_r] = {'n_components_used': 0, 'skipped': True}
+                        else:
+                            prelim_corrected_spectra[idx_r] = corrected_r
+                            correction_details[idx_r] = details_r
+            else:
+                # --- Sequential Phase 1 ---
+                for spec_idx, idx in enumerate(indices):
+                    try:
+                        spectrum = data[spectrum_col][idx]
+
+                        # Select correct decomposition for this spectrum if using per-mission decompositions
+                        if mission_decompositions:
+                            spec_mission_id = data['MISSION_ID'][idx].strip()
+                            spec_telescope = data['TELESCOP'][idx].strip()
+                            decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
+                            if decomp is None:
+                                if spec_idx < 3:  # Log only first 3 misses
+                                    logger.warning(f"Spectrum {idx}: No decomposition found for {spec_mission_id}/{spec_telescope} - keeping original (uncorrected)")
+                                # Keep original spectrum uncorrected instead of skipping
+                                prelim_corrected_spectra[idx] = spectrum
+                                correction_details[idx] = {'n_components_used': 0, 'skipped': True, 'reason': 'no_decomposition'}
+                                stats['failed'] += 1
+                                continue
+                            saved_components = self.components
+                            saved_variance_ratio = self.explained_variance_ratio
+                            self.components = decomp.components
+                            self.explained_variance_ratio = decomp.explained_variance_ratio
+
+                        # Check for bad channels only (no line mask yet)
+                        bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
+                        good_channels_for_fitting = ~bad_channels
+
+                        if not np.any(good_channels_for_fitting):
+                            correction_details[idx] = {'n_components_used': 0, 'skipped': True}
+                            if mission_decompositions:
+                                self.components = saved_components
+                                self.explained_variance_ratio = saved_variance_ratio
+                            continue
+
+                        # First pass: correct without line mask
+                        corrected, details = self.apply_correction(
+                            spectrum,
+                            good_channels=good_channels_for_fitting,
+                            good_channels_for_subtraction=good_channels_for_fitting,
+                            cutoff_variance=cutoff_variance,
+                            cutoff_noise_ratio=cutoff_noise_ratio,
+                            verbose=False,
+                            smoothing_kernel_size=self.smoothing_kernel_size
+                        )
+
+                        prelim_corrected_spectra[idx] = corrected
+                        correction_details[idx] = details
+
                         if mission_decompositions:
                             self.components = saved_components
                             self.explained_variance_ratio = saved_variance_ratio
-                        continue
-                    
-                    # First pass: correct without line mask
-                    corrected, details = self.apply_correction(
-                        spectrum,
-                        good_channels=good_channels_for_fitting,
-                        good_channels_for_subtraction=good_channels_for_fitting,
-                        cutoff_variance=cutoff_variance,
-                        cutoff_noise_ratio=cutoff_noise_ratio,
-                        verbose=False,
-                        smoothing_kernel_size=self.smoothing_kernel_size
-                    )
-                    
-                    prelim_corrected_spectra[idx] = corrected
-                    correction_details[idx] = details
-                    
-                    if mission_decompositions:
-                        self.components = saved_components
-                        self.explained_variance_ratio = saved_variance_ratio
-                
-                except Exception as e:
-                    logger.debug(f"First pass correction failed for spectrum {idx}: {e}")
-                    correction_details[idx] = {'n_components_used': 0, 'skipped': True}
-            
+
+                    except Exception as e:
+                        logger.debug(f"First pass correction failed for spectrum {idx}: {e}")
+                        correction_details[idx] = {'n_components_used': 0, 'skipped': True}
+
             # Log coefficient statistics after first pass
             all_coefficients = []
             for idx in indices:
@@ -1279,97 +1464,139 @@ class PCACorrector:
             # Step 3: Final correction with detected lines excluded from fitting
             logger.info("STEP 3: Final correction with detected lines excluded from fitting")
             
-            for spec_idx, idx in enumerate(indices):
-                try:
-                    spectrum = data[spectrum_col][idx]
-                    
-                    # Select correct decomposition for this spectrum if using per-mission decompositions
-                    if mission_decompositions:
-                        spec_mission_id = data['MISSION_ID'][idx].strip()
-                        spec_telescope = data['TELESCOP'][idx].strip()
-                        decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
-                        if decomp is None:
-                            logger.debug(f"Spectrum {idx}: no decomposition for {spec_mission_id}/{spec_telescope}, keeping original (uncorrected)")
-                            corrected_spectra[idx] = spectrum
-                            stats['failed'] += 1
-                            continue
-                        # Temporarily swap components for this spectrum
-                        saved_components = self.components
-                        saved_variance_ratio = self.explained_variance_ratio
-                        self.components = decomp.components
-                        self.explained_variance_ratio = decomp.explained_variance_ratio
-                    
-                    # Check for bad channels
+            if n_workers > 1:
+                # --- Parallel Phase 3 ---
+                if detected_lines_mask is not None and np.any(detected_lines_mask):
+                    stats['lines_detected'] = True
+                phase3_args = []
+                for spec_idx, idx in enumerate(indices):
+                    spectrum = np.array(data[spectrum_col][idx], dtype=float)
+                    mission_id_s = data['MISSION_ID'][idx].strip() if mission_decompositions else None
+                    telescope_s = data['TELESCOP'][idx].strip() if mission_decompositions else None
                     bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
-                    good_channels_for_fitting = ~bad_channels
-                    good_channels_for_subtraction = good_channels_for_fitting.copy()
-                    
-                    n_good = np.sum(good_channels_for_fitting)
-                    n_line = 0
-                    
-                    # Exclude detected lines from FITTING (following original pca_correct.py)
+                    gcf = ~bad_channels
+                    gcs = gcf.copy()
                     if detected_lines_mask is not None and np.any(detected_lines_mask):
                         line_regions = detected_lines_mask[spec_idx]
-                        good_channels_for_fitting = good_channels_for_fitting & ~line_regions
-                        good_channels_for_subtraction = good_channels_for_subtraction & ~line_regions
-                        n_line = np.sum(line_regions)
-                        stats['lines_detected'] = True
-                    
-                    # Exclude telluric lines from fitting only (not subtraction), matching legacy behaviour
+                        gcf = gcf & ~line_regions
+                        gcs = gcs & ~line_regions
                     if telluric_line_mask is not None:
-                        telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask)-1)]
-                        good_channels_for_fitting = good_channels_for_fitting & ~telluric_regions
+                        telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
+                        gcf = gcf & ~telluric_regions
+                        # gcs NOT modified (legacy: telluric excluded from fitting only)
+                    phase3_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s))
+                from multiprocessing import Pool
+                chunk = max(1, len(phase3_args) // (n_workers * 4))
+                with Pool(processes=n_workers, initializer=_init_pca_worker,
+                          initargs=(mission_decompositions, self.components,
+                                    self.explained_variance_ratio,
+                                    cutoff_variance, cutoff_noise_ratio,
+                                    self.smoothing_kernel_size)) as pool:
+                    for idx_r, corrected_r, details_r in pool.imap_unordered(
+                            _pca_spectrum_worker, phase3_args, chunksize=chunk):
+                        status = None if details_r is None else details_r.get('status', 'ok')
+                        if status is None:  # no decomposition
+                            corrected_spectra[idx_r] = data[spectrum_col][idx_r]
+                            correction_details[idx_r] = {'n_components_used': 0, 'skipped': True}
+                            stats['failed'] += 1
+                        elif status in ('skip_bad_channels', 'error'):
+                            corrected_spectra[idx_r] = corrected_r
+                            correction_details[idx_r] = {'n_components_used': 0, 'skipped': True}
+                            stats['failed'] += 1
+                        else:
+                            corrected_spectra[idx_r] = corrected_r
+                            correction_details[idx_r] = details_r
+                            stats['corrected'] += 1
+                            if details_r.get('n_components_used', 0) > 0:
+                                stats['components_used'].append(details_r['n_components_used'])
+            else:
+                # --- Sequential Phase 3 ---
+                for spec_idx, idx in enumerate(indices):
+                    try:
+                        spectrum = data[spectrum_col][idx]
 
-                    
-                    if not np.any(good_channels_for_fitting):
-                        logger.warning(f"Spectrum {idx}: no good channels for fitting (had {n_good} good, {n_line if detected_lines_mask is not None else 0} lines), skipping")
-                        corrected_spectra[idx] = spectrum
-                        # Record as skipped but still track it
-                        correction_details[idx] = {'n_components_used': 0, 'skipped': True}
-                        stats['failed'] += 1
-                        # Restore original decomposition if using per-mission
+                        # Select correct decomposition for this spectrum if using per-mission decompositions
+                        if mission_decompositions:
+                            spec_mission_id = data['MISSION_ID'][idx].strip()
+                            spec_telescope = data['TELESCOP'][idx].strip()
+                            decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
+                            if decomp is None:
+                                logger.debug(f"Spectrum {idx}: no decomposition for {spec_mission_id}/{spec_telescope}, keeping original (uncorrected)")
+                                corrected_spectra[idx] = spectrum
+                                stats['failed'] += 1
+                                continue
+                            # Temporarily swap components for this spectrum
+                            saved_components = self.components
+                            saved_variance_ratio = self.explained_variance_ratio
+                            self.components = decomp.components
+                            self.explained_variance_ratio = decomp.explained_variance_ratio
+
+                        # Check for bad channels
+                        bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
+                        good_channels_for_fitting = ~bad_channels
+                        good_channels_for_subtraction = good_channels_for_fitting.copy()
+
+                        n_good = np.sum(good_channels_for_fitting)
+                        n_line = 0
+
+                        # Exclude detected lines from FITTING (following original pca_correct.py)
+                        if detected_lines_mask is not None and np.any(detected_lines_mask):
+                            line_regions = detected_lines_mask[spec_idx]
+                            good_channels_for_fitting = good_channels_for_fitting & ~line_regions
+                            good_channels_for_subtraction = good_channels_for_subtraction & ~line_regions
+                            n_line = np.sum(line_regions)
+                            stats['lines_detected'] = True
+
+                        # Exclude telluric lines from fitting only (not subtraction), matching legacy behaviour
+                        if telluric_line_mask is not None:
+                            telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask)-1)]
+                            good_channels_for_fitting = good_channels_for_fitting & ~telluric_regions
+
+                        if not np.any(good_channels_for_fitting):
+                            logger.warning(f"Spectrum {idx}: no good channels for fitting (had {n_good} good, {n_line if detected_lines_mask is not None else 0} lines), skipping")
+                            corrected_spectra[idx] = spectrum
+                            correction_details[idx] = {'n_components_used': 0, 'skipped': True}
+                            stats['failed'] += 1
+                            if mission_decompositions:
+                                self.components = saved_components
+                                self.explained_variance_ratio = saved_variance_ratio
+                            continue
+
+                        # Final correction with detected lines excluded from fitting
+                        corrected, details = self.apply_correction(
+                            spectrum,
+                            good_channels=good_channels_for_fitting,
+                            good_channels_for_subtraction=good_channels_for_subtraction,
+                            cutoff_variance=cutoff_variance,
+                            cutoff_noise_ratio=cutoff_noise_ratio,
+                            verbose=(spec_idx < 3),  # Log first 3 spectra
+                            smoothing_kernel_size=self.smoothing_kernel_size
+                        )
+
+                        corrected_spectra[idx] = corrected
+                        correction_details[idx] = details
+
+                        stats['corrected'] += 1
+                        if details['n_components_used'] > 0:
+                            stats['components_used'].append(details['n_components_used'])
+
+                        # Log first few spectra to track what's happening
+                        if spec_idx < 3:
+                            logger.info(f"Spectrum {idx}: {details['n_components_used']} components used, "
+                                      f"correction_avg={np.mean(np.abs(corrected - spectrum)):.4e}")
+
                         if mission_decompositions:
                             self.components = saved_components
                             self.explained_variance_ratio = saved_variance_ratio
-                        continue
-                    
-                    # Final correction with detected lines excluded from fitting
-                    corrected, details = self.apply_correction(
-                        spectrum, 
-                        good_channels=good_channels_for_fitting,
-                        good_channels_for_subtraction=good_channels_for_subtraction,
-                        cutoff_variance=cutoff_variance,
-                        cutoff_noise_ratio=cutoff_noise_ratio,
-                        verbose=(spec_idx < 3),  # Log first 3 spectra
-                        smoothing_kernel_size=self.smoothing_kernel_size
-                    )
-                    
-                    corrected_spectra[idx] = corrected
-                    correction_details[idx] = details
-                    
-                    stats['corrected'] += 1
-                    if details['n_components_used'] > 0:
-                        stats['components_used'].append(details['n_components_used'])
-                    
-                    # Log first few spectra to track what's happening
-                    if spec_idx < 3:
-                        logger.info(f"Spectrum {idx}: {details['n_components_used']} components used, "
-                                  f"correction_avg={np.mean(np.abs(corrected - spectrum)):.4e}")
-                    
-                    # Restore original decomposition if using per-mission
-                    if mission_decompositions:
-                        self.components = saved_components
-                        self.explained_variance_ratio = saved_variance_ratio
-                
-                except Exception as e:
-                    logger.error(f"Spectrum {idx}: ERROR: {str(e)}", exc_info=True)
-                    corrected_spectra[idx] = data[spectrum_col][idx]
-                    stats['failed'] += 1
-                    # Restore original decomposition if using per-mission
-                    if mission_decompositions:
-                        self.components = saved_components
-                        self.explained_variance_ratio = saved_variance_ratio
-            
+
+                    except Exception as e:
+                        logger.error(f"Spectrum {idx}: ERROR: {str(e)}", exc_info=True)
+                        corrected_spectra[idx] = data[spectrum_col][idx]
+                        stats['failed'] += 1
+                        if mission_decompositions:
+                            self.components = saved_components
+                            self.explained_variance_ratio = saved_variance_ratio
+
             # Update data with corrected spectra
             data[spectrum_col] = corrected_spectra
             
@@ -2421,6 +2648,12 @@ Examples:
     
     # Logging
     parser.add_argument(
+        '--n-jobs',
+        type=int,
+        default=1,
+        help='Number of parallel worker processes (default: 1). Use -1 for all CPU cores.'
+    )
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Verbose output'
@@ -2430,7 +2663,7 @@ Examples:
         action='store_true',
         help='Debug output'
     )
-    
+
     args = parser.parse_args()
     
     # Load config to get defaults
@@ -2730,7 +2963,8 @@ Examples:
             subscan_filter=args.subscan,
             telescope_filter=args.telescope,
             mission_id_filter=args.mission_id,
-            mission_decompositions=mission_decompositions_to_use
+            mission_decompositions=mission_decompositions_to_use,
+            n_jobs=args.n_jobs
         )
         # Print summary
         logger.info("\n=== Correction Summary ===")

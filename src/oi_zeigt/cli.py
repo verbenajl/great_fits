@@ -17,7 +17,6 @@ from .reduction.core import (analyze_spectrum_values, detect_blank_channels,
                             apply_baseline_from_config, reduce_spectra_from_config,
                             average_spectra_from_config)
 from .statistics.quality import get_spechistogram, get_rmsratio_histogram, rmsratio_statistics
-from .mapping.gridding import create_map_from_column, create_integrated_map
 
 
 def _print_fits_details(hdul):
@@ -1615,10 +1614,12 @@ def apply_baseline(config, fits, order, window, output):
               help='Apply smoothing.')
 @click.option('--smooth-window', type=int, default=5,
               help='Smoothing window size (default: 5).')
+@click.option('--decimate', type=int, default=None,
+              help='Decimate spectra by taking every Nth channel after smoothing (e.g. --decimate 5). VELOCITY_AXIS is updated accordingly.')
 @click.option('--output', type=click.Path(), default=None,
               help='Output FITS file path.')
-def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, baseline_window, 
-                       smooth, smooth_window, output):
+def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, baseline_window,
+                       smooth, smooth_window, decimate, output):
     """
     Perform spectral reduction with selected methods.
     
@@ -1626,7 +1627,9 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
     1. Unblank (--unblank): Fill NaN values using interpolation
     2. Baseline subtraction (--baseline): Remove polynomial baseline
     3. Smoothing (--smooth): Apply boxcar smoothing
-    
+    4. Decimation (--decimate N): Keep every Nth channel; VELOCITY_AXIS is updated accordingly.
+       Typically used together with --smooth --smooth-window N for proper Nyquist sampling.
+
     More methods can be added in the future.
     
     Input file:
@@ -1727,7 +1730,10 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
             methods['smooth'] = {
                 'window_size': smooth_window
             }
-        
+
+        if decimate is not None and decimate > 1:
+            methods['decimate'] = {'factor': decimate}
+
         if not methods:
             click.echo(click.style("No reduction methods selected. Use --unblank, --baseline, and/or --smooth.", 
                                   fg="yellow"), err=True)
@@ -1766,7 +1772,11 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
         if smooth:
             click.echo(f"    - Smoothing (window={smooth_window})")
             methods_applied = True
-        
+
+        if decimate is not None and decimate > 1:
+            click.echo(f"    - Decimation (factor={decimate})")
+            methods_applied = True
+
         if not methods_applied:
             click.echo(f"    (Extraction only, if configured; no other processing applied)")
         
@@ -2425,6 +2435,8 @@ def map_column_cmd(config, reduced, clean, object, column, beamsize, pixsize, sc
             click.echo(click.style("Error: --column is required", fg="red"), err=True)
             sys.exit(1)
 
+        from .mapping.gridding import create_map_from_column
+
         # Load config
         config_path = config if config else None
         cfg = get_config(config_path) if config_path else {}
@@ -2583,8 +2595,8 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
         map_integrated --config config.toml --pcad --object M51 --weight-column RMSRATIO --plot weighted_map.png
     """
     try:
-        from oi_zeigt.mapping.gridding import get_gridding_params_from_config
-        
+        from oi_zeigt.mapping.gridding import get_gridding_params_from_config, create_integrated_map
+
         # Load config
         config_path = config if config else None
         cfg = get_config(config_path) if config_path else {}
@@ -2725,7 +2737,174 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
 
 
 @click.command()
-@click.option('--config', type=click.Path(exists=True), 
+@click.option('--config', type=click.Path(exists=True),
+              help='Path to config.toml file.')
+@click.option('--object', type=str, default=None,
+              help='Filter by object name (partial match). If not specified, uses "object" from config.toml if available.')
+@click.option('--beamsize', type=float, default=None,
+              help='Beam size in degrees for gridding kernel. If not specified, reads from config [gridding].beamsize_arcsec.')
+@click.option('--pixsize', type=float, default=None,
+              help='Map pixel size in degrees. If not specified, uses beamsize/3 or config [gridding].pixel_size_arcsec.')
+@click.option('--velocity-range', type=(float, float), default=None, nargs=2,
+              help='Velocity range in km/s (e.g., --velocity-range 450 500). If not specified, integrates entire spectrum.')
+@click.option('--weight-column', type=str, default=None,
+              help='Column name for per-spectrum weighting (e.g., RMSRATIO).')
+@click.option('--scatter', is_flag=True, default=False,
+              help='Show observation points as scatter plot on map.')
+@click.option('--plot', type=click.Path(), default=None,
+              help='Output path for plot (e.g., compare_map.png). If not specified, plot is shown but not saved.')
+def compare_map_integrated_cmd(config, object, beamsize, pixsize, velocity_range, weight_column, scatter, plot):
+    """
+    Compare integrated intensity maps from reduced, prepared, and PCA-corrected datasets.
+
+    Creates a three-panel figure showing the integrated map from:
+      - Panel 1: reduced data   (output.reduced_fits from config)
+      - Panel 2: prepared data  (output.prepared_for_pca from config)
+      - Panel 3: PCA-corrected  (output.pcad_fits from config)
+
+    Examples:
+        compare_map_integrated --config config.toml
+        compare_map_integrated --config config.toml --object M51 --velocity-range 450 500
+        compare_map_integrated --config config.toml --weight-column RMSRATIO --plot compare.png
+    """
+    try:
+        from oi_zeigt.mapping.gridding import (
+            get_gridding_params_from_config, format_ra_hms, format_dec_dms, HAS_CYGRID
+        )
+        from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+        config_path = config if config else None
+        cfg = get_config(config_path) if config_path else {}
+
+        beamsize_deg, pixsize_deg = get_gridding_params_from_config(
+            config_path=config_path,
+            beamsize_deg=beamsize,
+            pixsize_deg=pixsize
+        )
+
+        output_cfg = cfg.get('output', {})
+        reduced_path = output_cfg.get('reduced_fits')
+        prepared_path = output_cfg.get('prepared_for_pca')
+        pcad_path = output_cfg.get('pcad_fits')
+
+        missing = []
+        if not reduced_path:
+            missing.append('output.reduced_fits')
+        if not prepared_path:
+            missing.append('output.prepared_for_pca')
+        if not pcad_path:
+            missing.append('output.pcad_fits')
+        if missing:
+            click.echo(click.style(f"Error: missing config keys: {', '.join(missing)}", fg='red'), err=True)
+            sys.exit(1)
+
+        if object is None:
+            object_filter = cfg.get('parameters', {}).get('object', None)
+        else:
+            object_filter = object
+
+        datasets = [
+            ('Reduced', reduced_path),
+            ('Prepared', prepared_path),
+            ('PCA corrected', pcad_path),
+        ]
+
+        maps = []
+        for label, path in datasets:
+            click.echo(f"Reading {label}: {path}")
+            hdul = read_fits(path)
+            grid_map, wcs_header, _fig = create_integrated_map(
+                hdul,
+                object_filter=object_filter,
+                beamsize_deg=beamsize_deg,
+                pixsize=pixsize_deg,
+                show_scatter=False,
+                velocity_range=velocity_range,
+                weight_column=weight_column,
+            )
+            plt.close(_fig)
+            hdul.close()
+            maps.append((label, grid_map, wcs_header))
+
+        # Build 3-panel comparison figure
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        for ax, (label, grid_map, wcs_header) in zip(axes, maps):
+            crval1 = wcs_header['CRVAL1']
+            crval2 = wcs_header['CRVAL2']
+            cdelt1 = wcs_header['CDELT1']
+            cdelt2 = wcs_header['CDELT2']
+            crpix1 = wcs_header['CRPIX1']
+            crpix2 = wcs_header['CRPIX2']
+            naxis1 = wcs_header['NAXIS1']
+            naxis2 = wcs_header['NAXIS2']
+
+            ra_max = crval1 + (1 - crpix1) * cdelt1
+            ra_min = crval1 + (naxis1 - crpix1) * cdelt1
+            dec_min = crval2 + (1 - crpix2) * cdelt2
+            dec_max = crval2 + (naxis2 - crpix2) * cdelt2
+
+            grid_map_display = np.fliplr(grid_map)
+            im = ax.imshow(grid_map_display, origin='lower',
+                           extent=[ra_min, ra_max, dec_min, dec_max],
+                           cmap='viridis', aspect='auto')
+
+            ra_formatter = FuncFormatter(lambda x, p: format_ra_hms(x))
+            dec_formatter = FuncFormatter(lambda x, p: format_dec_dms(x))
+            ax.xaxis.set_major_formatter(ra_formatter)
+            ax.yaxis.set_major_formatter(dec_formatter)
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=4, integer=False))
+            ax.invert_xaxis()
+
+            ax.set_xlabel('RA (h:m:s)', fontsize=10)
+            ax.set_ylabel('Dec (°:′:″)', fontsize=10)
+            ax.set_title(label, fontsize=12, fontweight='bold')
+
+            cbar = plt.colorbar(im, ax=ax)
+            cbar.set_label('Int. Intensity (K·m/s)', fontsize=9)
+
+        gridding_method = 'cygrid' if HAS_CYGRID else 'scipy'
+        weight_info = f', weighted by {weight_column}' if weight_column else ''
+        suptitle = f'Integrated Intensity Comparison ({gridding_method}, beam={beamsize_deg*3600:.1f}″{weight_info})'
+        if object_filter:
+            suptitle += f' — {object_filter}'
+        if velocity_range:
+            suptitle += f' [{velocity_range[0]:.0f}–{velocity_range[1]:.0f} km/s]'
+        fig.suptitle(suptitle, fontsize=13, fontweight='bold')
+        fig.tight_layout()
+
+        click.echo(f"\n✓ Comparison maps created")
+        click.echo(f"  Beam size: {beamsize_deg*3600:.2f}\"")
+        if object_filter:
+            click.echo(f"  Object filter: {object_filter}")
+        if weight_column:
+            click.echo(f"  Per-spectrum weighting: {weight_column}")
+        if velocity_range:
+            click.echo(f"  Velocity range: {velocity_range[0]:.1f} - {velocity_range[1]:.1f} km/s")
+
+        if plot:
+            plt.savefig(plot, dpi=150)
+            click.echo(f"  Plot saved: {plot}")
+
+        click.echo()
+        plt.show()
+        plt.close()
+
+    except FileNotFoundError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.option('--config', type=click.Path(exists=True),
               help='Path to config.toml file.')
 @click.option('--reduced', is_flag=True, default=False,
               help='Use reduced_data.fits (output.reduced_fits from config).')
