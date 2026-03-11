@@ -1412,54 +1412,73 @@ class PCACorrector:
                 # If last iteration, skip re-correction
                 if iteration < 2:
                     # Re-correct with the current detected lines mask
-                    for spec_idx, idx in enumerate(indices):
-                        try:
-                            spectrum = data[spectrum_col][idx]
-                            
-                            if mission_decompositions:
-                                spec_mission_id = data['MISSION_ID'][idx].strip()
-                                spec_telescope = data['TELESCOP'][idx].strip()
-                                decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
-                                if decomp is None:
-                                    continue
-                                saved_components = self.components
-                                saved_variance_ratio = self.explained_variance_ratio
-                                self.components = decomp.components
-                                self.explained_variance_ratio = decomp.explained_variance_ratio
-                            
+                    if n_workers > 1:
+                        # --- Parallel re-correction (same pattern as Steps 1 & 3) ---
+                        recorr_args = []
+                        for spec_idx, idx in enumerate(indices):
+                            spectrum = np.array(data[spectrum_col][idx], dtype=float)
+                            mission_id_s = data['MISSION_ID'][idx].strip() if mission_decompositions else None
+                            telescope_s  = data['TELESCOP'][idx].strip()   if mission_decompositions else None
                             bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
-                            good_channels_for_fitting = ~bad_channels
-                            good_channels_for_subtraction = good_channels_for_fitting.copy()
-                            
-                            # Exclude detected lines from subtraction (but use for fitting - like original)
-                            line_regions = detected_lines_mask[spec_idx]
-                            good_channels_for_subtraction = good_channels_for_subtraction & ~line_regions
-                            
-                            if not np.any(good_channels_for_fitting):
+                            gcf = ~bad_channels
+                            gcs = gcf & ~detected_lines_mask[spec_idx]
+                            recorr_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s))
+                        chunk = max(1, len(recorr_args) // (n_workers * 4))
+                        with Pool(processes=n_workers, initializer=_init_pca_worker,
+                                  initargs=(mission_decompositions, self.components,
+                                            self.explained_variance_ratio,
+                                            cutoff_variance, cutoff_noise_ratio,
+                                            self.smoothing_kernel_size)) as pool:
+                            for idx_r, corrected_r, details_r in pool.imap_unordered(
+                                    _pca_spectrum_worker, recorr_args, chunksize=chunk):
+                                if corrected_r is not None and details_r is not None \
+                                        and details_r.get('status') == 'ok':
+                                    prelim_corrected_spectra[idx_r] = corrected_r
+                    else:
+                        # --- Serial re-correction ---
+                        for spec_idx, idx in enumerate(indices):
+                            try:
+                                spectrum = data[spectrum_col][idx]
+
+                                if mission_decompositions:
+                                    spec_mission_id = data['MISSION_ID'][idx].strip()
+                                    spec_telescope = data['TELESCOP'][idx].strip()
+                                    decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
+                                    if decomp is None:
+                                        continue
+                                    saved_components = self.components
+                                    saved_variance_ratio = self.explained_variance_ratio
+                                    self.components = decomp.components
+                                    self.explained_variance_ratio = decomp.explained_variance_ratio
+
+                                bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
+                                good_channels_for_fitting = ~bad_channels
+                                gcs = good_channels_for_fitting & ~detected_lines_mask[spec_idx]
+
+                                if not np.any(good_channels_for_fitting):
+                                    if mission_decompositions:
+                                        self.components = saved_components
+                                        self.explained_variance_ratio = saved_variance_ratio
+                                    continue
+
+                                corrected, details = self.apply_correction(
+                                    spectrum,
+                                    good_channels=good_channels_for_fitting,
+                                    good_channels_for_subtraction=gcs,
+                                    cutoff_variance=cutoff_variance,
+                                    cutoff_noise_ratio=cutoff_noise_ratio,
+                                    verbose=False,
+                                    smoothing_kernel_size=self.smoothing_kernel_size
+                                )
+
+                                prelim_corrected_spectra[idx] = corrected
+
                                 if mission_decompositions:
                                     self.components = saved_components
                                     self.explained_variance_ratio = saved_variance_ratio
-                                continue
-                            
-                            # Re-correct with detected lines excluded from subtraction
-                            corrected, details = self.apply_correction(
-                                spectrum,
-                                good_channels=good_channels_for_fitting,
-                                good_channels_for_subtraction=good_channels_for_subtraction,
-                                cutoff_variance=cutoff_variance,
-                                cutoff_noise_ratio=cutoff_noise_ratio,
-                                verbose=False,
-                                smoothing_kernel_size=self.smoothing_kernel_size
-                            )
-                            
-                            prelim_corrected_spectra[idx] = corrected
-                            
-                            if mission_decompositions:
-                                self.components = saved_components
-                                self.explained_variance_ratio = saved_variance_ratio
-                        
-                        except Exception as e:
-                            logger.debug(f"Re-correction iteration {iteration + 1} failed for spectrum {idx}: {e}")
+
+                            except Exception as e:
+                                logger.debug(f"Re-correction iteration {iteration + 1} failed for spectrum {idx}: {e}")
             
             # Step 3: Final correction with detected lines excluded from fitting
             logger.info("STEP 3: Final correction with detected lines excluded from fitting")
@@ -2373,7 +2392,7 @@ class PCACorrector:
                 
                 # Plot original, corrected, and component contribution
                 ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=1.5, alpha=0.8, label='Orig', zorder=1)
-                ax_ex_comp.plot(x_axis, corrected_ex, color='gray', lw=0.5, alpha=0.5, label='Corr', zorder=2)
+                ax_ex_comp.plot(x_axis, corrected_ex, color='green', lw=1.5, alpha=0.8, label='Corr', zorder=2)
                 
                 scaled_comp = coeffs[comp_idx] * self.components[comp_idx]
                 ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')

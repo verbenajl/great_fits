@@ -466,6 +466,18 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
     help="Plot from output.prepared_for_pca in config.toml"
 )
 @click.option(
+    "--pcad",
+    is_flag=True,
+    default=False,
+    help="Plot from output.pcad_fits in config.toml"
+)
+@click.option(
+    "--post",
+    is_flag=True,
+    default=False,
+    help="Plot from output.post_filtered_fits in config.toml"
+)
+@click.option(
     "--object",
     default=None,
     help="Object name to filter (substring match)"
@@ -485,7 +497,7 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
 
 
 def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
-                       object: Optional[str], num_spectra: int, output: Optional[str]):
+                       pcad: bool, post: bool, object: Optional[str], num_spectra: int, output: Optional[str]):
     """
     Plot a sample of spectra from a FITS file.
     
@@ -508,7 +520,7 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
         # Load config to get object filter and handle output file flags
         config_data = {}
         try:
-            if config or (reduced or clean or prepared):
+            if config or (reduced or clean or prepared or pcad or post):
                 try:
                     import tomllib
                 except ModuleNotFoundError:
@@ -520,7 +532,7 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
                     config_data = cfg
                     
                     # Handle output file flags
-                    if reduced or clean or prepared:
+                    if reduced or clean or prepared or pcad or post:
                         output_cfg = cfg.get('output', {})
                         if reduced and 'reduced_fits' in output_cfg:
                             fits = output_cfg['reduced_fits']
@@ -531,7 +543,13 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
                         elif prepared and 'prepared_for_pca' in output_cfg:
                             fits = output_cfg['prepared_for_pca']
                             click.echo(f"Reading from output.prepared_for_pca: {fits}")
-                        elif reduced or clean or prepared:
+                        elif pcad and 'pcad_fits' in output_cfg:
+                            fits = output_cfg['pcad_fits']
+                            click.echo(f"Reading from output.pcad_fits: {fits}")
+                        elif post and 'post_filtered_fits' in output_cfg:
+                            fits = output_cfg['post_filtered_fits']
+                            click.echo(f"Reading from output.post_filtered_fits: {fits}")
+                        elif reduced or clean or prepared or pcad or post:
                             click.echo(click.style(
                                 f"Error: Requested output file not found in config.toml",
                                 fg="red"
@@ -2249,8 +2267,10 @@ def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, po
 
 
 @click.command()
-@click.option('--config', type=click.Path(exists=True), 
+@click.option('--config', type=click.Path(exists=True),
               help='Path to config.toml file.')
+@click.option('--fits', 'fits_file', type=click.Path(exists=True), default=None,
+              help='Path to FITS file to analyse directly. Overrides all dataset flags.')
 @click.option('--reduced', is_flag=True, default=False,
               help='Use reduced_data.fits instead of the input data.')
 @click.option('--clean', is_flag=True, default=False,
@@ -2267,16 +2287,18 @@ def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, po
               help='Number of histogram bins (default: 30).')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for plot (e.g., rmsratio_hist.png). If not specified, plot is shown but not saved.')
-def rmsratio_cmd(config, reduced, clean, rejected, prepared, pcad, object, bins, plot):
+def rmsratio_cmd(config, fits_file, reduced, clean, rejected, prepared, pcad, object, bins, plot):
     """
     Analyze RMSRATIO quality metric and generate histogram.
     
-    Reads input file from config.toml [input].fits_file by default, or uses one of:
-    - [output].reduced_fits if --reduced flag is specified
-    - [output].clean_fits if --clean flag is specified
-    - [output].rejected_fits if --rejected flag is specified
-    - [output].prepared_for_pca if --prepared flag is specified
-    - [output].pcad_fits if --pcad flag is specified
+    Reads input file from (in order of priority):
+    1. --fits if specified
+    2. [output].reduced_fits if --reduced flag is specified
+    3. [output].clean_fits if --clean flag is specified
+    4. [output].rejected_fits if --rejected flag is specified
+    5. [output].prepared_for_pca if --prepared flag is specified
+    6. [output].pcad_fits if --pcad flag is specified
+    7. [input].fits_file from config.toml otherwise
     
     Computes statistics and creates a histogram of RMSRATIO values
     for all spectra or a specific object.
@@ -2306,7 +2328,9 @@ def rmsratio_cmd(config, reduced, clean, rejected, prepared, pcad, object, bins,
         
         # Determine FITS file to process
         fits_path = None
-        if reduced or clean or rejected or prepared or pcad:
+        if fits_file:
+            hdul = read_fits(fits_file)
+        elif reduced or clean or rejected or prepared or pcad:
             output_cfg = cfg.get('output', {})
             if reduced:
                 fits_path = output_cfg.get('reduced_fits', None)
@@ -2557,14 +2581,20 @@ def map_column_cmd(config, reduced, clean, object, column, beamsize, pixsize, sc
 @click.option('--velocity-range', type=(float, float), default=None, nargs=2,
               help='Velocity range in km/s (e.g., --velocity-range 450 500). If not specified, integrates entire spectrum.')
 @click.option('--weight-column', type=str, default=None,
-              help='Column name for per-spectrum weighting (e.g., RMSRATIO). If specified, each integrated spectrum is weighted by 1/weight_value (lower values get higher weight).')
+              help='Column name for per-spectrum weighting (e.g., RMSRATIO). Overrides --weight-spectra.')
+@click.option('--weight-spectra', is_flag=True, default=False,
+              help='Weight each spectrum by its RMSRATIOB value (falls back to RMSRATIO if absent). '
+                   'Shorthand for --weight-column RMSRATIOB.')
+@click.option('--weight-channels', is_flag=True, default=False,
+              help='Weight each channel by exp(-tau)/T_sys using the TSYS_INDEX/TAU_SIG_INDEX columns '
+                   '(added by prepare_for_pca). Falls back to uniform if columns are absent.')
 @click.option('--scatter', is_flag=True, default=False,
               help='Show observation points as scatter plot on map.')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for plot (e.g., integrated_map.png). If not specified, plot is shown but not saved.')
 @click.option('--fits-output', type=click.Path(), default=None,
               help='Output path for FITS file (e.g., integrated_map.fits). If not specified, FITS is not saved.')
-def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltered, prepared, object, beamsize, pixsize, velocity_range, weight_column, scatter, plot, fits_output):
+def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltered, prepared, object, beamsize, pixsize, velocity_range, weight_column, weight_spectra, weight_channels, scatter, plot, fits_output):
     """
     Create a spatial map of integrated spectral intensity with optional per-spectrum weighting.
     
@@ -2680,6 +2710,11 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
         else:
             object_filter = object
 
+        # Resolve per-spectrum weight column
+        eff_weight_column = weight_column
+        if eff_weight_column is None and weight_spectra:
+            eff_weight_column = 'RMSRATIOB'  # fallback to RMSRATIO handled inside create_integrated_map
+
         # Create integrated map
         grid_map, wcs_header, fig = create_integrated_map(
             hdul,
@@ -2688,7 +2723,8 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
             pixsize=pixsize_deg,
             show_scatter=scatter,
             velocity_range=velocity_range,
-            weight_column=weight_column
+            weight_column=eff_weight_column,
+            channel_weights=weight_channels,
         )
 
         click.echo(f"\n✓ Integrated intensity map created")
@@ -2697,8 +2733,10 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
             click.echo(f"  Pixel size: {pixsize_deg*3600:.3f}\"")
         if object_filter:
             click.echo(f"  Object filter: {object_filter}")
-        if weight_column:
-            click.echo(f"  Per-spectrum weighting: {weight_column} (using 1/value)")
+        if eff_weight_column:
+            click.echo(f"  Per-spectrum weighting: {eff_weight_column}")
+        if weight_channels:
+            click.echo(f"  Per-channel weighting: exp(-tau)/T_sys from TSYS/TAU_SIG calibration spectra")
         if velocity_range:
             click.echo(f"  Velocity range: {velocity_range[0]:.1f} - {velocity_range[1]:.1f} km/s")
         click.echo(f"  Map dimensions: {grid_map.shape[1]} × {grid_map.shape[0]}")
@@ -2739,39 +2777,53 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
 @click.command()
 @click.option('--config', type=click.Path(exists=True),
               help='Path to config.toml file.')
+@click.option('--fits', 'fits_files', type=click.Path(exists=True), multiple=True,
+              help='Explicit FITS files to include (repeat for each). Labels taken from basenames.')
+@click.option('--clean',    is_flag=True, default=False, help='Include clean dataset from config (output.clean_fits).')
+@click.option('--reduced',  is_flag=True, default=False, help='Include reduced dataset from config (output.reduced_fits).')
+@click.option('--prepared', is_flag=True, default=False, help='Include prepared-for-PCA dataset from config (output.prepared_for_pca).')
+@click.option('--pcad',     is_flag=True, default=False, help='Include PCA-corrected dataset from config (output.pcad_fits).')
 @click.option('--object', type=str, default=None,
-              help='Filter by object name (partial match). If not specified, uses "object" from config.toml if available.')
+              help='Filter by object name. If not specified, uses "object" from config or auto-excludes calibration rows (TSYS, TAU_SIG, etc.).')
 @click.option('--beamsize', type=float, default=None,
-              help='Beam size in degrees for gridding kernel. If not specified, reads from config [gridding].beamsize_arcsec.')
+              help='Beam size in degrees for gridding kernel. If not specified, reads from config [gridding].beamsize_arcsec (default 14.1″).')
 @click.option('--pixsize', type=float, default=None,
               help='Map pixel size in degrees. If not specified, uses beamsize/3 or config [gridding].pixel_size_arcsec.')
 @click.option('--velocity-range', type=(float, float), default=None, nargs=2,
               help='Velocity range in km/s (e.g., --velocity-range 450 500). If not specified, integrates entire spectrum.')
 @click.option('--weight-column', type=str, default=None,
-              help='Column name for per-spectrum weighting (e.g., RMSRATIO).')
+              help='Column name for per-spectrum weighting (e.g., RMSRATIO). Overrides --weight-spectra.')
+@click.option('--weight-spectra', is_flag=True, default=False,
+              help='Weight each spectrum by its RMSRATIOB value (falls back to RMSRATIO if absent).')
+@click.option('--weight-channels', is_flag=True, default=False,
+              help='Weight each channel by exp(-tau)/T_sys using TSYS_INDEX/TAU_SIG_INDEX columns. '
+                   'Falls back to uniform if columns are absent.')
 @click.option('--scatter', is_flag=True, default=False,
               help='Show observation points as scatter plot on map.')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for plot (e.g., compare_map.png). If not specified, plot is shown but not saved.')
-def compare_map_integrated_cmd(config, object, beamsize, pixsize, velocity_range, weight_column, scatter, plot):
+def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pcad, object, beamsize, pixsize, velocity_range, weight_column, weight_spectra, weight_channels, scatter, plot):
     """
-    Compare integrated intensity maps from reduced, prepared, and PCA-corrected datasets.
+    Compare integrated intensity maps side by side (max 3 per row).
 
-    Creates a three-panel figure showing the integrated map from:
-      - Panel 1: reduced data   (output.reduced_fits from config)
-      - Panel 2: prepared data  (output.prepared_for_pca from config)
-      - Panel 3: PCA-corrected  (output.pcad_fits from config)
+    Datasets can come from explicit --fits files and/or config-defined datasets
+    selected with --clean / --reduced / --prepared / --pcad flags. Both can be
+    combined freely. When no flags and no --fits are given, defaults to showing
+    reduced + prepared + PCA-corrected from config.
 
     Examples:
         compare_map_integrated --config config.toml
-        compare_map_integrated --config config.toml --object M51 --velocity-range 450 500
-        compare_map_integrated --config config.toml --weight-column RMSRATIO --plot compare.png
+        compare_map_integrated --config config.toml --reduced --pcad
+        compare_map_integrated --config config.toml --fits postpcarmsr_1.3.fits --fits postpcarmsr_1.5.fits --fits postpcarmsr_2.0.fits --object M51CENTER
+        compare_map_integrated --config config.toml --pcad --fits postpcarmsr_1.3.fits
     """
     try:
         from oi_zeigt.mapping.gridding import (
-            get_gridding_params_from_config, format_ra_hms, format_dec_dms, HAS_CYGRID
+            get_gridding_params_from_config, create_integrated_map, format_ra_hms, format_dec_dms, HAS_CYGRID
         )
         from matplotlib.ticker import FuncFormatter, MaxNLocator
+        from pathlib import Path
+        import math
 
         config_path = config if config else None
         cfg = get_config(config_path) if config_path else {}
@@ -2779,36 +2831,54 @@ def compare_map_integrated_cmd(config, object, beamsize, pixsize, velocity_range
         beamsize_deg, pixsize_deg = get_gridding_params_from_config(
             config_path=config_path,
             beamsize_deg=beamsize,
-            pixsize_deg=pixsize
+            pixsize_deg=pixsize,
         )
-
-        output_cfg = cfg.get('output', {})
-        reduced_path = output_cfg.get('reduced_fits')
-        prepared_path = output_cfg.get('prepared_for_pca')
-        pcad_path = output_cfg.get('pcad_fits')
-
-        missing = []
-        if not reduced_path:
-            missing.append('output.reduced_fits')
-        if not prepared_path:
-            missing.append('output.prepared_for_pca')
-        if not pcad_path:
-            missing.append('output.pcad_fits')
-        if missing:
-            click.echo(click.style(f"Error: missing config keys: {', '.join(missing)}", fg='red'), err=True)
-            sys.exit(1)
 
         if object is None:
             object_filter = cfg.get('parameters', {}).get('object', None)
         else:
             object_filter = object
 
-        datasets = [
-            ('Reduced', reduced_path),
-            ('Prepared', prepared_path),
-            ('PCA corrected', pcad_path),
-        ]
+        # --- Build dataset list ---
+        # Start with config-flag datasets (in a logical order), then append explicit --fits
+        datasets = []
+        output_cfg = cfg.get('output', {})
+        # Default (no flags, no --fits): show reduced + prepared + pcad from config
+        use_defaults = not fits_files and not any([clean, reduced, prepared, pcad])
 
+        if clean:
+            p = output_cfg.get('clean_fits')
+            if not p:
+                click.echo(click.style("Error: output.clean_fits not in config", fg='red'), err=True); sys.exit(1)
+            datasets.append(('Clean', p))
+        if reduced or use_defaults:
+            p = output_cfg.get('reduced_fits')
+            if reduced and not p:
+                click.echo(click.style("Error: output.reduced_fits not in config", fg='red'), err=True); sys.exit(1)
+            if p: datasets.append(('Reduced', p))
+        if prepared or use_defaults:
+            p = output_cfg.get('prepared_for_pca')
+            if prepared and not p:
+                click.echo(click.style("Error: output.prepared_for_pca not in config", fg='red'), err=True); sys.exit(1)
+            if p: datasets.append(('Prepared', p))
+        if pcad or use_defaults:
+            p = output_cfg.get('pcad_fits')
+            if pcad and not p:
+                click.echo(click.style("Error: output.pcad_fits not in config", fg='red'), err=True); sys.exit(1)
+            if p: datasets.append(('PCA corrected', p))
+        for fp in fits_files:
+            datasets.append((Path(fp).stem, fp))
+
+        if not datasets:
+            click.echo(click.style("Error: no datasets to compare. Use --fits, --reduced, --prepared, --pcad, or --clean.", fg='red'), err=True)
+            sys.exit(1)
+
+        # Resolve per-spectrum weight column
+        eff_weight_column = weight_column
+        if eff_weight_column is None and weight_spectra:
+            eff_weight_column = 'RMSRATIOB'
+
+        # --- Grid each dataset ---
         maps = []
         for label, path in datasets:
             click.echo(f"Reading {label}: {path}")
@@ -2820,16 +2890,25 @@ def compare_map_integrated_cmd(config, object, beamsize, pixsize, velocity_range
                 pixsize=pixsize_deg,
                 show_scatter=False,
                 velocity_range=velocity_range,
-                weight_column=weight_column,
+                weight_column=eff_weight_column,
+                channel_weights=weight_channels,
             )
             plt.close(_fig)
             hdul.close()
             maps.append((label, grid_map, wcs_header))
 
-        # Build 3-panel comparison figure
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        # --- Build figure: max 3 panels per row ---
+        n = len(maps)
+        ncols = min(n, 3)
+        nrows = math.ceil(n / 3)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows),
+                                 squeeze=False)
+        # Flatten axes and hide any unused panels
+        axes_flat = [axes[r][c] for r in range(nrows) for c in range(ncols)]
+        for ax in axes_flat[n:]:
+            ax.set_visible(False)
 
-        for ax, (label, grid_map, wcs_header) in zip(axes, maps):
+        for ax, (label, grid_map, wcs_header) in zip(axes_flat, maps):
             crval1 = wcs_header['CRVAL1']
             crval2 = wcs_header['CRVAL2']
             cdelt1 = wcs_header['CDELT1']
@@ -2864,7 +2943,9 @@ def compare_map_integrated_cmd(config, object, beamsize, pixsize, velocity_range
             cbar.set_label('Int. Intensity (K·m/s)', fontsize=9)
 
         gridding_method = 'cygrid' if HAS_CYGRID else 'scipy'
-        weight_info = f', weighted by {weight_column}' if weight_column else ''
+        weight_info = f', weighted by {eff_weight_column}' if eff_weight_column else ''
+        if weight_channels:
+            weight_info += ', chan-weighted by exp(-τ)/T_sys'
         suptitle = f'Integrated Intensity Comparison ({gridding_method}, beam={beamsize_deg*3600:.1f}″{weight_info})'
         if object_filter:
             suptitle += f' — {object_filter}'
@@ -2873,12 +2954,14 @@ def compare_map_integrated_cmd(config, object, beamsize, pixsize, velocity_range
         fig.suptitle(suptitle, fontsize=13, fontweight='bold')
         fig.tight_layout()
 
-        click.echo(f"\n✓ Comparison maps created")
+        click.echo(f"\n✓ {n} comparison maps created ({nrows}×{ncols} grid)")
         click.echo(f"  Beam size: {beamsize_deg*3600:.2f}\"")
         if object_filter:
             click.echo(f"  Object filter: {object_filter}")
-        if weight_column:
-            click.echo(f"  Per-spectrum weighting: {weight_column}")
+        if eff_weight_column:
+            click.echo(f"  Per-spectrum weighting: {eff_weight_column}")
+        if weight_channels:
+            click.echo(f"  Per-channel weighting: exp(-tau)/T_sys from TSYS/TAU_SIG calibration spectra")
         if velocity_range:
             click.echo(f"  Velocity range: {velocity_range[0]:.1f} - {velocity_range[1]:.1f} km/s")
 
@@ -3256,6 +3339,236 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
         sys.exit(1)
     except Exception as e:
         click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.option('--config', type=click.Path(exists=True),
+              help='Path to config.toml file.')
+@click.option('--pcad', is_flag=True, default=False,
+              help='Use pca_corrected.fits from config (default if no dataset flag given).')
+@click.option('--clean', is_flag=True, default=False,
+              help='Use clean_fits from config instead of pcad.')
+@click.option('--prepared', is_flag=True, default=False,
+              help='Use prepared_for_pca from config instead of pcad.')
+@click.option('--reduced', is_flag=True, default=False,
+              help='Use reduced_fits from config instead of pcad.')
+@click.option('--output', type=click.Path(), default=None,
+              help='Output FITS file path. Defaults to output.postpcarmsr from config.')
+@click.option('--filter', 'filter_threshold', type=float, default=None,
+              help='Remove spectra with RMSRATIO greater than this value.')
+def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, filter_threshold):
+    """
+    Post-process spectra: compute per-spectrum RMS outside the line window.
+
+    Reads spectra from the PCA-corrected file (default) or an alternative dataset,
+    computes the noise RMS in channels outside [reduction].line_window (km/s) from
+    config.toml, and writes the result as a new RMS column in the output FITS file.
+    The output has the same format as the input with the RMS column added (or replaced).
+
+    Input priority (first matching flag wins):
+      --clean > --prepared > --reduced > --pcad (default)
+
+    Examples:
+        post_process_data --config config.toml
+        post_process_data --config config.toml --reduced
+        post_process_data --config config.toml --output my_post.fits
+    """
+    try:
+        from astropy.table import Table
+        from .reduction.core import _extract_spectral_params, _create_velocity_axis
+
+        config_path = config if config else None
+        cfg = get_config(config_path) if config_path else {}
+        output_cfg = cfg.get('output', {})
+        reduction_cfg = cfg.get('reduction', {})
+        object_filter = cfg.get('parameters', {}).get('object', None)
+
+        # --- Determine input file ---
+        if clean:
+            fits_path = output_cfg.get('clean_fits')
+            if not fits_path:
+                click.echo(click.style("Error: output.clean_fits not in config", fg='red'), err=True)
+                sys.exit(1)
+            label = 'clean'
+        elif prepared:
+            fits_path = output_cfg.get('prepared_for_pca')
+            if not fits_path:
+                click.echo(click.style("Error: output.prepared_for_pca not in config", fg='red'), err=True)
+                sys.exit(1)
+            label = 'prepared'
+        elif reduced:
+            fits_path = output_cfg.get('reduced_fits')
+            if not fits_path:
+                click.echo(click.style("Error: output.reduced_fits not in config", fg='red'), err=True)
+                sys.exit(1)
+            label = 'reduced'
+        else:
+            # Default: pcad
+            fits_path = output_cfg.get('pcad_fits')
+            if not fits_path:
+                click.echo(click.style("Error: output.pcad_fits not in config", fg='red'), err=True)
+                sys.exit(1)
+            label = 'pcad'
+
+        click.echo(f"Reading {label}: {fits_path}")
+        hdul = read_fits(fits_path)
+
+        # --- Determine output file ---
+        if output is None:
+            output = output_cfg.get('postpcarmsr')
+            if not output:
+                click.echo(click.style("Error: no --output given and output.postpcarmsr not in config", fg='red'), err=True)
+                sys.exit(1)
+
+        # --- Get line_window from config (km/s) ---
+        line_window = reduction_cfg.get('line_window', None)
+        if line_window is None or len(line_window) != 2:
+            click.echo(click.style("Error: [reduction].line_window not defined in config (expected [v_min, v_max] in km/s)", fg='red'), err=True)
+            sys.exit(1)
+        v_min_kms, v_max_kms = float(line_window[0]), float(line_window[1])
+        click.echo(f"Line window: [{v_min_kms}, {v_max_kms}] km/s — RMS computed outside this range")
+
+        # --- Build velocity axis ---
+        spectral_params = _extract_spectral_params(hdul)
+
+        # Prefer per-spectrum VELOCITY_AXIS column if present (set by reduce_spectra)
+        matrix_hdu = None
+        for hdu in hdul:
+            if hasattr(hdu, 'data') and hdu.data is not None:
+                if 'SPECTRUM' in hdu.data.dtype.names:
+                    matrix_hdu = hdu
+                    break
+        if matrix_hdu is None:
+            raise ValueError("No SPECTRUM column found in FITS file")
+
+        data = matrix_hdu.data
+        n_spectra = len(data)
+
+        if 'VELOCITY_AXIS' in data.dtype.names:
+            # Use first spectrum's axis (same for all after reduce_spectra)
+            velocity_axis_kms = data['VELOCITY_AXIS'][0] / 1000.0
+        else:
+            velocity_axis_ms = _create_velocity_axis(
+                spectral_params['velo_ref'],
+                spectral_params['deltav'],
+                spectral_params['crpix1_spec'],
+                spectral_params['nchans'],
+            )
+            velocity_axis_kms = velocity_axis_ms / 1000.0
+
+        outside_mask = (velocity_axis_kms < v_min_kms) | (velocity_axis_kms > v_max_kms)
+        n_outside = int(np.sum(outside_mask))
+        click.echo(f"Channels outside window: {n_outside} / {len(velocity_axis_kms)}")
+
+        # --- Compute measured and theoretical RMS per spectrum ---
+        C_MS = 299792458.0  # speed of light in m/s
+
+        spectra       = np.array(data['SPECTRUM'],  dtype=np.float64)
+        tsys_vals     = np.array(data['TSYS'],      dtype=np.float64)   # K
+        deltav_vals   = np.array(data['DELTAV'],    dtype=np.float64)   # m/s
+        restfreq_vals = np.array(data['RESTFREQ'],  dtype=np.float64)   # Hz
+        spectime_vals = np.array(data['SPECTIME'],  dtype=np.float64)   # s, on-source
+        reftime_vals  = np.array(data['REFTIME'],   dtype=np.float64)   # s, off-source
+
+        rms_measured    = np.full(n_spectra, np.nan, dtype=np.float32)
+        rms_theoretical = np.full(n_spectra, np.nan, dtype=np.float32)
+        rms_ratio       = np.full(n_spectra, np.nan, dtype=np.float32)
+
+        for i in range(n_spectra):
+            # Measured RMS outside line window
+            outside_channels = spectra[i][outside_mask]
+            n_valid = int(np.sum(~np.isnan(outside_channels)))
+            if n_valid >= 2:
+                rms_measured[i] = np.nanstd(outside_channels)
+
+            # Theoretical radiometer RMS:
+            #   Δν = |DELTAV| / c * RESTFREQ  (channel bandwidth in Hz)
+            #   σ  = T_sys * sqrt(1/t_sig + 1/t_ref) / sqrt(Δν)
+            # If REFTIME <= 0, reduce to σ = T_sys / sqrt(Δν * t_sig)
+            delta_nu = abs(deltav_vals[i]) / C_MS * restfreq_vals[i]
+            t_sig = spectime_vals[i]
+            t_ref = reftime_vals[i]
+
+            if delta_nu > 0 and t_sig > 0:
+                if t_ref > 0:
+                    rms_theoretical[i] = tsys_vals[i] * np.sqrt(1.0/t_sig + 1.0/t_ref) / np.sqrt(delta_nu)
+                else:
+                    rms_theoretical[i] = tsys_vals[i] / np.sqrt(delta_nu * t_sig)
+
+            if np.isfinite(rms_measured[i]) and np.isfinite(rms_theoretical[i]) and rms_theoretical[i] > 0:
+                rms_ratio[i] = rms_measured[i] / rms_theoretical[i]
+
+        n_valid_rms = int(np.sum(~np.isnan(rms_measured)))
+        click.echo(f"RMS computed for {n_valid_rms} / {n_spectra} spectra")
+        click.echo(f"  Measured    — median: {np.nanmedian(rms_measured):.4f}  mean: {np.nanmean(rms_measured):.4f}")
+        click.echo(f"  Theoretical — median: {np.nanmedian(rms_theoretical):.4f}  mean: {np.nanmean(rms_theoretical):.4f}")
+        click.echo(f"  Ratio       — median: {np.nanmedian(rms_ratio):.4f}  mean: {np.nanmean(rms_ratio):.4f}")
+
+        # --- Build output table: same columns as input, add/replace columns ---
+        table = Table(data)
+        table['RMS']             = rms_measured
+        table['RMS_THEORETICAL'] = rms_theoretical
+        table['RMSRATIOB']       = rms_ratio    # ratio of measured RMS to theoretical radiometer RMS
+
+        # --- Apply RMSRATIO filter if requested ---
+        # Only science spectra (OBJECT == object_filter) are filtered;
+        # calibration rows (TSYS, TAU_SIG, SKYCHOPDIFF, etc.) are always kept.
+        if filter_threshold is not None:
+            objects_col = np.array([
+                s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                for s in data['OBJECT']
+            ])
+            is_science = (objects_col == object_filter) if object_filter else np.ones(n_spectra, dtype=bool)
+            keep = np.array(
+                [not is_science[i] or np.isnan(rms_ratio[i]) or rms_ratio[i] <= filter_threshold
+                 for i in range(n_spectra)]
+            )
+            n_science = int(np.sum(is_science))
+            n_removed = int(np.sum(~keep))
+            table = table[keep]
+            click.echo(f"  Filter RMSRATIOB <= {filter_threshold} (science only, {n_science} spectra): "
+                       f"removed {n_removed} ({n_removed/n_science*100:.1f}% of science), "
+                       f"{int(np.sum(keep))} total remaining")
+
+            # Remap TSYS_INDEX / TAU_SIG_INDEX to new row positions after filtering
+            for idx_col in ('TSYS_INDEX', 'TAU_SIG_INDEX'):
+                if idx_col in table.colnames:
+                    old_to_new = np.full(n_spectra, -1, dtype=np.int32)
+                    old_to_new[np.where(keep)[0]] = np.arange(int(np.sum(keep)), dtype=np.int32)
+                    table[idx_col] = np.array([
+                        old_to_new[v] if 0 <= v < n_spectra else -1
+                        for v in table[idx_col]
+                    ], dtype=np.int32)
+
+        # Preserve header and write output
+        primary = hdul[0].copy()
+        new_hdu = fits.BinTableHDU(table)
+        new_hdu.name = matrix_hdu.name
+        for key in matrix_hdu.header:
+            if key not in ['NAXIS1', 'NAXIS2', 'TFIELDS'] and key != '':
+                try:
+                    new_hdu.header[key] = matrix_hdu.header[key]
+                except (ValueError, KeyError):
+                    pass
+
+        import os
+        os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+        fits.HDUList([primary, new_hdu]).writeto(output, overwrite=True)
+        click.echo(f"\n✓ Written: {output}")
+
+        hdul.close()
+
+    except FileNotFoundError as e:
+        click.echo(click.style(f"Error: {e}", fg='red'), err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(click.style(f"Error: {e}", fg='red'), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg='red'), err=True)
         import traceback
         traceback.print_exc()
         sys.exit(1)

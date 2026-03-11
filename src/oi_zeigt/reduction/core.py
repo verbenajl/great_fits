@@ -1457,7 +1457,8 @@ def reduce_spectra(hdul: fits.HDUList,
                 ])
                 # Calculate standard deviation of channels outside window (on baselined spectrum)
                 outside_channels = spec[outside_mask]
-                if len(outside_channels) > 0:
+                n_valid = np.sum(~np.isnan(outside_channels))
+                if n_valid >= 2:
                     rms_baseline_values[i] = np.nanstd(outside_channels)
                 else:
                     rms_baseline_values[i] = np.nan
@@ -1488,11 +1489,16 @@ def reduce_spectra(hdul: fits.HDUList,
     
     # Create table from filtered data - this preserves ALL columns from the input
     table = Table(filtered_data)
-    
+
     # Replace the spectrum column with reduced spectra (now in original dtype)
     # After extraction+baseline, the spectrum is reduced and extracted
     table[spectrum_column] = spectra
-    
+
+    # If decimation was applied, update DELTAV to reflect the new effective channel width.
+    # Decimating by factor N makes each output channel N times wider.
+    if '_decimate_factor' in methods and 'DELTAV' in table.colnames:
+        table['DELTAV'] = table['DELTAV'] * methods['_decimate_factor']
+
     # All columns from the input are preserved, including:
     # - VELOCITY, DELTAV, CRPIX1 (reference values for original spectrum)
     # - OBJECT, SCAN, AOR_ID, etc. (metadata)

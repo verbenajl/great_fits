@@ -512,16 +512,27 @@ def grid_to_map(ras: np.ndarray, decs: np.ndarray, values: np.ndarray,
         gridder = cygrid.WcsGrid(wcs_header_dict)
         gridder.set_kernel(kernel_type, kernel_params, kernel_support, hpx_maxres)
         gridder.grid(ras, decs, values)
-        grid_map = gridder.get_datacube().astype(np.float32)
+        grid_map = gridder.get_datacube().squeeze().astype(np.float64)
+
+        # Always grid a coverage map to identify empty pixels (cygrid fills them with 0)
+        gridder_cov = cygrid.WcsGrid(wcs_header_dict)
+        gridder_cov.set_kernel(kernel_type, kernel_params, kernel_support, hpx_maxres)
+        gridder_cov.grid(ras, decs, np.ones(len(ras), dtype=np.float64))
+        coverage = gridder_cov.get_datacube().squeeze()
 
         if weights is not None:
             gridder_w = cygrid.WcsGrid(wcs_header_dict)
             gridder_w.set_kernel(kernel_type, kernel_params, kernel_support, hpx_maxres)
             gridder_w.grid(ras, decs, weights)
-            grid_weights = gridder_w.get_datacube().astype(np.float32)
+            grid_weights = gridder_w.get_datacube().squeeze().astype(np.float64)
+            out = np.full_like(grid_map, np.nan)
             grid_map = np.divide(grid_map, grid_weights,
                                  where=grid_weights > 0,
-                                 out=np.zeros_like(grid_map))
+                                 out=out)
+
+        # Set pixels with no coverage to NaN
+        grid_map[coverage <= 0] = np.nan
+        grid_map = grid_map.astype(np.float32)
     else:
         warnings.warn(
             "cygrid not available - using scipy griddata instead "
@@ -537,9 +548,10 @@ def grid_to_map(ras: np.ndarray, decs: np.ndarray, values: np.ndarray,
         if weights is not None:
             grid_weights = griddata(points, weights, (ra_mesh, dec_mesh),
                                     method='linear').astype(np.float32)
+            out = np.full_like(grid_map, np.nan)
             grid_map = np.divide(grid_map, grid_weights,
                                  where=grid_weights > 0,
-                                 out=np.zeros_like(grid_map))
+                                 out=out)
 
     return grid_map
 
@@ -770,24 +782,31 @@ def create_integrated_map(hdul: fits.HDUList,
                          figsize: Tuple[int, int] = (10, 8),
                          show_scatter: bool = False,
                          velocity_range: Optional[Tuple[float, float]] = None,
-                         weight_column: Optional[str] = None) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+                         weight_column: Optional[str] = None,
+                         channel_weights: bool = False) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Create a spatial map from integrated spectral intensity with optional per-spectrum weighting.
-    
+
     Integrates spectra across all channels (or specified velocity range), then grids with proper WCS.
-    Can optionally weight each integrated spectrum by a quality metric (e.g., RMSRATIO).
-    
+
     Parameters
     ----------
     velocity_range : tuple or None
         (v_min, v_max) in km/s to restrict integration to this velocity range.
         If None, integrates entire spectrum.
     weight_column : str, optional
-        Column name for per-spectrum weighting (e.g., 'RMSRATIO').
+        Column name for per-spectrum weighting (e.g., 'RMSRATIO' or 'RMSRATIOB').
         If None, all spectra are weighted equally (uniform weighting).
-        For RMSRATIO, weights are calculated as: weight = exp(-(RMSRATIO - 1.0)^2 / (2*sigma^2))
-        where sigma=0.5 (favors values close to 1.0, ideal quality).
-        Final map is normalized: map = (sum of intensity*weight) / (sum of weights)
+        For RMSRATIO/RMSRATIOB, weights are calculated as:
+            weight = exp(-(value - 1.0)^2 / (2*sigma^2))  with sigma=0.5
+        Final map is normalized: map = sum(intensity*weight) / sum(weights).
+    channel_weights : bool, optional
+        If True, compute per-channel weights from the TSYS and TAU_SIG calibration
+        spectra linked via TSYS_INDEX / TAU_SIG_INDEX columns (added by prepare_for_pca).
+        Weight per channel: w_{i,c} = exp(-tau_{i,c}) / tsys_{i,c}
+        The integration becomes: sum_c(w_{i,c} * T_{i,c}) / sum_c(w_{i,c}).
+        Falls back silently to uniform channel weights when the index columns are
+        absent, the index is -1, or the calibration spectrum contains non-finite values.
     """
     # Find ALL binary tables with the required spectrum column (supports multi-HDU files)
     matrix_hdus = []
@@ -874,6 +893,10 @@ def create_integrated_map(hdul: fits.HDUList,
     # Extract per-spectrum weights if requested
     weights = None
     if weight_column is not None:
+        # Fallback: if RMSRATIOB requested but absent, try RMSRATIO
+        if weight_column not in data.dtype.names and weight_column == 'RMSRATIOB' and 'RMSRATIO' in data.dtype.names:
+            warnings.warn("RMSRATIOB column not found, falling back to RMSRATIO for per-spectrum weighting.", UserWarning)
+            weight_column = 'RMSRATIO'
         if weight_column not in data.dtype.names:
             raise ValueError(f"Weight column '{weight_column}' not found in FITS file")
         
@@ -902,22 +925,84 @@ def create_integrated_map(hdul: fits.HDUList,
             if max_weight > 0:
                 weights[weights > 0] /= max_weight
     
-    # Compute integrated intensity
+    # Integrated intensity — always original unmodified values (nansum over channels).
+    # Per-channel and per-spectrum weights affect only how spectra are blended
+    # spatially by the gridder (via the weights argument to grid_to_map), following
+    # the same principle as CLASS map.template.class:
+    #   grid(T * w) / grid(w)  →  weighted average preserving original T units.
     integrated = np.nansum(spectra, axis=1)
-    
-    # Apply per-spectrum weighting if available
-    if weights is not None:
-        integrated = integrated * weights
-    
+
+    # --- Per-channel gridding weight from TSYS / TAU_SIG calibration spectra ---
+    # For each spectrum i: W_i = nansum_c( exp(-tau_{i,c}) / T_sys_{i,c} )
+    # This collapses the per-channel quality to a per-spectrum scalar weight.
+    # Spectra with lower opacity and lower T_sys across more channels get higher weight.
+    # The weight is used only for spatial gridding; integrated intensities are untouched.
+    chan_quality = None
+    if channel_weights:
+        has_cols = ('TSYS_INDEX' in data.dtype.names and 'TAU_SIG_INDEX' in data.dtype.names)
+        if not has_cols:
+            warnings.warn(
+                "channel_weights=True requested but TSYS_INDEX / TAU_SIG_INDEX columns "
+                "not found in file (available after prepare_for_pca). "
+                "Falling back to uniform channel weights.", UserWarning)
+        else:
+            all_spectra = data[spectrum_column]
+            tsys_idx = data['TSYS_INDEX']
+            tau_idx  = data['TAU_SIG_INDEX']
+            if object_filter:
+                tsys_idx = tsys_idx[mask]
+                tau_idx  = tau_idx[mask]
+            n_spec, n_chan = spectra.shape
+            # NaN sentinel: spectra with no calibration match get NaN initially
+            chan_quality = np.full(n_spec, np.nan, dtype=np.float64)
+            for i in range(n_spec):
+                ti = int(tsys_idx[i])
+                ai = int(tau_idx[i])
+                if ti < 0 or ai < 0 or ti >= len(all_spectra) or ai >= len(all_spectra):
+                    continue  # stale / missing index → leave as NaN
+                tsys_spec = np.asarray(all_spectra[ti], dtype=np.float64)
+                tau_spec  = np.asarray(all_spectra[ai], dtype=np.float64)
+                if velocity_range is not None:
+                    tsys_spec = tsys_spec[ch_min:ch_max]
+                    tau_spec  = tau_spec[ch_min:ch_max]
+                w_ch = np.where(
+                    np.isfinite(tsys_spec) & np.isfinite(tau_spec) & (tsys_spec > 0),
+                    np.exp(-tau_spec) / tsys_spec,
+                    np.nan,
+                )
+                w_sum = np.nansum(w_ch)
+                if np.isfinite(w_sum) and w_sum > 0:
+                    chan_quality[i] = w_sum
+
+            # Normalize: divide by median of calibrated values so the typical
+            # spectrum gets weight=1.0. Spectra with no calibration match also
+            # get weight=1.0 (median = neutral), avoiding the magnitude mismatch
+            # that would otherwise suppress or dominate entire sky regions.
+            calibrated_mask = np.isfinite(chan_quality)
+            if np.any(calibrated_mask):
+                median_cq = np.median(chan_quality[calibrated_mask])
+                if median_cq > 0:
+                    chan_quality /= median_cq
+            chan_quality = np.where(np.isfinite(chan_quality), chan_quality, 1.0)
+
+    # Combine per-spectrum (RMSRATIO) and per-channel (tau/T_sys) gridding weights.
+    # grid_to_map computes: Σ(kernel * gridding_weight * integrated) / Σ(kernel * gridding_weight)
+    # which is a weighted average of the original integrated intensities.
+    if weights is not None and chan_quality is not None:
+        gridding_weights = weights * chan_quality
+    elif chan_quality is not None:
+        gridding_weights = chan_quality
+    else:
+        gridding_weights = weights  # may be None → uniform
+
     # Filter valid points
     valid = np.isfinite(ras) & np.isfinite(decs) & np.isfinite(integrated)
     ras = ras[valid]
     decs = decs[valid]
     integrated = integrated[valid]
-    
-    # Also filter weights if they exist
-    if weights is not None:
-        weights = weights[valid]
+
+    if gridding_weights is not None:
+        gridding_weights = gridding_weights[valid]
     
     if len(integrated) < 3:
         raise ValueError(f"Not enough valid data points ({len(integrated)})")
@@ -957,14 +1042,17 @@ def create_integrated_map(hdul: fits.HDUList,
         object_name=object_filter or "",
     )
 
+    # grid_to_map expects values pre-multiplied by weights so that:
+    #   output = Σ(K * W * integrated) / Σ(K * W)  →  weighted average in original units
+    values_to_grid = integrated * gridding_weights if gridding_weights is not None else integrated
     grid_map = grid_to_map(
-        ras, decs, integrated,
+        ras, decs, values_to_grid,
         wcs_header_dict=wcs_header_dict,
         naxis1=naxis1, naxis2=naxis2,
         beamsize_deg=beamsize_deg,
         ra_min=ra_min, ra_max=ra_max,
         dec_min=dec_min, dec_max=dec_max,
-        weights=weights,
+        weights=gridding_weights,
     )
     
     # Create WCS header

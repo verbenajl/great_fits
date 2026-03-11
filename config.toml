@@ -58,8 +58,8 @@ averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files
 datacube = "/home/verbena/data/m51_processed_data/datacube.fits"
 prepared_for_pca="/home/verbena/data/m51_processed_data/prepared_for_pca.fits"
 pcad_fits="/home/verbena/data/m51_processed_data/pca_corrected.fits"
-post_filtered_fits="/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/post_filtered.fits"
+post_filtered_fits="/home/verbena/data/m51_processed_data/postpcarmsr.fits"
+postpcarmsr="/home/verbena/data/m51_processed_data/postpcarmsr.fits"
 pca_plots_dir="/home/verbena/data/m51_pca_plots/"
-
 
 

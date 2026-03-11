@@ -1,0 +1,114 @@
+{% include "template_head.class" %}
+
+file in "{{input_file}}"
+
+file out "{{weighted_channels_tag}}.kosma" single /over
+find
+
+set window {{line_window.0}} {{line_window.1}}
+
+def real taumin taumax rymin rymax
+
+for i 1 to found
+get n
+if exist(testry) then
+    del /var testry 
+endif
+def real testry /like ry
+let testry r%assoc%tau%data
+compute taumin min testry /blanking r%head%spe%bad
+compute taumax max testry /blanking r%head%spe%bad
+compute rymin min ry /blanking r%head%spe%bad
+compute rymax max ry /blanking r%head%spe%bad
+exa taumin
+exa taumax
+exa rymin
+exa rymax
+if (taumin.gt.0.001).and.(taumax.le.1) then
+    if (rymin.gt.-1000).and.(rymax.le.(1000)) then
+        bas 3
+        let ry 0 /where ry.eq.r%head%spe%bad
+        let ry ry/r%assoc%tau%data/sigma /where ry.ne.r%head%spe%bad
+        write   
+    endif
+endif
+next
+
+
+file out "{{weights_tag}}.kosma" single /over
+find
+
+
+for i 1 to found
+get n
+if exist(testry) then
+ del /var testry
+endif
+def real testry /like ry
+let testry r%assoc%tau%data
+compute taumin min testry
+compute taumax max testry
+compute rymin min ry /blanking r%head%spe%bad
+compute rymax max ry /blanking r%head%spe%bad
+if (taumin.gt.0.001).and.(taumax.le.1) then
+    if (rymin.gt.-1000).and.(rymax.le.(1000)) then
+        bas 3
+        let ry 0 /where ry.eq.r%head%spe%bad
+        let ry 1/r%assoc%tau%data/sigma /where ry.ne.r%head%spe%bad
+        write
+    endif
+endif
+next
+
+set cal off
+
+file in "{{weighted_channels_tag}}.kosma"
+find
+
+let map%beam {{beam}}
+let map%cell -{{cell}} {{cell}}
+let map%reso 1.1*map%beam
+set weight sigma
+
+set nocheck
+
+table {{weighted_channels_tag}} new 
+unblank {{weighted_channels_tag}}.tab {{weighted_channels_tag}}_unblank.tab
+xy_map {{weighted_channels_tag}}_unblank
+
+file in {{weights_tag}}.kosma
+find
+table {{weights_tag}} new
+unblank {{weights_tag}}.tab {{weights_tag}}_unblank.tab
+xy_map {{weighted_channels_tag}}_unblank
+xy_map {{weights_tag}}_unblank
+
+!sic copy {{weights_tag}}_unblank.lmv {{final_tag}}.lmv
+SYSTEM "cp {{weights_tag}}_unblank.lmv {{final_tag}}.lmv"
+
+define image channel_weights "{{weighted_channels_tag}}_unblank.lmv" read
+define header channel_weights_head "{{weighted_channels_tag}}_unblank.lmv" read
+define image weights "{{final_tag}}.lmv" write
+define header weights_head "{{final_tag}}.lmv" read
+
+for i 1 to weights_head%dim[3]
+    let weights[,,i] channel_weights[,,i]/weights[,,i]
+next
+del /var weights
+
+sic copy "{{final_tag}}.lmv" "{{output_file}}"
+
+!SYSTEM "cp {{final_tag}}.lmv {{output_file}}"
+!define image map_data  "{{output_file}}" write
+!define header map_head "{{output_file}}" read
+!define image wei "{{normal_tag}}.wei" read
+!for i 1 to map_head%dim[3]
+!SIC\LET map_data[,,i] map_head%blank[1] /WHERE wei.lt.weight_cut_off !    17
+!SIC\NEXT
+!del /var map_data
+!del /var map_head
+!del /var wei
+
+
+
+{% include "template_tail.class" %}
