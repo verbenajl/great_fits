@@ -7,6 +7,7 @@ and fills telluric line regions with Gaussian noise.
 
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -91,6 +92,64 @@ def get_telluric_indices(mission_id: str, velocity_axis_kms: np.ndarray) -> Opti
         return telluric_mask
     
     return None
+
+
+def _fill_telluric_chunk(args: tuple) -> np.ndarray:
+    """
+    Worker function: fill telluric channels with Gaussian noise for a chunk of spectra.
+
+    Must be defined at module level so ProcessPoolExecutor can pickle it.
+
+    Parameters
+    ----------
+    args : tuple
+        (spectra_chunk, velocity_axes_chunk, mission_ids_chunk, objects_chunk, mission_params_cache)
+        - spectra_chunk       : (N, nchan) float array
+        - velocity_axes_chunk : (N, nchan) float array in km/s
+        - mission_ids_chunk   : list of str
+        - objects_chunk       : list of str
+        - mission_params_cache: dict {mission_id -> params dict}
+
+    Returns
+    -------
+    np.ndarray
+        (N, nchan) array with telluric channels filled.
+    """
+    spectra_chunk, velocity_axes_chunk, mission_ids_chunk, objects_chunk, mission_params_cache = args
+    result = spectra_chunk.copy()
+
+    for i in range(len(result)):
+        if objects_chunk[i] in ('TSYS', 'TAU_SIG'):
+            continue
+
+        params = mission_params_cache.get(mission_ids_chunk[i], {})
+        if not params or 'telluric_line_center' not in params:
+            continue
+
+        center_km_s = params['telluric_line_center']
+        width_km_s = params.get('telluric_line_width', 30)
+        v_min = center_km_s - width_km_s / 2.0
+        v_max = center_km_s + width_km_s / 2.0
+
+        velocity_kms = velocity_axes_chunk[i]
+        telluric_mask = (velocity_kms >= v_min) & (velocity_kms <= v_max)
+
+        if not np.any(telluric_mask):
+            continue
+
+        spectrum = result[i]
+        non_telluric_values = spectrum[~telluric_mask]
+        n_valid = np.sum(~np.isnan(non_telluric_values))
+        noise_level = np.nanstd(non_telluric_values) if n_valid >= 2 else np.nan
+
+        if np.isnan(noise_level):
+            n_valid_full = np.sum(~np.isnan(spectrum))
+            noise_level = np.nanstd(spectrum) if n_valid_full >= 2 else np.nan
+
+        if not np.isnan(noise_level) and noise_level > 0:
+            result[i][telluric_mask] = np.random.normal(0, noise_level, np.sum(telluric_mask))
+
+    return result
 
 
 def fill_telluric_with_noise(fits_file: str, output_fits: str, 
@@ -198,63 +257,54 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         filtered_mission_ids = mission_ids[combined_mask]
         filtered_objects = objects[combined_mask]
         
-        # Fill telluric lines with Gaussian noise
+        # Fill telluric lines with Gaussian noise (parallelized)
         logger.info("Filling telluric lines with Gaussian noise...")
-        
-        n_filled = 0
-        current_mission_id = None
-        for idx, spectrum in enumerate(filtered_data['SPECTRUM']):
-            # Skip TSYS and TAU_SIG rows - they should not be modified
-            if filtered_objects[idx] in ('TSYS', 'TAU_SIG'):
-                logger.debug(f"Skipping telluric fill for {filtered_objects[idx]} spectrum")
-                continue
-            
-            mission_id = filtered_mission_ids[idx]
-            
-            # Log when we start processing a new mission_id
-            if mission_id != current_mission_id:
-                logger.info(f"  Processing {mission_id}")
-                current_mission_id = mission_id
-            
-            # Get velocity axis for this specific spectrum
-            if 'VELOCITY_AXIS' in filtered_data.dtype.names:
-                spectrum_velocity_ms = filtered_data['VELOCITY_AXIS'][idx]
-                spectrum_velocity_kms = spectrum_velocity_ms / 1000.0  # Convert m/s to km/s
-            else:
-                # Fallback to shared velocity axis if per-spectrum not available
-                spectrum_velocity_kms = velocity_axis_kms
-            
-            telluric_mask = get_telluric_indices(mission_id, spectrum_velocity_kms)
-            
-            if telluric_mask is not None and np.any(telluric_mask):
-                # Get noise level from surrounding channels, ignoring NaNs
-                non_telluric = ~telluric_mask
-                if np.any(non_telluric):
-                    # Use nanstd to ignore NaN values; need at least 2 valid values
-                    non_telluric_values = spectrum[non_telluric]
-                    n_valid = np.sum(~np.isnan(non_telluric_values))
-                    if n_valid >= 2:
-                        noise_level = np.nanstd(non_telluric_values)
-                    else:
-                        noise_level = np.nan
 
-                    # If all non-telluric values are NaN, use the full spectrum
-                    if np.isnan(noise_level):
-                        n_valid_full = np.sum(~np.isnan(spectrum))
-                        noise_level = np.nanstd(spectrum) if n_valid_full >= 2 else np.nan
-                else:
-                    n_valid_full = np.sum(~np.isnan(spectrum))
-                    noise_level = np.nanstd(spectrum) if n_valid_full >= 2 else np.nan
-                
-                # Only fill if we have a valid noise level
-                if not np.isnan(noise_level) and noise_level > 0:
-                    # Fill with Gaussian noise
-                    noise = np.random.normal(0, noise_level, np.sum(telluric_mask))
-                    spectrum[telluric_mask] = noise
-                    n_filled += 1
-                else:
-                    logger.warning(f"Could not determine noise level for spectrum {idx}, skipping telluric fill")
-        
+        # Pre-cache mission parameters — avoids re-parsing the YAML file for every spectrum
+        unique_mission_ids = list(set(filtered_mission_ids))
+        mission_params_cache = {mid: load_mission_parameters(mid) for mid in unique_mission_ids}
+        logger.info(f"  Cached parameters for {len(mission_params_cache)} unique mission IDs")
+
+        # Build per-spectrum velocity axes as a plain numpy array for parallel workers
+        spectra_array = np.array(filtered_data['SPECTRUM'], dtype=np.float64)
+        n_spectra, n_chan = spectra_array.shape
+
+        if 'VELOCITY_AXIS' in filtered_data.dtype.names:
+            velocity_axes = np.array(filtered_data['VELOCITY_AXIS'], dtype=np.float64) / 1000.0
+        else:
+            velocity_axes = np.tile(velocity_axis_kms, (n_spectra, 1))
+
+        # Split work into chunks — one per CPU
+        n_workers = os.cpu_count() or 1
+        chunk_size = max(1, n_spectra // n_workers)
+        chunks = []
+        for start in range(0, n_spectra, chunk_size):
+            end = min(start + chunk_size, n_spectra)
+            chunks.append((
+                spectra_array[start:end],
+                velocity_axes[start:end],
+                list(filtered_mission_ids[start:end]),
+                list(filtered_objects[start:end]),
+                mission_params_cache,
+            ))
+
+        logger.info(f"  Processing {n_spectra} spectra across {len(chunks)} chunks ({n_workers} workers)...")
+
+        filled_chunks = []
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            for chunk_result in executor.map(_fill_telluric_chunk, chunks):
+                filled_chunks.append(chunk_result)
+
+        # Reassemble and count filled spectra
+        filled_spectra = np.concatenate(filled_chunks, axis=0)
+        n_filled = int(np.sum(
+            np.any(filled_spectra != spectra_array, axis=1) &
+            np.array([obj not in ('TSYS', 'TAU_SIG') for obj in filtered_objects])
+        ))
+
+        # Write back into filtered_data in-place
+        filtered_data['SPECTRUM'][:] = filled_spectra.astype(filtered_data['SPECTRUM'].dtype)
+
         logger.info(f"Filled telluric lines in {n_filled} spectra")
         
         # Create index columns for linking M51CENTER to TSYS and TAU_SIG
