@@ -446,8 +446,8 @@ def main_cli():
     parser.add_argument(
         "--n-components",
         type=int,
-        default=5,
-        help="Number of PCA components to extract (default: 5)"
+        default=None,
+        help="Number of PCA components to extract (default: from config [pca][n_components], or 5)"
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -474,6 +474,18 @@ def main_cli():
         logger.info(f"Loading configuration from {args.config}")
         config = get_config(args.config)
         
+        # Resolve n_components: CLI > config [pca][n_components] > default 5
+        pca_config = config.get('pca', {})
+        if args.n_components is not None:
+            n_components = args.n_components
+            logger.info(f"✓ N components = {n_components} (from command line)")
+        elif pca_config.get('n_components') is not None:
+            n_components = int(pca_config['n_components'])
+            logger.info(f"✓ N components = {n_components} (from config [pca][n_components])")
+        else:
+            n_components = 5
+            logger.info(f"✓ N components = {n_components} (default)")
+
         # Determine FITS file (command line > config [output][prepared_for_pca] > config [output][reduced_fits] > config [input][fits_file])
         if args.fits is not None:
             fits_file = args.fits
@@ -587,11 +599,11 @@ def main_cli():
                 telescop,
                 data['spectra'],
                 data['date'],
-                n_components=args.n_components,
+                n_components=n_components,
                 velocity_axis=velocity_axis,
                 line_window_kms=mission_line_windows.get(mission_id),
                 spectrum_indices=spectrum_indices,
-                smoothing_kernel_size=config.get('pca', {}).get('smoothing_kernel_size')
+                smoothing_kernel_size=pca_config.get('smoothing_kernel_size')
             )
             
             if result is None:

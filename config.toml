@@ -30,25 +30,28 @@ telescop = "IRAM-30M"  # Telescope name written to FITS header (must be recognis
 
 [pca_prepare]
 fill_with_noise=true
-rmsratio_value=1.3
 tau_min=0.001
 tau_max=1.0
 rymin=-1000
 rymax=1000
 
 [pca]
-n_components = 5
+n_components = 6
 pca_source="SKYCHOPDIFF"
 # smooth the components in frequency space by a box car with a
 # a kernel length of
-smoothing_kernel_size= 10
-rolling_noise_window = 11
+smoothing_kernel_size= 25
+rolling_noise_window = 15
 noise_cutoff = false
-cutoff = false
+cutoff = 0.03
 global_noise_ratio_cutoff = false
-noise_ratio_cutoff = false
-line_kernel_size = 21
+noise_ratio_cutoff = 2.0
+line_kernel_size = 11
+line_cutoff_std=2.0
+least_squares=true
 
+[filter]
+rms_ratio=2.0
 
 [output]
 clean_fits = "/home/verbena/data/m51_processed_data/clean_data.fits"

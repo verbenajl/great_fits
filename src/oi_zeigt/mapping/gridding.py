@@ -181,7 +181,7 @@ def create_wcs_header(naxis1: int, naxis2: int, naxis3: int,
     header['WCSAXES'] = 3
     header['CTYPE1'] = 'RA---SIN'
     header['CTYPE2'] = 'DEC--SIN'
-    header['CTYPE3'] = 'VRAD'
+    header['CTYPE3'] = 'VELO-LSR'
     header['CUNIT1'] = 'deg'
     header['CUNIT2'] = 'deg'
     header['CUNIT3'] = 'm/s'
@@ -1237,12 +1237,13 @@ def _init_gridding_worker(ras, decs, wcs_header_dict,
 
 def _grid_channel_worker(args):
     """Worker: grid one spectral channel and return (ichannel, 2D map or None)."""
-    ichannel, channel_data = args
+    ichannel, channel_data, weights = args
     s = _gridding_worker_state
     valid = (np.isfinite(s['ras']) & np.isfinite(s['decs']) &
              np.isfinite(channel_data))
     if not np.any(valid):
         return ichannel, None
+    w = weights[valid] if weights is not None else None
     channel_map = grid_to_map(
         s['ras'][valid], s['decs'][valid], channel_data[valid],
         wcs_header_dict=s['wcs_header_dict'],
@@ -1250,6 +1251,7 @@ def _grid_channel_worker(args):
         beamsize_deg=s['beamsize_deg'],
         ra_min=s['ra_min'], ra_max=s['ra_max'],
         dec_min=s['dec_min'], dec_max=s['dec_max'],
+        weights=w,
     )
     return ichannel, channel_map
 
@@ -1264,7 +1266,9 @@ def create_spectral_datacube(hdul: fits.HDUList,
                             figsize: Tuple[float, float] = (12, 5),
                             output_file: Optional[str] = None,
                             telescop: str = "",
-                            n_jobs: int = -1) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+                            n_jobs: int = -1,
+                            weight_column: Optional[str] = None,
+                            channel_weights: bool = False) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -1286,7 +1290,16 @@ def create_spectral_datacube(hdul: fits.HDUList,
         Figure size for plot (width, height). Default is (12, 5).
     output_file : str, optional
         If provided, saves the datacube as a FITS file.
-    
+    weight_column : str, optional
+        Column name for per-spectrum weighting (e.g. 'RMSRATIOB').
+        Gaussian weight: exp(-(value - 1.0)^2 / (2*0.5^2)).
+    channel_weights : bool, optional
+        If True, compute per-channel gridding weights from TSYS / TAU_SIG
+        calibration spectra (via TSYS_INDEX / TAU_SIG_INDEX columns).
+        Weight for spectrum i at channel c: exp(-tau_{i,c}) / tsys_{i,c}.
+        Unlike create_integrated_map (which collapses to a scalar), this uses
+        the channel-specific weight for each channel slice individually.
+
     Returns
     -------
     tuple
@@ -1407,6 +1420,70 @@ def create_spectral_datacube(hdul: fits.HDUList,
     # Initialize datacube
     datacube = np.full((nvel, naxis2, naxis1), np.nan, dtype=np.float32)
 
+    # --- Compute gridding weights ---
+    # spectrum_weights: per-spectrum scalar (shape: nobs), or None
+    spectrum_weights = None
+    if weight_column is not None:
+        col = weight_column
+        if col not in table.names and col == 'RMSRATIOB' and 'RMSRATIO' in table.names:
+            warnings.warn("RMSRATIOB not found, falling back to RMSRATIO for per-spectrum weighting.", UserWarning)
+            col = 'RMSRATIO'
+        if col not in table.names:
+            raise ValueError(f"Weight column '{col}' not found in FITS file")
+        wvals = np.asarray(table[col], dtype=np.float64)
+        if object_filter and 'OBJECT' in table.names:
+            wvals = wvals[mask]
+        sigma = 0.5
+        spectrum_weights = np.where(
+            np.isfinite(wvals),
+            np.exp(-((wvals - 1.0) ** 2) / (2 * sigma ** 2)),
+            0.0,
+        )
+
+    # channel_weight_matrix: per-spectrum per-channel (shape: nobs, nvel), or None
+    # Unlike create_integrated_map (which collapses to scalar), we keep the full
+    # 2D matrix so each channel slice gets its own optimal per-spectrum weights.
+    channel_weight_matrix = None
+    if channel_weights:
+        has_cols = ('TSYS_INDEX' in table.names and 'TAU_SIG_INDEX' in table.names)
+        if not has_cols:
+            warnings.warn(
+                "channel_weights=True requested but TSYS_INDEX / TAU_SIG_INDEX columns "
+                "not found (available after prepare_for_pca). "
+                "Falling back to uniform channel weights.", UserWarning)
+        else:
+            all_spectra_raw = table['SPECTRUM']
+            tsys_idx = np.asarray(table['TSYS_INDEX'])
+            tau_idx  = np.asarray(table['TAU_SIG_INDEX'])
+            if object_filter and 'OBJECT' in table.names:
+                tsys_idx = tsys_idx[mask]
+                tau_idx  = tau_idx[mask]
+            channel_weight_matrix = np.ones((nobs, nvel), dtype=np.float64)
+            for i in range(nobs):
+                ti = int(tsys_idx[i])
+                ai = int(tau_idx[i])
+                if ti < 0 or ai < 0 or ti >= len(all_spectra_raw) or ai >= len(all_spectra_raw):
+                    continue
+                tsys_spec = np.asarray(all_spectra_raw[ti], dtype=np.float64)
+                tau_spec  = np.asarray(all_spectra_raw[ai], dtype=np.float64)
+                w_ch = np.where(
+                    np.isfinite(tsys_spec) & np.isfinite(tau_spec) & (tsys_spec > 0),
+                    np.exp(-tau_spec) / tsys_spec,
+                    np.nan,
+                )
+                finite_mask = np.isfinite(w_ch)
+                channel_weight_matrix[i, finite_mask] = w_ch[finite_mask]
+                # Spectra with no valid calibration for a channel get weight=1.0 (neutral)
+            # Normalize each channel by its median across spectra so the typical
+            # spectrum has weight=1.0 per channel
+            for c in range(nvel):
+                col_w = channel_weight_matrix[:, c]
+                finite_vals = col_w[np.isfinite(col_w) & (col_w > 0)]
+                if len(finite_vals) > 0:
+                    med = np.median(finite_vals)
+                    if med > 0:
+                        channel_weight_matrix[:, c] /= med
+
     # Build WCS header dict once (same geometry for every channel)
     wcs_header_dict_ch = create_wcs_header(
         naxis1=naxis1, naxis2=naxis2, naxis3=1,
@@ -1426,17 +1503,33 @@ def create_spectral_datacube(hdul: fits.HDUList,
     print(f"Creating datacube: {nvel} channels × {naxis2} × {naxis1} pixels "
           f"(n_jobs={n_workers})...")
 
-    channel_args = [(ichannel, np.array(spectra[:, ichannel], dtype=np.float32))
-                    for ichannel in range(nvel)]
+    def _get_channel_weights(ichannel):
+        """Combine spectrum and channel weights for a single channel slice."""
+        sw = spectrum_weights  # per-spectrum scalar (nobs,) or None
+        cw = channel_weight_matrix[:, ichannel] if channel_weight_matrix is not None else None
+        if sw is not None and cw is not None:
+            return sw * cw
+        elif cw is not None:
+            return cw
+        else:
+            return sw  # may be None → uniform
+
+    channel_args = [
+        (ichannel,
+         np.array(spectra[:, ichannel], dtype=np.float32),
+         _get_channel_weights(ichannel))
+        for ichannel in range(nvel)
+    ]
 
     if n_workers == 1:
         # Sequential path — useful for debugging
-        for ichannel, channel_data in channel_args:
+        for ichannel, channel_data, weights in channel_args:
             if ichannel % max(1, nvel // 10) == 0:
                 print(f"  Channel {ichannel+1}/{nvel}...", end='\r')
             valid = np.isfinite(ras) & np.isfinite(decs) & np.isfinite(channel_data)
             if not np.any(valid):
                 continue
+            w = weights[valid] if weights is not None else None
             datacube[ichannel] = grid_to_map(
                 ras[valid], decs[valid], channel_data[valid],
                 wcs_header_dict=wcs_header_dict_ch,
@@ -1444,6 +1537,7 @@ def create_spectral_datacube(hdul: fits.HDUList,
                 beamsize_deg=beamsize_deg,
                 ra_min=ra_min, ra_max=ra_max,
                 dec_min=dec_min, dec_max=dec_max,
+                weights=w,
             )
     else:
         from multiprocessing import Pool

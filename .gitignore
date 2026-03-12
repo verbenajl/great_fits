@@ -85,3 +85,6 @@ datacube.fits
 *.fits
 *.fits.gz
 
+# Claude Code memory files
+.claude/
+

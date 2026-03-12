@@ -494,10 +494,32 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
     default=None,
     help="Output file for the plot (PNG or PDF). If not specified, show plot."
 )
+@click.option(
+    "--filter-above",
+    "filter_above_col",
+    default=None,
+    help="Column name: only plot spectra with value above --filter-value. "
+         "If RMSRATIOB is requested but absent, falls back to RMSRATIO."
+)
+@click.option(
+    "--filter-below",
+    "filter_below_col",
+    default=None,
+    help="Column name: only plot spectra with value below --filter-value. "
+         "If RMSRATIOB is requested but absent, falls back to RMSRATIO."
+)
+@click.option(
+    "--filter-value",
+    type=float,
+    default=None,
+    help="Threshold value for --filter-above or --filter-below."
+)
 
 
 def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
-                       pcad: bool, post: bool, object: Optional[str], num_spectra: int, output: Optional[str]):
+                       pcad: bool, post: bool, object: Optional[str], num_spectra: int, output: Optional[str],
+                       filter_above_col: Optional[str], filter_below_col: Optional[str],
+                       filter_value: Optional[float]):
     """
     Plot a sample of spectra from a FITS file.
     
@@ -603,7 +625,32 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
         if len(matching_indices) == 0:
             click.echo(click.style(f"No spectra found for object '{object}'", fg="red"), err=True)
             sys.exit(1)
-        
+
+        # Apply --filter-above / --filter-below with --filter-value
+        filter_column = filter_above_col or filter_below_col
+        filter_direction = 'above' if filter_above_col else ('below' if filter_below_col else None)
+
+        if filter_column is not None and filter_value is not None:
+            col = filter_column
+            if col not in data.dtype.names:
+                if col == 'RMSRATIOB' and 'RMSRATIO' in data.dtype.names:
+                    click.echo(f"Warning: RMSRATIOB not found, falling back to RMSRATIO for filtering.")
+                    col = 'RMSRATIO'
+                else:
+                    click.echo(click.style(f"Error: column '{col}' not found in FITS file.", fg="red"), err=True)
+                    sys.exit(1)
+            col_values = data[col][matching_indices]
+            if filter_direction == 'above':
+                mask = np.array([np.isfinite(float(v)) and float(v) > filter_value for v in col_values])
+                click.echo(f"Filter: {col} > {filter_value} → {np.sum(mask)} spectra remaining")
+            else:
+                mask = np.array([np.isfinite(float(v)) and float(v) < filter_value for v in col_values])
+                click.echo(f"Filter: {col} < {filter_value} → {np.sum(mask)} spectra remaining")
+            matching_indices = matching_indices[mask]
+            if len(matching_indices) == 0:
+                click.echo(click.style(f"No spectra pass the filter.", fg="red"), err=True)
+                sys.exit(1)
+
         # Sample spectra
         sample_size = min(num_spectra, len(matching_indices))
         sampled_indices = np.random.choice(matching_indices, size=sample_size, replace=False)
@@ -688,12 +735,16 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
                 title_color = 'red'
                 nan_indicator = "✗"
             
-            ax.set_title(
-                f"{nan_indicator} Row {orig_idx}: {obj_name} ({nan_frac:.1%} NaN)",
-                fontsize=10,
-                color=title_color,
-                weight='bold'
-            )
+            title = f"{nan_indicator} Row {orig_idx}: {obj_name} ({nan_frac:.1%} NaN)"
+            if filter_column is not None:
+                col = filter_column if filter_column in data.dtype.names else (
+                    'RMSRATIO' if 'RMSRATIO' in data.dtype.names else None)
+                if col:
+                    try:
+                        title += f"\n{col}={float(spectrum_data[col]):.3f}"
+                    except (KeyError, TypeError):
+                        pass
+            ax.set_title(title, fontsize=10, color=title_color, weight='bold')
             ax.set_xlabel(x_label)
             ax.set_ylabel("Intensity")
             ax.grid(True, alpha=0.3)
@@ -1325,10 +1376,27 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     default=False,
     help="Filter out spectra that are all zeros (entire spectrum = 0)"
 )
+@click.option(
+    "--filter-below",
+    type=(str, float),
+    multiple=True,
+    metavar="COLUMN VALUE",
+    help="Keep rows where COLUMN >= VALUE (filter out below). "
+         "Rows with NaN in the column always pass. Can be repeated."
+)
+@click.option(
+    "--filter-above",
+    type=(str, float),
+    multiple=True,
+    metavar="COLUMN VALUE",
+    help="Keep rows where COLUMN <= VALUE (filter out above). "
+         "Rows with NaN in the column always pass. Can be repeated."
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
-                nan_threshold: float, output_clean: Optional[str], 
+                nan_threshold: float, output_clean: Optional[str],
                 output_rejected: Optional[str], remove: Optional[str],
-                remove_values: tuple, apply_only_to_object: bool, filter_zero: bool):
+                remove_values: tuple, apply_only_to_object: bool, filter_zero: bool,
+                filter_below: tuple, filter_above: tuple):
     """
     Filter FITS data by object, NaN content, all-zero spectra, and/or column values.
     
@@ -1372,6 +1440,12 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         filter_fits --config config.toml --remove AOR_ID \\
             --remove-values 04_0116_0020609 --remove-values 04_0116_0020506 \\
             --filter-zero
+
+        # Keep only spectra with RMSRATIOB >= 2.0
+        filter_fits --config config.toml --filter-below RMSRATIOB 2.0
+
+        # Keep only spectra with 1.3 <= RMSRATIOB <= 3.0
+        filter_fits --config config.toml --filter-below RMSRATIOB 1.3 --filter-above RMSRATIOB 3.0
     """
     try:
         # Always try to load config
@@ -1470,6 +1544,15 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             except (NameError, KeyError):
                 pass
         
+        # Build param_filters from --filter-below / --filter-above
+        param_filters = []
+        for col, val in filter_below:
+            param_filters.append((col, 'below', val))
+            click.echo(f"Parameter filter: keep {col} <= {val}")
+        for col, val in filter_above:
+            param_filters.append((col, 'above', val))
+            click.echo(f"Parameter filter: keep {col} >= {val}")
+
         # Filter and save
         clean_path, rejected_path, stats = filter_and_save_fits(
             hdul,
@@ -1480,7 +1563,8 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             remove_column=remove,
             remove_values=list(remove_values) if remove_values else None,
             apply_to_all=not apply_only_to_object,
-            filter_zero_spectra=filter_zero
+            filter_zero_spectra=filter_zero,
+            param_filters=param_filters if param_filters else None,
         )
         
         # Get statistics before closing
@@ -1514,6 +1598,11 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             click.echo(f"    - All-zero spectra: {stats['rejected_zero']}")
         if stats['rejected_removed'] > 0:
             click.echo(f"    - Removed by --remove criteria: {stats['rejected_removed']}")
+        if stats['rejected_param'] > 0:
+            click.echo(f"    - Removed by --filter-below/--filter-above: {stats['rejected_param']} total")
+            for col, direction, value, n in stats.get('param_filter_details', []):
+                op = '<=' if direction == 'below' else '>='
+                click.echo(f"        kept {col} {op} {value}: {n} removed individually")
         
         click.echo()
         
@@ -2710,7 +2799,7 @@ def map_integrated_cmd(config, fits, reduced, clean, pcad, rejected, postfiltere
         else:
             object_filter = object
 
-        # Resolve per-spectrum weight column
+        # Resolve per-spectrum weight column (map_integrated_cmd block)
         eff_weight_column = weight_column
         if eff_weight_column is None and weight_spectra:
             eff_weight_column = 'RMSRATIOB'  # fallback to RMSRATIO handled inside create_integrated_map
@@ -2989,6 +3078,8 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
 @click.command()
 @click.option('--config', type=click.Path(exists=True),
               help='Path to config.toml file.')
+@click.option('--fits', 'fits_file', type=click.Path(exists=True), default=None,
+              help='Path to an arbitrary input FITS file (takes priority over dataset flags).')
 @click.option('--reduced', is_flag=True, default=False,
               help='Use reduced_data.fits (output.reduced_fits from config).')
 @click.option('--pcad', is_flag=True, default=False,
@@ -3007,7 +3098,11 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
               help='Output path for diagnostic plot (e.g., datacube_slices.png). If not specified, plot is shown but not saved.')
 @click.option('--n-jobs', type=int, default=-1,
               help='Number of parallel workers for channel gridding. -1 = all CPUs (default), 1 = sequential.')
-def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsize, output, plot, n_jobs):
+@click.option('--weight-spectra', is_flag=True, default=False,
+              help='Weight spectra by exp(-(RMSRATIOB-1)²/(2×0.5²)) during gridding.')
+@click.option('--weight-channels', is_flag=True, default=False,
+              help='Weight each channel by exp(-tau)/T_sys from TSYS/TAU_SIG calibration spectra.')
+def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, output, plot, n_jobs, weight_spectra, weight_channels):
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -3016,10 +3111,11 @@ def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsi
     with scipy fallback.
     
     Reads input file from (in order of priority):
-    1. --pcad flag (uses output.pcad_fits from config)
-    2. --prepared flag (uses output.prepared_for_pca from config)
-    3. --reduced flag (uses output.reduced_fits from config)
-    4. [input].fits_file from config.toml otherwise
+    1. --fits path (arbitrary file, takes priority over all flags)
+    2. --pcad flag (uses output.pcad_fits from config)
+    3. --prepared flag (uses output.prepared_for_pca from config)
+    4. --reduced flag (uses output.reduced_fits from config)
+    5. [input].fits_file from config.toml otherwise
 
     Output file path is determined by (in order of priority):
     1. --output command line option
@@ -3030,7 +3126,8 @@ def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsi
 
     Examples:
         create_datacube --config config.toml
-        create_datacube --config config.toml --pcad --object M51
+        create_datacube --config config.toml --fits postpcarmsr_1.3.fits --object M51
+        create_datacube --config config.toml --pcad --object M51 --weight-spectra --weight-channels
         create_datacube --config config.toml --prepared --object M51
         create_datacube --config config.toml --reduced --object M51
         create_datacube --config config.toml --output my_datacube.fits --plot slices.png
@@ -3052,7 +3149,10 @@ def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsi
 
         # Determine FITS file to process
         output_cfg = cfg.get('output', {})
-        if pcad:
+        if fits_file:
+            click.echo(f"Reading FITS file: {fits_file}")
+            hdul = fits.open(fits_file)
+        elif pcad:
             fits_path = output_cfg.get('pcad_fits', None)
             if not fits_path:
                 click.echo(click.style("Error: --pcad flag specified but [output].pcad_fits not defined in config", fg="red"), err=True)
@@ -3097,9 +3197,11 @@ def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsi
 
         # Create datacube
         from oi_zeigt.mapping.gridding import create_spectral_datacube
-        
+
         gridding_cfg = cfg.get('gridding', {})
         telescop = gridding_cfg.get('telescop', '')
+
+        eff_weight_column = 'RMSRATIOB' if weight_spectra else None
 
         datacube, wcs_header, fig = create_spectral_datacube(
             hdul,
@@ -3109,6 +3211,8 @@ def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsi
             output_file=output_file,
             telescop=telescop,
             n_jobs=n_jobs,
+            weight_column=eff_weight_column,
+            channel_weights=weight_channels,
         )
 
         click.echo(f"\n✓ Spectral datacube created")
@@ -3117,6 +3221,10 @@ def create_datacube_cmd(config, reduced, pcad, prepared, object, beamsize, pixsi
             click.echo(f"  Pixel size: {pixsize_deg:.6f}°")
         if object_filter:
             click.echo(f"  Object filter: {object_filter}")
+        if eff_weight_column:
+            click.echo(f"  Per-spectrum weighting: {eff_weight_column}")
+        if weight_channels:
+            click.echo(f"  Per-channel weighting: exp(-tau)/T_sys from TSYS/TAU_SIG calibration spectra")
         click.echo(f"  Datacube shape: {datacube.shape[0]} channels × {datacube.shape[1]} × {datacube.shape[2]} pixels")
         click.echo(f"  Output file: {output_file}")
 
@@ -3357,9 +3465,7 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
               help='Use reduced_fits from config instead of pcad.')
 @click.option('--output', type=click.Path(), default=None,
               help='Output FITS file path. Defaults to output.postpcarmsr from config.')
-@click.option('--filter', 'filter_threshold', type=float, default=None,
-              help='Remove spectra with RMSRATIO greater than this value.')
-def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, filter_threshold):
+def post_process_data_cmd(config, pcad, clean, prepared, reduced, output):
     """
     Post-process spectra: compute per-spectrum RMS outside the line window.
 
@@ -3375,6 +3481,8 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, filter
         post_process_data --config config.toml
         post_process_data --config config.toml --reduced
         post_process_data --config config.toml --output my_post.fits
+
+    Use filter_data to filter spectra by RMSRATIOB after post-processing.
     """
     try:
         from astropy.table import Table
@@ -3502,46 +3610,72 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, filter
                 rms_ratio[i] = rms_measured[i] / rms_theoretical[i]
 
         n_valid_rms = int(np.sum(~np.isnan(rms_measured)))
-        click.echo(f"RMS computed for {n_valid_rms} / {n_spectra} spectra")
-        click.echo(f"  Measured    — median: {np.nanmedian(rms_measured):.4f}  mean: {np.nanmean(rms_measured):.4f}")
-        click.echo(f"  Theoretical — median: {np.nanmedian(rms_theoretical):.4f}  mean: {np.nanmean(rms_theoretical):.4f}")
-        click.echo(f"  Ratio       — median: {np.nanmedian(rms_ratio):.4f}  mean: {np.nanmean(rms_ratio):.4f}")
+
+        # --- Restrict summary to science rows only ---
+        # Science rows are those whose OBJECT matches object_filter.
+        # If object_filter is not set, fall back to excluding known calibration
+        # row types (TSYS, TAU_SIG, SKYCHOPDIFF) so calibration spectra do not
+        # skew the statistics.
+        CAL_TYPES = {'TSYS', 'TAU_SIG', 'SKYCHOPDIFF'}
+        objects_col_all = np.array([
+            s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+            for s in data['OBJECT']
+        ])
+        if object_filter:
+            is_science_all = objects_col_all == object_filter
+        else:
+            is_science_all = np.array([o not in CAL_TYPES for o in objects_col_all])
+        sci_rms    = rms_measured[is_science_all]
+        sci_rmsth  = rms_theoretical[is_science_all]
+        sci_ratio  = rms_ratio[is_science_all]
+        n_science  = int(np.sum(is_science_all))
+
+        sep = "─" * 60
+        click.echo(f"\n{sep}")
+        click.echo(f"  Post-process summary  ({n_valid_rms}/{n_spectra} spectra computed, {n_science} science rows)")
+        click.echo(sep)
+
+        def _row(label, arr):
+            valid = arr[np.isfinite(arr)]
+            if len(valid) == 0:
+                click.echo(f"  {label:<18}  (no valid values)")
+                return
+            click.echo(
+                f"  {label:<18}"
+                f"  min={np.min(valid):8.4f}"
+                f"  p25={np.percentile(valid, 25):8.4f}"
+                f"  med={np.median(valid):8.4f}"
+                f"  p75={np.percentile(valid, 75):8.4f}"
+                f"  max={np.max(valid):8.4f}"
+                f"  mean={np.mean(valid):8.4f}"
+            )
+
+        _row("RMS measured [K]",  sci_rms)
+        _row("RMS theoretical [K]", sci_rmsth)
+        _row("RMSRATIOB",          sci_ratio)
+
+        # RMSRATIOB distribution bins
+        thresholds = [1.0, 1.3, 1.5, 2.0, 3.0]
+        valid_ratio = sci_ratio[np.isfinite(sci_ratio)]
+        n_valid_ratio = len(valid_ratio)
+        click.echo(f"\n  RMSRATIOB distribution ({n_valid_ratio} science spectra with valid ratio):")
+        prev = 0.0
+        for thr in thresholds:
+            n_bin = int(np.sum(valid_ratio <= thr)) - int(np.sum(valid_ratio <= prev))
+            cum   = int(np.sum(valid_ratio <= thr))
+            pct   = 100.0 * cum / n_valid_ratio if n_valid_ratio > 0 else 0.0
+            click.echo(f"    <= {thr:.1f} : {cum:6d} cumulative ({pct:5.1f}%)   +{n_bin} in this bin")
+            prev = thr
+        n_above = int(np.sum(valid_ratio > thresholds[-1]))
+        click.echo(f"    >  {thresholds[-1]:.1f} : {n_above:6d} spectra")
+
+        click.echo(sep)
 
         # --- Build output table: same columns as input, add/replace columns ---
         table = Table(data)
         table['RMS']             = rms_measured
         table['RMS_THEORETICAL'] = rms_theoretical
         table['RMSRATIOB']       = rms_ratio    # ratio of measured RMS to theoretical radiometer RMS
-
-        # --- Apply RMSRATIO filter if requested ---
-        # Only science spectra (OBJECT == object_filter) are filtered;
-        # calibration rows (TSYS, TAU_SIG, SKYCHOPDIFF, etc.) are always kept.
-        if filter_threshold is not None:
-            objects_col = np.array([
-                s.decode().strip() if isinstance(s, bytes) else str(s).strip()
-                for s in data['OBJECT']
-            ])
-            is_science = (objects_col == object_filter) if object_filter else np.ones(n_spectra, dtype=bool)
-            keep = np.array(
-                [not is_science[i] or np.isnan(rms_ratio[i]) or rms_ratio[i] <= filter_threshold
-                 for i in range(n_spectra)]
-            )
-            n_science = int(np.sum(is_science))
-            n_removed = int(np.sum(~keep))
-            table = table[keep]
-            click.echo(f"  Filter RMSRATIOB <= {filter_threshold} (science only, {n_science} spectra): "
-                       f"removed {n_removed} ({n_removed/n_science*100:.1f}% of science), "
-                       f"{int(np.sum(keep))} total remaining")
-
-            # Remap TSYS_INDEX / TAU_SIG_INDEX to new row positions after filtering
-            for idx_col in ('TSYS_INDEX', 'TAU_SIG_INDEX'):
-                if idx_col in table.colnames:
-                    old_to_new = np.full(n_spectra, -1, dtype=np.int32)
-                    old_to_new[np.where(keep)[0]] = np.arange(int(np.sum(keep)), dtype=np.int32)
-                    table[idx_col] = np.array([
-                        old_to_new[v] if 0 <= v < n_spectra else -1
-                        for v in table[idx_col]
-                    ], dtype=np.int32)
 
         # Preserve header and write output
         primary = hdul[0].copy()
@@ -3553,6 +3687,11 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, filter
                     new_hdu.header[key] = matrix_hdu.header[key]
                 except (ValueError, KeyError):
                     pass
+
+        # Write median std of science spectra outside the line window as header keyword
+        median_std = float(np.nanmedian(sci_rms[np.isfinite(sci_rms)]))
+        new_hdu.header['STD'] = (median_std, 'Median RMS outside line window [K]')
+        click.echo(f"\n  STD header keyword: {median_std:.6f} K")
 
         import os
         os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)

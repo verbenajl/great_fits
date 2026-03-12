@@ -359,7 +359,8 @@ def _pca_get_decomp(mission_id, telescope, mission_decompositions):
 
 def _pca_apply_correction(spectrum, components, variance_ratio,
                           good_channels_fit, good_channels_sub,
-                          cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size):
+                          cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size,
+                          use_lstsq=False):
     """
     Pure-function PCA correction for one spectrum.
 
@@ -368,7 +369,11 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
     """
     # Fit coefficients
     if not np.all(good_channels_fit):
-        coeff = np.dot(components[:, good_channels_fit], spectrum[good_channels_fit])
+        if use_lstsq:
+            A = components[:, good_channels_fit].T  # [n_good, n_comp]
+            coeff, _, _, _ = np.linalg.lstsq(A, spectrum[good_channels_fit], rcond=None)
+        else:
+            coeff = np.dot(components[:, good_channels_fit], spectrum[good_channels_fit])
     else:
         coeff = np.dot(components, spectrum)
 
@@ -384,20 +389,25 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
 
         scaled_comp = coeff[i] * comp
 
-        # Noise ratio (mirrors PCACorrector.get_noise_ratio)
-        spectrum_std = np.nanstd(spectrum)
-        component_std = np.nanstd(scaled_comp)
+        # Noise ratio: restrict both spectrum and scaled component to the same
+        # masked channels used for fitting — mirrors legacy pca_correct.py and
+        # PCACorrector.get_noise_ratio(precomputed_coeff=..., good_channels=...).
+        spec_masked = spectrum[good_channels_fit]
+        comp_masked = comp[good_channels_fit]
+        component_std = np.nanstd(coeff[i] * comp_masked)
         if smoothing_kernel_size and smoothing_kernel_size > 0:
-            nan_mask = np.isnan(spectrum)
+            nan_mask = np.isnan(spec_masked)
             if np.any(nan_mask):
                 valid_idx = np.where(~nan_mask)[0]
-                s4s = spectrum.copy()
+                s4s = spec_masked.copy()
                 if len(valid_idx) > 0:
-                    s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spectrum[valid_idx])
+                    s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spec_masked[valid_idx])
             else:
-                s4s = spectrum
+                s4s = spec_masked
             kernel = np.ones(smoothing_kernel_size) / smoothing_kernel_size
             spectrum_std = np.nanstd(np.convolve(s4s, kernel, mode='same'))
+        else:
+            spectrum_std = np.nanstd(spec_masked)
         eps = 1e-15
         if np.isnan(spectrum_std) or np.isnan(component_std):
             noise_ratio = np.inf
@@ -435,7 +445,8 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
 
 
 def _init_pca_worker(mission_decompositions, default_components, default_variance_ratio,
-                     cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size):
+                     cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size,
+                     use_lstsq=False):
     """Initializer for PCA correction worker processes."""
     global _pca_worker_state
     _pca_worker_state = {
@@ -445,6 +456,7 @@ def _init_pca_worker(mission_decompositions, default_components, default_varianc
         'cutoff_variance': cutoff_variance,
         'cutoff_noise_ratio': cutoff_noise_ratio,
         'smoothing_kernel_size': smoothing_kernel_size,
+        'use_lstsq': use_lstsq,
     }
 
 
@@ -476,7 +488,8 @@ def _pca_spectrum_worker(args):
 
         corrected, details = _pca_apply_correction(
             spectrum, components, variance_ratio, gcf, gcs,
-            s['cutoff_variance'], s['cutoff_noise_ratio'], s['smoothing_kernel_size']
+            s['cutoff_variance'], s['cutoff_noise_ratio'], s['smoothing_kernel_size'],
+            use_lstsq=s.get('use_lstsq', False),
         )
         details['status'] = 'ok'
         return idx, corrected, details
@@ -488,9 +501,11 @@ def _pca_spectrum_worker(args):
 class PCACorrector:
     """Apply PCA-based correction to spectra in FITS files."""
     
-    def __init__(self, decomposition_pkl, config=None, 
-                 line_kernel_size=51, line_cutoff_std=2.0, 
-                 smoothing_kernel_size=None, line_window_velocities=None):
+    def __init__(self, decomposition_pkl, config=None,
+                 n_components=None,
+                 line_kernel_size=51, line_cutoff_std=2.0,
+                 smoothing_kernel_size=None, line_window_velocities=None,
+                 use_lstsq=False):
         """
         Initialize PCA corrector with decomposition results.
         
@@ -514,6 +529,7 @@ class PCACorrector:
         self.line_cutoff_std = line_cutoff_std
         self.smoothing_kernel_size = smoothing_kernel_size
         self.line_window_velocities = line_window_velocities
+        self.use_lstsq = use_lstsq
         
         self.decomposition = self._load_decomposition(decomposition_pkl)
         self.pca = self.decomposition.pca if hasattr(self.decomposition, 'pca') else None
@@ -534,7 +550,13 @@ class PCACorrector:
             self.components = self.pca.components_
             self.explained_variance_ratio = self.pca.explained_variance_ratio_
         
-        logger.info(f"✓ Loaded PCA with {len(self.components)} components")
+        n_loaded = len(self.components)
+        if n_components is not None and n_components < n_loaded:
+            self.components = self.components[:n_components]
+            self.explained_variance_ratio = self.explained_variance_ratio[:n_components]
+            logger.info(f"✓ Loaded PCA with {n_loaded} components, truncated to {n_components}")
+        else:
+            logger.info(f"✓ Loaded PCA with {n_loaded} components")
         logger.info(f"  Variance explained: {np.sum(self.explained_variance_ratio)*100:.2f}%")
         logger.info(f"  Line detection kernel size: {line_kernel_size}")
         logger.info(f"  Line detection cutoff: {line_cutoff_std} sigma")
@@ -763,104 +785,112 @@ class PCACorrector:
         logger.warning(f"No decomposition found for {mission_id}/{telescope}, using default")
         return None
     
-    def get_noise_ratio(self, spectrum, component, scaled_spectrum=None, smoothing_kernel_size=None):
+    def get_noise_ratio(self, spectrum, component, precomputed_coeff=None,
+                        good_channels=None, scaled_spectrum=None, smoothing_kernel_size=None):
         """
         Calculate noise ratio: noise in spectrum / noise in component.
-        
-        This metric measures the reliability of a component for this spectrum:
-        - noise_ratio = std(spectrum) / std(scaled_component)
-        - Higher values = component explains less signal, more noise-like
-        - Lower values = component explains signal well
-        
-        Optionally applies box-car smoothing to distinguish between noise and signal,
-        following the approach in pca_correct.py lines 939-956.
-        
+
+        Mirrors the legacy pca_correct.py behaviour: both the scaled-component
+        amplitude and the spectrum noise are evaluated on the same masked subset
+        of channels (bad channels + detected science line excluded).  Using the
+        full spectrum for either quantity contaminates the metric with the bright
+        science emission line and produces a noise ratio inconsistent with the
+        coefficient that will actually be subtracted.
+
         Parameters
         ----------
         spectrum : ndarray
-            Original spectrum
+            Original spectrum (full channel range).
         component : ndarray
-            PCA component
+            PCA component (unit-norm, full channel range).
+        precomputed_coeff : float, optional
+            Coefficient already fitted with fit_coefficients() on the masked
+            channels.  When supplied the dot-product is skipped.  Should always
+            be passed from apply_correction() so that the noise-ratio decision
+            is made with the same coefficient that drives the correction.
+        good_channels : ndarray of bool, optional
+            Mask of channels used for fitting (True = use).  Both the spectrum
+            std and the component std are restricted to these channels, matching
+            the legacy ``ma.std(masked_new_spec)`` calculation.  When None the
+            full spectrum is used (legacy fallback for callers that don't supply
+            a mask).
         scaled_spectrum : ndarray, optional
-            Scaled spectrum (if different from original)
+            Unused legacy parameter kept for API compatibility.
         smoothing_kernel_size : int, optional
-            Kernel size for box-car smoothing. If None, no smoothing applied.
-        
+            Box-car kernel size for smoothing the spectrum before computing its
+            std, following pca_correct.py lines 939-956.
+
         Returns
         -------
         float
-            Noise ratio (higher = less reliable component)
+            Noise ratio (higher = less reliable component).
         """
-        if scaled_spectrum is None:
-            scaled_spectrum = spectrum
-        
-        # Calculate scaled component
-        coeff = np.dot(component, scaled_spectrum)
-        scaled_comp = coeff * component
-        
-        # Calculate spectrum std (unsmoothed)
-        spectrum_std = np.nanstd(scaled_spectrum)
-        component_std = np.nanstd(scaled_comp)
-        
-        # Apply smoothing if kernel size provided (like original pca_correct.py)
-        # CRITICAL: Handle NaNs properly - convolve() does NOT ignore NaNs!
+        # Restrict to good channels (excludes bad channels + detected science line)
+        if good_channels is not None and not np.all(good_channels):
+            spec_for_noise = spectrum[good_channels]
+            comp_for_noise = component[good_channels]
+        else:
+            spec_for_noise = spectrum
+            comp_for_noise = component
+
+        # Use the pre-fitted coefficient when available; fall back to recomputing
+        # on the (already restricted) channels.
+        if precomputed_coeff is not None:
+            coeff = precomputed_coeff
+        else:
+            coeff = np.dot(comp_for_noise, spec_for_noise)
+
+        scaled_comp_masked = coeff * comp_for_noise
+        component_std = np.nanstd(scaled_comp_masked)
+
+        # Spectrum std on the masked channels, with optional smoothing
         if smoothing_kernel_size and smoothing_kernel_size > 0:
-            # Replace NaNs with interpolated values before convolution
-            nan_mask = np.isnan(scaled_spectrum)
+            nan_mask = np.isnan(spec_for_noise)
             if np.any(nan_mask):
-                # Interpolate NaNs before smoothing
                 valid_idx = np.where(~nan_mask)[0]
                 if len(valid_idx) > 0:
-                    spectrum_for_smooth = scaled_spectrum.copy()
-                    spectrum_for_smooth[nan_mask] = np.interp(
-                        np.where(nan_mask)[0], 
-                        valid_idx, 
-                        scaled_spectrum[valid_idx]
+                    s4s = spec_for_noise.copy()
+                    s4s[nan_mask] = np.interp(
+                        np.where(nan_mask)[0], valid_idx, spec_for_noise[valid_idx]
                     )
                 else:
-                    # All NaN - can't smooth
-                    spectrum_for_smooth = scaled_spectrum
+                    s4s = spec_for_noise
             else:
-                spectrum_for_smooth = scaled_spectrum
-            
+                s4s = spec_for_noise
             kernel = np.ones(smoothing_kernel_size) / smoothing_kernel_size
-            spectrum_smoothed = np.convolve(spectrum_for_smooth, kernel, mode="same")
-            spectrum_std = np.nanstd(spectrum_smoothed)
-        
-        # Handle edge cases that could produce NaN or inf
+            spectrum_std = np.nanstd(np.convolve(s4s, kernel, mode='same'))
+        else:
+            spectrum_std = np.nanstd(spec_for_noise)
+
+        # Edge-case guards
         if np.isnan(spectrum_std) or np.isnan(component_std):
-            # If either std is NaN, we have bad/masked data (all NaN)
             return np.inf
-        
-        # Prevent division by zero with a minimum threshold
+
         epsilon = 1e-15
         if component_std < epsilon:
-            # Component has negligible amplitude
             return 1e10
-        
         if spectrum_std < epsilon:
-            # Spectrum is essentially flat/zero
             return 1e5
-        
+
         noise_ratio = spectrum_std / component_std
-        
-        # Ensure the result is finite
-        if not np.isfinite(noise_ratio):
-            return 1e10
-        
-        return noise_ratio
+        return noise_ratio if np.isfinite(noise_ratio) else 1e10
     
-    def fit_coefficients(self, spectrum, good_channels=None):
+    def fit_coefficients(self, spectrum, good_channels=None, use_lstsq=False):
         """
         Fit PCA coefficients to a spectrum.
-        
+
         Parameters
         ----------
         spectrum : ndarray
             Input spectrum
         good_channels : ndarray, optional
             Boolean mask of good channels (False = bad)
-        
+        use_lstsq : bool
+            When True and channels are masked, solve via least-squares instead
+            of a plain dot product.  The masked PCA components are no longer
+            orthonormal, so dot product underestimates individual coefficients;
+            least-squares properly deconvolves them.
+
         Returns
         -------
         ndarray
@@ -868,14 +898,15 @@ class PCACorrector:
         """
         if good_channels is None:
             good_channels = np.ones(len(spectrum), dtype=bool)
-        
-        # Fit coefficients using only good channels
-        # Slice both components and spectrum to good channels only
+
         if not np.all(good_channels):
-            # Only use good channels for fitting
-            coeff = np.dot(self.components[:, good_channels], spectrum[good_channels])
+            if use_lstsq:
+                A = self.components[:, good_channels].T  # [n_good, n_comp]
+                coeff, _, _, _ = np.linalg.lstsq(A, spectrum[good_channels], rcond=None)
+            else:
+                coeff = np.dot(self.components[:, good_channels], spectrum[good_channels])
         else:
-            # All channels are good
+            # Full channel set: components are orthonormal, dot product is exact.
             coeff = np.dot(self.components, spectrum)
         
         return coeff
@@ -928,7 +959,7 @@ class PCACorrector:
             good_channels_for_subtraction = good_channels.copy()
         
         # Fit coefficients
-        coeff = self.fit_coefficients(spectrum, good_channels)
+        coeff = self.fit_coefficients(spectrum, good_channels, use_lstsq=self.use_lstsq)
         
         if verbose:
             logger.info(f"  Fitted coefficients: {coeff}")
@@ -954,9 +985,15 @@ class PCACorrector:
                 }
                 continue
             
-            # Calculate noise ratio (with optional smoothing)
+            # Calculate noise ratio using the same coefficient and the same
+            # masked channels as the correction — mirrors legacy pca_correct.py.
             scaled_comp = coeff[i] * comp
-            noise_ratio = self.get_noise_ratio(spectrum, comp, smoothing_kernel_size=smoothing_kernel_size)
+            noise_ratio = self.get_noise_ratio(
+                spectrum, comp,
+                precomputed_coeff=coeff[i],
+                good_channels=good_channels,
+                smoothing_kernel_size=smoothing_kernel_size,
+            )
             
             if verbose:
                 logger.info(f"  Comp {i}: coeff={coeff[i]:.6f}, var_ratio={var_ratio:.6f}, "
@@ -1262,7 +1299,8 @@ class PCACorrector:
                           initargs=(mission_decompositions, self.components,
                                     self.explained_variance_ratio,
                                     cutoff_variance, cutoff_noise_ratio,
-                                    self.smoothing_kernel_size)) as pool:
+                                    self.smoothing_kernel_size,
+                                    self.use_lstsq)) as pool:
                     for idx_r, corrected_r, details_r in pool.imap_unordered(
                             _pca_spectrum_worker, phase1_args, chunksize=chunk):
                         status = None if details_r is None else details_r.get('status', 'ok')
@@ -1510,7 +1548,8 @@ class PCACorrector:
                           initargs=(mission_decompositions, self.components,
                                     self.explained_variance_ratio,
                                     cutoff_variance, cutoff_noise_ratio,
-                                    self.smoothing_kernel_size)) as pool:
+                                    self.smoothing_kernel_size,
+                                    self.use_lstsq)) as pool:
                     for idx_r, corrected_r, details_r in pool.imap_unordered(
                             _pca_spectrum_worker, phase3_args, chunksize=chunk):
                         status = None if details_r is None else details_r.get('status', 'ok')
@@ -2553,6 +2592,20 @@ Examples:
     
     # Correction parameters
     parser.add_argument(
+        '--n-components',
+        type=int,
+        default=None,
+        help='Maximum number of PCA components to use (default: from config [pca][n_components], or all)'
+    )
+    parser.add_argument(
+        '--least-squares',
+        action='store_true',
+        default=False,
+        help='Use least-squares fitting for PCA coefficients instead of dot product. '
+             'More accurate when channels are masked (bad channels + science line), '
+             'because masked PCA components are no longer orthonormal.'
+    )
+    parser.add_argument(
         '--variance-cutoff',
         type=float,
         default=None,
@@ -2691,6 +2744,8 @@ Examples:
     config_object = None
     config_output_file = None
     config_line_window = None
+    config_n_components = None
+    config_use_lstsq = False
     config_variance_cutoff = None
     config_noise_ratio_cutoff = None
     config_line_kernel_size = 51
@@ -2718,7 +2773,20 @@ Examples:
             
             # Get PCA correction parameters from [pca] section
             pca_config = config.get('pca', {})
-            
+
+            # Read n_components
+            n_comp_val = pca_config.get('n_components', None)
+            if n_comp_val is not None:
+                try:
+                    config_n_components = int(n_comp_val)
+                except (ValueError, TypeError):
+                    config_n_components = None
+
+            # Read least_squares
+            ls_val = pca_config.get('least_squares', False)
+            if ls_val and ls_val is not False:
+                config_use_lstsq = bool(ls_val)
+
             # Read cutoff parameters (can be False, float, or int)
             cutoff_val = pca_config.get('cutoff', False)
             if cutoff_val and cutoff_val is not False:
@@ -2772,6 +2840,10 @@ Examples:
                 logger.debug(f"Output FITS file from config: {config_output_file}")
             if config_line_window:
                 logger.debug(f"Line window from config: {config_line_window}")
+            if config_n_components is not None:
+                logger.debug(f"N components from config: {config_n_components}")
+            if config_use_lstsq:
+                logger.debug(f"Least-squares fitting from config: {config_use_lstsq}")
             if config_variance_cutoff is not None:
                 logger.debug(f"Variance cutoff from config: {config_variance_cutoff}")
             if config_noise_ratio_cutoff is not None:
@@ -2905,6 +2977,8 @@ Examples:
         # Resolve final parameter values: CLI args take precedence over config file.
         # This must happen BEFORE constructing PCACorrector so the corrector receives
         # the correct values (previously these merges were done after construction).
+        n_components = args.n_components if args.n_components is not None else config_n_components
+        use_lstsq = args.least_squares or config_use_lstsq  # CLI flag overrides; config sets default
         cutoff_variance = args.variance_cutoff if args.variance_cutoff is not None else config_variance_cutoff
         cutoff_noise_ratio = args.noise_ratio_cutoff if args.noise_ratio_cutoff is not None else config_noise_ratio_cutoff
         line_kernel_size = args.line_kernel_size if args.line_kernel_size != 51 else config_line_kernel_size
@@ -2918,10 +2992,12 @@ Examples:
             # Use single decomposition file
             corrector = PCACorrector(
                 str(decomp_path),
+                n_components=n_components,
                 line_kernel_size=line_kernel_size,
                 line_cutoff_std=line_cutoff_std,
                 smoothing_kernel_size=smoothing_kernel,
-                line_window_velocities=line_window_velocities
+                line_window_velocities=line_window_velocities,
+                use_lstsq=use_lstsq,
             )
             mission_decompositions_to_use = None
         else:
@@ -2946,10 +3022,12 @@ Examples:
             try:
                 corrector = PCACorrector(
                     temp_decomp_path,
+                    n_components=n_components,
                     line_kernel_size=line_kernel_size,
                     line_cutoff_std=line_cutoff_std,
                     smoothing_kernel_size=smoothing_kernel,
-                    line_window_velocities=line_window_velocities
+                    line_window_velocities=line_window_velocities,
+                    use_lstsq=use_lstsq,
                 )
             finally:
                 # Clean up temp file
@@ -2964,6 +3042,7 @@ Examples:
         logger.info(f"  Line kernel size: {line_kernel_size}")
         logger.info(f"  Line cutoff std: {line_cutoff_std}")
         logger.info(f"  Smoothing kernel: {smoothing_kernel}")
+        logger.info(f"  Least-squares fitting: {use_lstsq}")
         
         stats = corrector.correct_fits_file(
             input_fits=str(input_path),

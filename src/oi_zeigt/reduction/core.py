@@ -457,7 +457,7 @@ def analyze_spectrum_values(hdul: fits.HDUList, sample_size: int = 100) -> dict:
     return analysis
 
 
-def filter_and_save_fits(hdul: fits.HDUList, 
+def filter_and_save_fits(hdul: fits.HDUList,
                         object_name: str,
                         nan_threshold: float = 0.20,
                         output_clean: Optional[Union[str, Path]] = None,
@@ -465,7 +465,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
                         remove_column: Optional[str] = None,
                         remove_values: Optional[list] = None,
                         apply_to_all: bool = False,
-                        filter_zero_spectra: bool = False) -> Tuple[Path, Path]:
+                        filter_zero_spectra: bool = False,
+                        param_filters: Optional[list] = None) -> Tuple[Path, Path]:
     """
     Filter FITS data by object and NaN content, with optional column value removal and zero-spectrum filtering.
     
@@ -511,6 +512,13 @@ def filter_and_save_fits(hdul: fits.HDUList,
         If True, also filter out spectra where all channels are 0.
         These spectra are moved to the rejected file.
         Default: False (keep zero spectra).
+    param_filters : list of tuples, optional
+        List of ``(column, direction, value)`` filter conditions, where
+        ``direction`` is ``'below'`` (keep rows where column >= value) or
+        ``'above'`` (keep rows where column <= value).
+        Rows with non-finite values in the filter column always pass.
+        All conditions are ANDed together.
+        Example: ``[('RMSRATIOB', 'below', 2.0), ('RMSRATIOB', 'above', 0.5)]``
     
     Returns
     -------
@@ -579,7 +587,35 @@ def filter_and_save_fits(hdul: fits.HDUList,
     # Concatenate all data
     data = np.concatenate(all_data)
     
-    # Apply removal filter FIRST if specified (before object separation)
+    # Apply param_filters (--filter-below / --filter-above) before other filtering.
+    # Rows with non-finite values in the filter column always pass.
+    param_rejected_data = np.array([])
+    param_rejected_count = 0
+    param_filter_details = []  # list of (col, direction, value, n_removed) per condition
+    if param_filters:
+        keep_mask = np.ones(len(data), dtype=bool)
+        for col, direction, value in param_filters:
+            if col not in data.dtype.names:
+                raise ValueError(f"Filter column '{col}' not found in FITS data")
+            col_vals = np.array([
+                float(row[col]) if np.isfinite(float(row[col])) else np.nan
+                for row in data
+            ], dtype=np.float64)
+            finite = np.isfinite(col_vals)
+            if direction == 'below':
+                # keep rows where col <= value (or NaN)
+                cond_mask = (~finite) | (col_vals <= value)
+            else:  # 'above'
+                # keep rows where col >= value (or NaN)
+                cond_mask = (~finite) | (col_vals >= value)
+            n_removed_by_cond = int(np.sum(keep_mask & ~cond_mask))
+            param_filter_details.append((col, direction, value, n_removed_by_cond))
+            keep_mask &= cond_mask
+        param_rejected_data = data[~keep_mask]
+        param_rejected_count = int(np.sum(~keep_mask))
+        data = data[keep_mask]
+
+    # Apply removal filter if specified (before object separation)
     removed_data = np.array([])  # Track removed rows for rejected file
     if remove_column and remove_values:
         if remove_column not in data.dtype.names:
@@ -692,6 +728,10 @@ def filter_and_save_fits(hdul: fits.HDUList,
             # Keep only non-zero spectra in clean file
             clean_combined = clean_combined[~zero_mask]
     
+    # Merge param_rejected_data into all_rejected
+    if param_rejected_count > 0:
+        all_rejected = np.concatenate([all_rejected, param_rejected_data]) if len(all_rejected) > 0 else param_rejected_data
+
     # Set default output paths
     if output_clean is None:
         output_clean = Path("clean_data.fits")
@@ -756,7 +796,9 @@ def filter_and_save_fits(hdul: fits.HDUList,
         'rejected_total': len(all_rejected),
         'rejected_nan': nan_rejected_count,
         'rejected_zero': zero_rejected_count,
-        'rejected_removed': removed_count
+        'rejected_removed': removed_count,
+        'rejected_param': param_rejected_count,
+        'param_filter_details': param_filter_details,
     }
     
     return output_clean, output_rejected, stats
@@ -1553,6 +1595,21 @@ def reduce_spectra(hdul: fits.HDUList,
                 new_hdu.header[key] = matrix_hdu.header[key]
             except (ValueError, KeyError):
                 pass
+
+    # Recalculate CRPIX1 to account for channel extraction and/or decimation.
+    # Original CRPIX1 is 1-indexed; convert to 0-based, apply shifts, convert back.
+    if '_extract_ch_min' in methods or '_decimate_factor' in methods:
+        old_crpix1 = float(new_hdu.header.get('CRPIX1', 1.0))
+        # Convert to 0-based index
+        ref_ch = old_crpix1 - 1.0
+        # Shift for channel extraction: reference channel moves left by ch_min
+        if '_extract_ch_min' in methods:
+            ref_ch -= methods['_extract_ch_min']
+        # Scale for decimation: reference channel index divides by factor
+        if '_decimate_factor' in methods:
+            ref_ch /= methods['_decimate_factor']
+        # Convert back to 1-based FITS pixel
+        new_hdu.header['CRPIX1'] = ref_ch + 1.0
 
     new_hdul = fits.HDUList([primary, new_hdu])
 
