@@ -360,7 +360,8 @@ def _pca_get_decomp(mission_id, telescope, mission_decompositions):
 def _pca_apply_correction(spectrum, components, variance_ratio,
                           good_channels_fit, good_channels_sub,
                           cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size,
-                          use_lstsq=False):
+                          use_lstsq=False, per_component_cutoffs=None,
+                          cut_coefficients=0):
     """
     Pure-function PCA correction for one spectrum.
 
@@ -378,36 +379,56 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
         coeff = np.dot(components, spectrum)
 
     corrected = spectrum.copy()
-    used_components = []
     component_info = {}
 
+    # Pre-compute spectrum_std once (used identically for every component).
+    spec_masked = spectrum[good_channels_fit]
+    if smoothing_kernel_size and smoothing_kernel_size > 0:
+        sk = np.ones(smoothing_kernel_size) / smoothing_kernel_size
+        nan_mask = np.isnan(spec_masked)
+        if np.any(nan_mask):
+            valid_idx = np.where(~nan_mask)[0]
+            s4s = spec_masked.copy()
+            if len(valid_idx) > 0:
+                s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spec_masked[valid_idx])
+        else:
+            s4s = spec_masked
+        spectrum_std = np.nanstd(np.convolve(s4s, sk, mode='same'))
+    else:
+        spectrum_std = np.nanstd(spec_masked)
+
+    # Pass 1: apply all cutoffs (variance, coefficient, noise ratio) using the
+    # original coefficients from the full-set fit.  Collect the smoothed
+    # components that survive into `survivors` — do NOT subtract yet.
+    #
+    # After pass 1 we re-fit the coefficients using ONLY the surviving
+    # components (matches original pyclass lines 1505–1514), then subtract
+    # in pass 2.  Re-fitting gives a more accurate projection onto the subset
+    # actually being subtracted (smoothed components are not orthonormal).
+    survivors = []  # list of (original_index, smoothed_comp, var_ratio, noise_ratio)
+
     for i, (comp, var_ratio) in enumerate(zip(components, variance_ratio)):
-        if cutoff_variance is not None and var_ratio < cutoff_variance:
+        # Variance cutoff: skip if component explains too little variance.
+        if cutoff_variance is not None and var_ratio <= cutoff_variance:
             component_info[i] = {'used': False, 'reason': 'variance_cutoff',
                                  'coeff': coeff[i], 'variance': var_ratio}
             continue
 
-        scaled_comp = coeff[i] * comp
+        # Coefficient cutoff: skip if projection onto this spectrum is negligible.
+        # Uses original (full-set) coefficient — matches original pyclass.
+        if cut_coefficients and abs(coeff[i]) < float(cut_coefficients):
+            component_info[i] = {'used': False, 'reason': 'cut_coefficients',
+                                 'coeff': coeff[i], 'variance': var_ratio}
+            continue
 
-        # Noise ratio: restrict both spectrum and scaled component to the same
-        # masked channels used for fitting — mirrors legacy pca_correct.py and
-        # PCACorrector.get_noise_ratio(precomputed_coeff=..., good_channels=...).
-        spec_masked = spectrum[good_channels_fit]
-        comp_masked = comp[good_channels_fit]
-        component_std = np.nanstd(coeff[i] * comp_masked)
+        # Smooth component — matches original pyclass smooth_pca_components().
+        # Done at correction time so kernel can be varied without re-decomposing.
         if smoothing_kernel_size and smoothing_kernel_size > 0:
-            nan_mask = np.isnan(spec_masked)
-            if np.any(nan_mask):
-                valid_idx = np.where(~nan_mask)[0]
-                s4s = spec_masked.copy()
-                if len(valid_idx) > 0:
-                    s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spec_masked[valid_idx])
-            else:
-                s4s = spec_masked
-            kernel = np.ones(smoothing_kernel_size) / smoothing_kernel_size
-            spectrum_std = np.nanstd(np.convolve(s4s, kernel, mode='same'))
-        else:
-            spectrum_std = np.nanstd(spec_masked)
+            comp = np.convolve(comp, sk, mode='same')
+
+        # Noise ratio: component_std on ALL channels (matches original pyclass).
+        # spectrum_std already computed above (shared across all components).
+        component_std = np.nanstd(coeff[i] * comp)
         eps = 1e-15
         if np.isnan(spectrum_std) or np.isnan(component_std):
             noise_ratio = np.inf
@@ -425,16 +446,44 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
                                  'coeff': coeff[i], 'noise_ratio': noise_ratio}
             continue
 
-        if cutoff_noise_ratio is not None and noise_ratio > cutoff_noise_ratio:
+        # Noise ratio cutoff: per_component_cutoffs (KDE) takes precedence.
+        if per_component_cutoffs is not None:
+            comp_cutoff = per_component_cutoffs[i] if i < len(per_component_cutoffs) else np.inf
+            if np.isnan(comp_cutoff):
+                component_info[i] = {'used': False, 'reason': 'global_noise_ratio_cutoff',
+                                     'coeff': coeff[i], 'noise_ratio': noise_ratio}
+                continue
+            effective_cutoff = comp_cutoff if np.isfinite(comp_cutoff) else None
+        else:
+            effective_cutoff = cutoff_noise_ratio
+
+        if effective_cutoff is not None and noise_ratio > effective_cutoff:
             component_info[i] = {'used': False, 'reason': 'noise_ratio_cutoff',
                                  'coeff': coeff[i], 'noise_ratio': noise_ratio}
             continue
 
-        corrected[good_channels_sub] -= scaled_comp[good_channels_sub]
-        used_components.append(i)
-        component_info[i] = {'used': True, 'coeff': coeff[i],
-                             'variance': var_ratio, 'noise_ratio': noise_ratio}
+        survivors.append((i, comp, var_ratio, noise_ratio))
 
+    # Re-fit coefficients using ONLY the surviving (smoothed) components.
+    # Matches original pyclass: after filtering, project spectrum onto the
+    # selected subset rather than using the full-set coefficients.
+    # For orthonormal components this is equivalent, but after smoothing the
+    # components are no longer orthonormal so re-fitting is more accurate.
+    if survivors:
+        surv_comps = np.array([comp for _, comp, _, _ in survivors])
+        if use_lstsq:
+            A = surv_comps[:, good_channels_fit].T
+            refit_coeff, _, _, _ = np.linalg.lstsq(A, spectrum[good_channels_fit], rcond=None)
+        else:
+            refit_coeff = np.dot(surv_comps[:, good_channels_fit], spectrum[good_channels_fit])
+
+        # Pass 2: subtract using re-fitted coefficients.
+        for j, (i, comp, var_ratio, noise_ratio) in enumerate(survivors):
+            corrected[good_channels_sub] -= refit_coeff[j] * comp[good_channels_sub]
+            component_info[i] = {'used': True, 'coeff': refit_coeff[j],
+                                 'variance': var_ratio, 'noise_ratio': noise_ratio}
+
+    used_components = [i for i, *_ in survivors]
     details = {
         'coefficients': coeff,
         'n_components_used': len(used_components),
@@ -444,9 +493,211 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
     return corrected, details
 
 
+def _compute_group_noise_ratios(spectra, good_channels_list, components, smoothing_kernel_size):
+    """
+    Compute (n_spectra × n_components) noise ratio matrix for a group.
+
+    For each spectrum, for each component: compute coeff, optionally smooth the
+    component, then compute noise_ratio = spectrum_std / component_std.
+    component_std uses ALL channels (matches original pyclass); spectrum_std uses
+    only the good (baseline) channels, optionally smoothed.
+    """
+    n_spectra = len(spectra)
+    n_components = len(components)
+    noise_ratios = np.full((n_spectra, n_components), np.nan)
+
+    for s_idx, (spectrum, gcf) in enumerate(zip(spectra, good_channels_list)):
+        if not np.any(gcf):
+            continue
+        coeff = np.dot(components[:, gcf], spectrum[gcf]) if not np.all(gcf) else np.dot(components, spectrum)
+        spec_masked = spectrum[gcf]
+
+        sk = None
+        if smoothing_kernel_size and smoothing_kernel_size > 0:
+            sk = np.ones(smoothing_kernel_size) / smoothing_kernel_size
+
+        for i, comp in enumerate(components):
+            comp_w = np.convolve(comp, sk, mode='same') if sk is not None else comp
+            component_std = np.nanstd(coeff[i] * comp_w)
+
+            if sk is not None:
+                nan_mask = np.isnan(spec_masked)
+                s4s = spec_masked.copy()
+                if np.any(nan_mask):
+                    valid_idx = np.where(~nan_mask)[0]
+                    if len(valid_idx) > 0:
+                        s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spec_masked[valid_idx])
+                spectrum_std = np.nanstd(np.convolve(s4s, sk, mode='same'))
+            else:
+                spectrum_std = np.nanstd(spec_masked)
+
+            eps = 1e-15
+            if not np.isfinite(component_std) or component_std < eps:
+                nr = np.nan
+            elif spectrum_std < eps:
+                nr = 1e5
+            else:
+                nr = spectrum_std / component_std
+            noise_ratios[s_idx, i] = nr
+
+    return noise_ratios
+
+
+def _fit_kde_to_noise_ratios(noise_ratio_matrix):
+    """
+    Fit KDE + Gaussian to noise ratio distribution per component.
+    Port of derive_noise_ratio_cutoff() from pca_utilities.py.
+
+    Returns dict {comp_idx: (amplitude, center, dev, X_plot, log_dens, indexes, gaussian_width)}
+    or None if KDE libraries are unavailable.
+    """
+    try:
+        import peakutils
+        from sklearn.neighbors import KernelDensity
+        from scipy.optimize import curve_fit
+    except ImportError as e:
+        logger.warning(f"KDE fitting unavailable ({e}); falling back to simple threshold")
+        return None
+
+    def _gauss(x, ampl, center, dev):
+        return ampl * np.exp(-((x - center) ** 2) / (2 * dev ** 2))
+
+    n_components = noise_ratio_matrix.shape[1]
+    kde_params = {}
+
+    for i in range(n_components):
+        col = noise_ratio_matrix[:, i]
+        col = np.abs(col[np.isfinite(col)])
+
+        if len(col) < 3:
+            kde_params[i] = (None, None, None, None, None, [], None)
+            continue
+
+        X = col[:, np.newaxis]
+        X_plot = np.linspace(0, 60, 60)[:, np.newaxis]
+        kde = KernelDensity(kernel='gaussian', bandwidth=1.5).fit(X)
+        log_dens = kde.score_samples(X_plot)
+        indexes = peakutils.indexes(np.exp(log_dens))
+
+        amplitude, center, dev, gaussian_width = None, None, None, None
+        if len(indexes) > 0:
+            gaussian_width = 2
+            first_index = int(indexes[0])
+            sl = slice(max(0, first_index - gaussian_width), first_index + gaussian_width + 1)
+            try:
+                params, _ = curve_fit(
+                    _gauss, X_plot[:, 0][sl], np.exp(log_dens[sl]),
+                    p0=[np.exp(log_dens[sl]).max(), X_plot[:, 0][first_index], float(gaussian_width)],
+                    maxfev=1000,
+                )
+                amplitude, center, dev = float(params[0]), float(params[1]), float(params[2])
+            except Exception:
+                pass
+
+        kde_params[i] = (amplitude, center, dev, X_plot, log_dens, indexes, gaussian_width)
+
+    return kde_params
+
+
+def _derive_component_cutoffs(kde_params, global_noise_ratio_cutoff, noise_ratio_cutoff):
+    """
+    Derive per-component noise ratio cutoffs from KDE fit parameters.
+    Port of should_component_be_used() from pca_utilities.py.
+
+    Returns numpy array of length n_components:
+      np.nan  → globally reject this component (KDE peak > global_noise_ratio_cutoff)
+      np.inf  → no noise ratio cutoff (always use component)
+      float   → adaptive cutoff value; skip component if noise_ratio > value
+    """
+    n_components = len(kde_params)
+    cutoffs = np.full(n_components, np.inf)
+
+    for i in range(n_components):
+        amplitude, center, dev, X_plot, log_dens, indexes, gaussian_width = kde_params[i]
+
+        use_component = True
+        cutoff_value = None
+
+        if center is not None and global_noise_ratio_cutoff:
+            use_component = center < float(global_noise_ratio_cutoff)
+            if use_component and dev is not None:
+                cutoff_value = center + 3.0 * abs(dev)
+
+        if not use_component:
+            cutoffs[i] = np.nan          # globally skip
+        elif noise_ratio_cutoff and float(noise_ratio_cutoff) != 0:
+            cutoffs[i] = float(noise_ratio_cutoff)   # user-specified fixed cutoff
+        elif cutoff_value is not None:
+            cutoffs[i] = cutoff_value    # KDE-derived adaptive cutoff
+        # else: np.inf (no cutoff)
+
+    return cutoffs
+
+
+def _plot_kde_noise_ratios(kde_params, component_cutoffs, output_path, group_label=''):
+    """
+    Save diagnostic histogram plot of noise ratio KDE distributions per component.
+    Port of plot_histogram() from pca_correct.py.
+    """
+    import math as _math
+
+    n_comp = len(kde_params)
+    if n_comp == 0:
+        return
+
+    n_cols = max(1, _math.ceil(_math.sqrt(n_comp)))
+    n_rows = max(1, _math.ceil(n_comp / n_cols))
+    fig = Figure(figsize=(5 * n_cols, 4 * n_rows))
+    fig.suptitle(f'Noise ratio KDE per component  {group_label}', fontsize=10)
+
+    def _gauss(x, a, c, d):
+        return a * np.exp(-((x - c) ** 2) / (2 * d ** 2))
+
+    for i in range(n_comp):
+        amplitude, center, dev, X_plot, log_dens, indexes, gaussian_width = kde_params[i]
+        ax = fig.add_subplot(n_rows, n_cols, i + 1)
+        ax.set_title(f'Component {i + 1}', fontsize=8)
+
+        if X_plot is None or log_dens is None:
+            ax.text(0.5, 0.5, 'no data', ha='center', va='center', transform=ax.transAxes)
+            continue
+
+        ax.plot(X_plot[:, 0], np.exp(log_dens), '-', lw=1.5, label='KDE')
+
+        if (center is not None and dev is not None
+                and gaussian_width is not None and len(indexes) > 0):
+            first_index = int(indexes[0])
+            sl = slice(max(0, first_index - gaussian_width), first_index + gaussian_width + 1)
+            try:
+                ax.plot(
+                    X_plot[:, 0][sl],
+                    _gauss(X_plot[:, 0][sl], amplitude, center, dev),
+                    '--', lw=1, color='orange',
+                    label=f'Gauss c={center:.1f} σ={abs(dev):.1f}',
+                )
+            except Exception:
+                pass
+
+        cutoff = component_cutoffs[i] if i < len(component_cutoffs) else np.inf
+        if np.isnan(cutoff):
+            ax.set_facecolor('#ffeeee')
+            ax.text(0.05, 0.9, 'globally rejected', transform=ax.transAxes,
+                    fontsize=7, color='red')
+        elif np.isfinite(cutoff):
+            ax.axvline(cutoff, color='red', lw=1.5, linestyle='--',
+                       label=f'cutoff={cutoff:.1f}')
+
+        ax.legend(fontsize=6)
+        ax.set_xlabel('noise ratio', fontsize=7)
+
+    fig.tight_layout()
+    FigureCanvasAgg(fig).print_figure(str(output_path), dpi=100)
+    logger.info(f"  Saved KDE noise ratio plot: {output_path}")
+
+
 def _init_pca_worker(mission_decompositions, default_components, default_variance_ratio,
                      cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size,
-                     use_lstsq=False):
+                     use_lstsq=False, cut_coefficients=0):
     """Initializer for PCA correction worker processes."""
     global _pca_worker_state
     _pca_worker_state = {
@@ -457,6 +708,7 @@ def _init_pca_worker(mission_decompositions, default_components, default_varianc
         'cutoff_noise_ratio': cutoff_noise_ratio,
         'smoothing_kernel_size': smoothing_kernel_size,
         'use_lstsq': use_lstsq,
+        'cut_coefficients': cut_coefficients,
     }
 
 
@@ -469,7 +721,9 @@ def _pca_spectrum_worker(args):
       - details['status']=='ok'   → successful correction
       - details['status']!='ok'   → skip (bad channels or exception), corrected=original
     """
-    idx, spectrum, gcf, gcs, mission_id, telescope = args
+    args_base = args[:6]
+    idx, spectrum, gcf, gcs, mission_id, telescope = args_base
+    per_component_cutoffs = args[6] if len(args) > 6 else None
     s = _pca_worker_state
     try:
         if s['mission_decompositions'] and mission_id is not None:
@@ -490,6 +744,8 @@ def _pca_spectrum_worker(args):
             spectrum, components, variance_ratio, gcf, gcs,
             s['cutoff_variance'], s['cutoff_noise_ratio'], s['smoothing_kernel_size'],
             use_lstsq=s.get('use_lstsq', False),
+            per_component_cutoffs=per_component_cutoffs,
+            cut_coefficients=s.get('cut_coefficients', 0),
         )
         details['status'] = 'ok'
         return idx, corrected, details
@@ -974,7 +1230,7 @@ class PCACorrector:
         for i, (comp, var_ratio) in enumerate(zip(self.components, 
                                                    self.explained_variance_ratio)):
             # Check variance cutoff
-            if cutoff_variance is not None and var_ratio < cutoff_variance:
+            if cutoff_variance is not None and var_ratio <= cutoff_variance:
                 if verbose:
                     logger.info(f"  Skip comp {i}: variance {var_ratio:.4f} < {cutoff_variance}")
                 component_info[i] = {
@@ -1055,7 +1311,8 @@ class PCACorrector:
                          output_dir='output/pca_corrected', config_window=None,
                          detect_science_lines=True, scan_filter=None, subscan_filter=None,
                          telescope_filter=None, mission_id_filter=None, mission_decompositions=None,
-                     n_jobs=1):
+                         n_jobs=1, global_noise_ratio_cutoff=None,
+                         cut_coefficients=0):
         """
         Correct all spectra in a FITS file.
         
@@ -1300,7 +1557,7 @@ class PCACorrector:
                                     self.explained_variance_ratio,
                                     cutoff_variance, cutoff_noise_ratio,
                                     self.smoothing_kernel_size,
-                                    self.use_lstsq)) as pool:
+                                    self.use_lstsq, cut_coefficients)) as pool:
                     for idx_r, corrected_r, details_r in pool.imap_unordered(
                             _pca_spectrum_worker, phase1_args, chunksize=chunk):
                         status = None if details_r is None else details_r.get('status', 'ok')
@@ -1518,6 +1775,77 @@ class PCACorrector:
                             except Exception as e:
                                 logger.debug(f"Re-correction iteration {iteration + 1} failed for spectrum {idx}: {e}")
             
+            # Step 2.5: KDE noise ratio fitting (when global_noise_ratio_cutoff is set).
+            # For each group, build noise ratio matrix → fit KDE → derive per-component cutoffs.
+            # When global_noise_ratio_cutoff is not set, per_spectrum_cutoffs stays None and
+            # the existing simple cutoff_noise_ratio threshold is used in phase 3 (backward compat).
+            per_spectrum_cutoffs = [None] * len(indices)
+            if global_noise_ratio_cutoff:
+                logger.info("STEP 2.5: KDE noise ratio fitting per group")
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                for group_row in unique_groups:
+                    mission_id_group, telescope_group, scan_id, subscan_id = group_row
+                    group_mask = (
+                        (mission_ids == mission_id_group) &
+                        (telescopes == telescope_group) &
+                        (scans == scan_id) &
+                        (subscans == subscan_id)
+                    )
+                    group_local_indices = np.where(group_mask)[0]
+                    if len(group_local_indices) == 0:
+                        continue
+
+                    # Collect spectra and channel masks for this group
+                    group_spectra = []
+                    group_gcf = []
+                    for local_idx in group_local_indices:
+                        global_idx = indices[local_idx]
+                        spectrum_g = np.array(data[spectrum_col][global_idx], dtype=float)
+                        bad_g = np.isnan(spectrum_g) | np.isinf(spectrum_g) | (spectrum_g == 0)
+                        gcf_g = ~bad_g
+                        if detected_lines_mask is not None and np.any(detected_lines_mask):
+                            gcf_g = gcf_g & ~detected_lines_mask[local_idx]
+                        if telluric_line_mask is not None:
+                            gcf_g = gcf_g & ~telluric_line_mask[min(local_idx, len(telluric_line_mask) - 1)]
+                        group_spectra.append(spectrum_g)
+                        group_gcf.append(gcf_g)
+
+                    # Select components for this group
+                    group_components = self.components
+                    if mission_decompositions:
+                        decomp_g = self.get_decomposition_for_mission(
+                            mission_id_group, telescope_group, mission_decompositions)
+                        if decomp_g is not None:
+                            group_components = decomp_g.components
+
+                    # Compute noise ratio matrix, fit KDE, derive cutoffs
+                    nr_matrix = _compute_group_noise_ratios(
+                        group_spectra, group_gcf, group_components, self.smoothing_kernel_size)
+                    kde_params = _fit_kde_to_noise_ratios(nr_matrix)
+
+                    if kde_params is not None:
+                        component_cutoffs = _derive_component_cutoffs(
+                            kde_params, global_noise_ratio_cutoff, cutoff_noise_ratio)
+                        group_label = (f"{mission_id_group}_{telescope_group}"
+                                       f"_scan{scan_id}_sub{subscan_id}")
+                        logger.info(f"  {group_label}: per-component cutoffs = {component_cutoffs}")
+
+                        if generate_plots:
+                            kde_plot_path = (Path(output_dir) /
+                                             f"kde_noise_ratios_{group_label}.png")
+                            try:
+                                _plot_kde_noise_ratios(
+                                    kde_params, component_cutoffs, kde_plot_path, group_label)
+                            except Exception as e:
+                                logger.warning(f"  KDE plot failed for {group_label}: {e}")
+
+                        for local_idx in group_local_indices:
+                            per_spectrum_cutoffs[local_idx] = component_cutoffs
+                    else:
+                        logger.warning(f"  KDE fitting failed for group "
+                                       f"{mission_id_group}/{telescope_group}/scan{scan_id} "
+                                       f"— falling back to simple threshold")
+
             # Step 3: Final correction with detected lines excluded from fitting
             logger.info("STEP 3: Final correction with detected lines excluded from fitting")
             
@@ -1541,7 +1869,8 @@ class PCACorrector:
                         telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
                         gcf = gcf & ~telluric_regions
                         # gcs NOT modified (legacy: telluric excluded from fitting only)
-                    phase3_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s))
+                    phase3_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s,
+                                        per_spectrum_cutoffs[spec_idx]))
                 from multiprocessing import Pool
                 chunk = max(1, len(phase3_args) // (n_workers * 4))
                 with Pool(processes=n_workers, initializer=_init_pca_worker,
@@ -1549,7 +1878,7 @@ class PCACorrector:
                                     self.explained_variance_ratio,
                                     cutoff_variance, cutoff_noise_ratio,
                                     self.smoothing_kernel_size,
-                                    self.use_lstsq)) as pool:
+                                    self.use_lstsq, cut_coefficients)) as pool:
                     for idx_r, corrected_r, details_r in pool.imap_unordered(
                             _pca_spectrum_worker, phase3_args, chunksize=chunk):
                         status = None if details_r is None else details_r.get('status', 'ok')
@@ -1621,14 +1950,18 @@ class PCACorrector:
                             continue
 
                         # Final correction with detected lines excluded from fitting
-                        corrected, details = self.apply_correction(
-                            spectrum,
-                            good_channels=good_channels_for_fitting,
-                            good_channels_for_subtraction=good_channels_for_subtraction,
-                            cutoff_variance=cutoff_variance,
-                            cutoff_noise_ratio=cutoff_noise_ratio,
-                            verbose=(spec_idx < 3),  # Log first 3 spectra
-                            smoothing_kernel_size=self.smoothing_kernel_size
+                        corrected, details = _pca_apply_correction(
+                            np.array(spectrum, dtype=float),
+                            self.components,
+                            self.explained_variance_ratio,
+                            good_channels_for_fitting,
+                            good_channels_for_subtraction,
+                            cutoff_variance,
+                            cutoff_noise_ratio,
+                            self.smoothing_kernel_size,
+                            use_lstsq=self.use_lstsq,
+                            per_component_cutoffs=per_spectrum_cutoffs[spec_idx],
+                            cut_coefficients=cut_coefficients,
                         )
 
                         corrected_spectra[idx] = corrected
@@ -2618,6 +2951,20 @@ Examples:
         help='Skip components where noise_ratio > this threshold'
     )
     parser.add_argument(
+        '--global-noise-ratio-cutoff',
+        type=float,
+        default=None,
+        dest='global_noise_ratio_cutoff',
+        help='Enable KDE-based per-group component selection: reject a component globally if its KDE peak > this value'
+    )
+    parser.add_argument(
+        '--cut-coefficients',
+        type=float,
+        default=None,
+        dest='cut_coefficients',
+        help='Skip component if |coeff| < this value (0 = disabled, matches original pyclass cut_coefficients)'
+    )
+    parser.add_argument(
         '--object',
         type=str,
         default=None,
@@ -2748,6 +3095,8 @@ Examples:
     config_use_lstsq = False
     config_variance_cutoff = None
     config_noise_ratio_cutoff = None
+    config_global_noise_ratio_cutoff = None
+    config_cut_coefficients = 0
     config_line_kernel_size = 51
     config_line_cutoff_std = 2.0
     config_smoothing_kernel = None
@@ -2802,12 +3151,13 @@ Examples:
                 except (ValueError, TypeError):
                     config_noise_ratio_cutoff = None
             
-            # NOTE: global_noise_ratio_cutoff in the original pca_correct.py triggers a sophisticated
-            # Gaussian-based component selection algorithm, NOT a direct threshold cutoff.
-            # For now, we don't use it automatically. To enable component filtering, users should
-            # explicitly set 'noise_ratio_cutoff' (direct threshold) or provide --noise-ratio-cutoff CLI arg.
-            # global_noise_ratio = pca_config.get('global_noise_ratio_cutoff', False)
-            # For now, leave config_noise_ratio_cutoff as None to use all components by default.
+            global_noise_ratio_val = pca_config.get('global_noise_ratio_cutoff', False)
+            config_global_noise_ratio_cutoff = None
+            if global_noise_ratio_val and global_noise_ratio_val is not False:
+                try:
+                    config_global_noise_ratio_cutoff = float(global_noise_ratio_val)
+                except (ValueError, TypeError):
+                    config_global_noise_ratio_cutoff = None
             
             # Read line detection parameters
             line_kernel_val = pca_config.get('line_kernel_size', 51)
@@ -2830,6 +3180,13 @@ Examples:
                     config_smoothing_kernel = int(smoothing_val)
                 except (ValueError, TypeError):
                     config_smoothing_kernel = None
+
+            cut_coeff_val = pca_config.get('cut_coefficients', False)
+            if cut_coeff_val and cut_coeff_val is not False:
+                try:
+                    config_cut_coefficients = float(cut_coeff_val)
+                except (ValueError, TypeError):
+                    config_cut_coefficients = 0
             
             logger.debug(f"PCA plots directory from config: {config_plot_dir}")
             if config_input_file:
@@ -2981,9 +3338,13 @@ Examples:
         use_lstsq = args.least_squares or config_use_lstsq  # CLI flag overrides; config sets default
         cutoff_variance = args.variance_cutoff if args.variance_cutoff is not None else config_variance_cutoff
         cutoff_noise_ratio = args.noise_ratio_cutoff if args.noise_ratio_cutoff is not None else config_noise_ratio_cutoff
+        global_noise_ratio_cutoff = (args.global_noise_ratio_cutoff
+                                     if hasattr(args, 'global_noise_ratio_cutoff') and args.global_noise_ratio_cutoff is not None
+                                     else config_global_noise_ratio_cutoff)
         line_kernel_size = args.line_kernel_size if args.line_kernel_size != 51 else config_line_kernel_size
         line_cutoff_std = args.line_cutoff_std if args.line_cutoff_std != 2.0 else config_line_cutoff_std
         smoothing_kernel = args.smoothing_kernel if args.smoothing_kernel is not None else config_smoothing_kernel
+        cut_coefficients = args.cut_coefficients if args.cut_coefficients is not None else config_cut_coefficients
 
         # Get line_window from [reduction] section (already extracted above)
         line_window_velocities = tuple(config_line_window) if config_line_window else None
@@ -3043,12 +3404,15 @@ Examples:
         logger.info(f"  Line cutoff std: {line_cutoff_std}")
         logger.info(f"  Smoothing kernel: {smoothing_kernel}")
         logger.info(f"  Least-squares fitting: {use_lstsq}")
-        
+        logger.info(f"  Cut coefficients: {cut_coefficients}")
+
         stats = corrector.correct_fits_file(
             input_fits=str(input_path),
             output_fits=output_file,
             cutoff_variance=cutoff_variance,
             cutoff_noise_ratio=cutoff_noise_ratio,
+            global_noise_ratio_cutoff=global_noise_ratio_cutoff,
+            cut_coefficients=cut_coefficients,
             hdu_index=args.hdu,
             spectrum_col=args.spectrum_column,
             object_filter=object_filter,

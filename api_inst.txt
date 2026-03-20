@@ -1,0 +1,1 @@
+DATA_DIR=/home/diskB/data_soft/m51/processed_fits uvicorn main:app --port 8000

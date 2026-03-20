@@ -466,7 +466,9 @@ def filter_and_save_fits(hdul: fits.HDUList,
                         remove_values: Optional[list] = None,
                         apply_to_all: bool = False,
                         filter_zero_spectra: bool = False,
-                        param_filters: Optional[list] = None) -> Tuple[Path, Path]:
+                        param_filters: Optional[list] = None,
+                        spectrum_peak_threshold: Optional[float] = None,
+                        filter_tau: bool = False) -> Tuple[Path, Path]:
     """
     Filter FITS data by object and NaN content, with optional column value removal and zero-spectrum filtering.
     
@@ -586,151 +588,229 @@ def filter_and_save_fits(hdul: fits.HDUList,
     
     # Concatenate all data
     data = np.concatenate(all_data)
-    
-    # Apply param_filters (--filter-below / --filter-above) before other filtering.
-    # Rows with non-finite values in the filter column always pass.
+
+    # Track the original row index of every row through all filtering steps so
+    # that TSYS_INDEX / TAU_SIG_INDEX can be remapped to the new positions in
+    # the output file.
+    orig_idx = np.arange(len(data), dtype=np.int64)
+
     param_rejected_data = np.array([])
     param_rejected_count = 0
     param_filter_details = []  # list of (col, direction, value, n_removed) per condition
-    if param_filters:
-        keep_mask = np.ones(len(data), dtype=bool)
+
+    def _apply_param_filters(rows):
+        """Apply param_filters to a subset of rows.
+
+        Returns (kept_rows, rejected_rows, details, keep_mask).
+        keep_mask is a boolean array aligned to the input rows.
+        """
+        if not param_filters or len(rows) == 0:
+            return rows, np.array([]), [], np.ones(len(rows), dtype=bool)
+        keep_mask = np.ones(len(rows), dtype=bool)
+        details = []
         for col, direction, value in param_filters:
-            if col not in data.dtype.names:
+            if col not in rows.dtype.names:
                 raise ValueError(f"Filter column '{col}' not found in FITS data")
             col_vals = np.array([
-                float(row[col]) if np.isfinite(float(row[col])) else np.nan
-                for row in data
+                float(r[col]) if np.isfinite(float(r[col])) else np.nan
+                for r in rows
             ], dtype=np.float64)
             finite = np.isfinite(col_vals)
             if direction == 'below':
-                # keep rows where col <= value (or NaN)
                 cond_mask = (~finite) | (col_vals <= value)
-            else:  # 'above'
-                # keep rows where col >= value (or NaN)
+            else:
                 cond_mask = (~finite) | (col_vals >= value)
             n_removed_by_cond = int(np.sum(keep_mask & ~cond_mask))
-            param_filter_details.append((col, direction, value, n_removed_by_cond))
+            details.append((col, direction, value, n_removed_by_cond))
             keep_mask &= cond_mask
-        param_rejected_data = data[~keep_mask]
-        param_rejected_count = int(np.sum(~keep_mask))
-        data = data[keep_mask]
+        return rows[keep_mask], rows[~keep_mask], details, keep_mask
+
+    def _remap_index_column(arr, col_name, row_mapping):
+        """Remap an integer index column using old→new row mapping. -1 if not found."""
+        if col_name not in arr.dtype.names:
+            return
+        old_vals = arr[col_name].copy()
+        new_vals = np.full(len(old_vals), -1, dtype=np.int32)
+        for i, v in enumerate(old_vals):
+            iv = int(v)
+            if iv >= 0:
+                new_vals[i] = row_mapping.get(iv, -1)
+        arr[col_name] = new_vals
 
     # Apply removal filter if specified (before object separation)
     removed_data = np.array([])  # Track removed rows for rejected file
     if remove_column and remove_values:
         if remove_column not in data.dtype.names:
             raise ValueError(f"Column '{remove_column}' not found in FITS data")
-        
-        # Create a mask for values to KEEP (inverse of remove)
+
         keep_mask = np.ones(len(data), dtype=bool)
         for i, row in enumerate(data):
             value = row[remove_column]
-            # Handle both bytes and string values
             if isinstance(value, bytes):
                 value = value.decode('utf-8').strip()
             else:
                 value = str(value).strip()
-            
             if value in remove_values:
                 keep_mask[i] = False
-        
-        # Save the removed data for the rejected file
+
         removed_data = data[~keep_mask]
-        data = data[keep_mask]
-    
-    # Separate data by object (or use all data if apply_to_all)
+        data     = data[keep_mask]
+        orig_idx = orig_idx[keep_mask]
+
+    # Always separate target object from calibration rows first.
+    # param_filters are ONLY applied to science (target) rows — never to
+    # TSYS, TAU_SIG, SKYCHOPDIFF or any other calibration source.
+    target_mask = np.array([object_name.lower() in str(obj).lower()
+                            for obj in data['OBJECT']])
+    other_data      = data[~target_mask]         # calibration rows — always kept
+    other_orig_idx  = orig_idx[~target_mask]
+    target_data     = data[target_mask]
+    target_orig_idx = orig_idx[target_mask]
+
+    # Apply param_filters exclusively to the target (science) rows.
+    target_data, pf_rejected, param_filter_details, pf_keep_mask = _apply_param_filters(target_data)
+    target_orig_idx = target_orig_idx[pf_keep_mask]
+    if len(pf_rejected) > 0:
+        param_rejected_data = pf_rejected
+        param_rejected_count = len(pf_rejected)
+
+    # Apply spectrum peak filter exclusively to the target (science) rows.
+    peaks_rejected_count = 0
+    peaks_rejected_data  = np.array([])
+    if spectrum_peak_threshold is not None and len(target_data) > 0:
+        spectra_arr = np.array(target_data['SPECTRUM'], dtype=np.float64)
+        with np.errstate(invalid='ignore'):
+            peak_mask = np.any(np.abs(spectra_arr) > spectrum_peak_threshold, axis=1)
+        peaks_rejected_data  = target_data[peak_mask]
+        peaks_rejected_count = int(np.sum(peak_mask))
+        target_data     = target_data[~peak_mask]
+        target_orig_idx = target_orig_idx[~peak_mask]
+
+    # Apply --filter-tau: reject science spectra linked to bad TAU_SIG rows
+    # (any channel outside [0.001, 1.0]), and also move the bad TAU_SIG rows
+    # themselves to the rejected dataset.
+    tau_rejected_science_count = 0
+    tau_rejected_tau_count = 0
+    tau_rejected_data = np.array([])
+    tau_filter_details = []  # list of (tau_original_index, n_science_removed)
+
+    if filter_tau and len(other_data) > 0 and 'TAU_SIG_INDEX' in target_data.dtype.names:
+        # Identify TAU_SIG rows within other_data
+        def _to_str(v):
+            return v.decode().strip() if isinstance(v, bytes) else str(v).strip()
+
+        tau_sig_pos = np.array([
+            _to_str(other_data['OBJECT'][j]) == 'TAU_SIG'
+            for j in range(len(other_data))
+        ], dtype=bool)
+
+        if np.any(tau_sig_pos):
+            tau_spectra_arr = np.array(other_data['SPECTRUM'][tau_sig_pos], dtype=np.float64)
+            tau_orig_subset = other_orig_idx[tau_sig_pos]
+
+            # A TAU_SIG spectrum is "bad" if any non-NaN channel is > 1 or < 0.001
+            with np.errstate(invalid='ignore'):
+                bad_tau_mask = np.zeros(np.sum(tau_sig_pos), dtype=bool)
+                for j, spec in enumerate(tau_spectra_arr):
+                    valid = spec[~np.isnan(spec)]
+                    if len(valid) > 0 and (np.any(valid > 1.0) or np.any(valid < 0.001)):
+                        bad_tau_mask[j] = True
+
+            if np.any(bad_tau_mask):
+                bad_tau_orig_set = set(int(v) for v in tau_orig_subset[bad_tau_mask])
+
+                # Remove linked science spectra
+                sci_tau_idx = np.array(target_data['TAU_SIG_INDEX'], dtype=np.int64)
+                sci_bad_mask = np.isin(sci_tau_idx, list(bad_tau_orig_set))
+
+                # Build per-tau reporting details
+                for orig_idx_val in sorted(bad_tau_orig_set):
+                    n_sci = int(np.sum(sci_tau_idx == orig_idx_val))
+                    tau_filter_details.append((int(orig_idx_val), n_sci))
+
+                tau_rejected_science_count = int(np.sum(sci_bad_mask))
+                if tau_rejected_science_count > 0:
+                    tau_rejected_data = target_data[sci_bad_mask]
+                target_data     = target_data[~sci_bad_mask]
+                target_orig_idx = target_orig_idx[~sci_bad_mask]
+
+                # Remove bad TAU_SIG rows from other_data
+                full_bad_other = np.zeros(len(other_data), dtype=bool)
+                tau_positions_in_other = np.where(tau_sig_pos)[0]
+                full_bad_other[tau_positions_in_other[bad_tau_mask]] = True
+                tau_rejected_tau_count = int(np.sum(full_bad_other))
+                bad_tau_rows = other_data[full_bad_other]
+                other_data     = other_data[~full_bad_other]
+                other_orig_idx = other_orig_idx[~full_bad_other]
+
+                # Collect all tau-rejected rows (science + bad TAU_SIG spectra)
+                if tau_rejected_science_count > 0 and tau_rejected_tau_count > 0:
+                    tau_rejected_data = np.concatenate([tau_rejected_data, bad_tau_rows])
+                elif tau_rejected_tau_count > 0:
+                    tau_rejected_data = bad_tau_rows
+
     if apply_to_all:
-        # Apply NaN filtering to ALL spectra
-        all_data = data
-        
-        # Filter all data by NaN content
-        nan_fractions = []
-        for spectrum in all_data['SPECTRUM']:
-            _, frac = detect_nan_channels(spectrum)
-            nan_fractions.append(frac)
-        
-        nan_fractions = np.array(nan_fractions)
-        clean_mask = nan_fractions < nan_threshold
-        rejected_mask = ~clean_mask
-        
-        clean_combined = all_data[clean_mask]
-        all_rejected = all_data[rejected_mask]
-        
-        # Track statistics
-        nan_rejected_count = np.sum(rejected_mask)
+        # NaN filtering applied to ALL spectra (target + calibration)
+        combined          = np.concatenate([other_data, target_data]) if len(other_data) > 0 else target_data
+        combined_orig_idx = np.concatenate([other_orig_idx, target_orig_idx]) if len(other_data) > 0 else target_orig_idx
+        nan_fractions  = np.array([detect_nan_channels(s)[1] for s in combined['SPECTRUM']])
+        clean_mask     = nan_fractions < nan_threshold
+        clean_combined      = combined[clean_mask]
+        clean_combined_orig = combined_orig_idx[clean_mask]
+        all_rejected        = combined[~clean_mask]
+        nan_rejected_count  = int(np.sum(~clean_mask))
         removed_count = len(removed_data)
-        
-        # Add the removed data to rejected
         if len(removed_data) > 0:
             all_rejected = np.concatenate([all_rejected, removed_data])
     else:
-        # Apply NaN filtering only to target object (default behavior)
-        target_mask = np.array([object_name.lower() in str(obj).lower() 
-                               for obj in data['OBJECT']])
-        other_mask = ~target_mask
-        
-        other_data = data[other_mask]
-        target_data = data[target_mask]
-        
-        # Filter target object by NaN content
-        nan_fractions = []
-        for spectrum in target_data['SPECTRUM']:
-            _, frac = detect_nan_channels(spectrum)
-            nan_fractions.append(frac)
-        
-        nan_fractions = np.array(nan_fractions)
-        clean_target_mask = nan_fractions < nan_threshold
-        rejected_target_mask = ~clean_target_mask
-        
-        target_clean = target_data[clean_target_mask]
-        target_rejected = target_data[rejected_target_mask]
-        
-        # Track statistics
-        nan_rejected_count = np.sum(rejected_target_mask)
+        # NaN filtering applied only to target object (default behavior)
+        nan_fractions = np.array([detect_nan_channels(s)[1] for s in target_data['SPECTRUM']]) if len(target_data) > 0 else np.array([])
+        clean_target_mask = nan_fractions < nan_threshold if len(nan_fractions) > 0 else np.array([], dtype=bool)
+        target_clean         = target_data[clean_target_mask]
+        target_clean_orig    = target_orig_idx[clean_target_mask]
+        target_rejected      = target_data[~clean_target_mask]
+        nan_rejected_count   = int(np.sum(~clean_target_mask))
         removed_count = len(removed_data)
-        
-        # Add the removed data to rejected
         if len(removed_data) > 0:
             target_rejected = np.concatenate([target_rejected, removed_data])
-        
-        # Combine other objects with clean target objects
-        clean_combined = np.concatenate([other_data, target_clean])
-        all_rejected = target_rejected
+        clean_combined      = np.concatenate([other_data, target_clean]) if len(other_data) > 0 else target_clean
+        clean_combined_orig = np.concatenate([other_orig_idx, target_clean_orig]) if len(other_data) > 0 else target_clean_orig
+        all_rejected        = target_rejected
     
     # Filter out all-zero spectra if requested
     zero_rejected_count = 0
     if filter_zero_spectra:
-        # Apply zero filtering to clean_combined BEFORE returning
-        # This catches zeros in both target and non-target objects
-        # A spectrum is considered "all-zero" if:
-        # - All non-NaN channels are exactly 0, OR
-        # - All channels are NaN or 0
-        zero_mask = np.array([])
-        for spectrum in clean_combined['SPECTRUM']:
-            valid_mask = ~np.isnan(spectrum)
-            if np.sum(valid_mask) == 0:
-                # All NaN - consider it zero
-                is_zero = True
-            else:
-                # Check if all non-NaN values are 0
-                valid_values = spectrum[valid_mask]
-                is_zero = np.all(valid_values == 0)
-            zero_mask = np.append(zero_mask, is_zero)
-        
-        zero_mask = zero_mask.astype(bool)
-        
+        zero_mask = np.array([
+            (np.sum(~np.isnan(s)) == 0) or np.all(s[~np.isnan(s)] == 0)
+            for s in clean_combined['SPECTRUM']
+        ], dtype=bool)
+
         if np.any(zero_mask):
-            zero_rejected_count = np.sum(zero_mask)
-            # Move zero spectra to rejected file
+            zero_rejected_count = int(np.sum(zero_mask))
             zero_spectra = clean_combined[zero_mask]
             all_rejected = np.concatenate([all_rejected, zero_spectra]) if len(all_rejected) > 0 else zero_spectra
-            
-            # Keep only non-zero spectra in clean file
-            clean_combined = clean_combined[~zero_mask]
-    
-    # Merge param_rejected_data into all_rejected
+            clean_combined      = clean_combined[~zero_mask]
+            clean_combined_orig = clean_combined_orig[~zero_mask]
+
+    # Merge param_rejected_data and peaks_rejected_data into all_rejected
     if param_rejected_count > 0:
         all_rejected = np.concatenate([all_rejected, param_rejected_data]) if len(all_rejected) > 0 else param_rejected_data
+    if peaks_rejected_count > 0:
+        all_rejected = np.concatenate([all_rejected, peaks_rejected_data]) if len(all_rejected) > 0 else peaks_rejected_data
+    if tau_rejected_science_count + tau_rejected_tau_count > 0:
+        all_rejected = np.concatenate([all_rejected, tau_rejected_data]) if len(all_rejected) > 0 else tau_rejected_data
+
+    # Remap TSYS_INDEX / TAU_SIG_INDEX to match the new row positions in the
+    # output file.  clean_combined_orig[i] is the original row number that
+    # landed at position i; we invert that to get old→new.
+    has_tsys = 'TSYS_INDEX'    in clean_combined.dtype.names
+    has_tau  = 'TAU_SIG_INDEX' in clean_combined.dtype.names
+    if has_tsys or has_tau:
+        row_mapping = {int(old): new for new, old in enumerate(clean_combined_orig)}
+        if has_tsys:
+            _remap_index_column(clean_combined, 'TSYS_INDEX',    row_mapping)
+        if has_tau:
+            _remap_index_column(clean_combined, 'TAU_SIG_INDEX', row_mapping)
 
     # Set default output paths
     if output_clean is None:
@@ -738,9 +818,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
     else:
         output_clean = Path(output_clean)
     
-    if output_rejected is None:
-        output_rejected = Path("rejected_data.fits")
-    else:
+    write_rejected = output_rejected is not None
+    if output_rejected is not None:
         output_rejected = Path(output_rejected)
     
     # Create FITS files with same structure as original
@@ -767,28 +846,26 @@ def filter_and_save_fits(hdul: fits.HDUList,
     hdul_clean = fits.HDUList([primary_hdu, hdu_clean])
     hdul_clean.writeto(output_clean, overwrite=True)
     
-    # Create binary table HDU for rejected data (only if there are rejected spectra)
-    if len(all_rejected) > 0:
-        table_rejected = Table(all_rejected)
-        hdu_rejected = fits.BinTableHDU(table_rejected)
-        hdu_rejected.name = matrix_hdus[0][1].name
-        
-        # Copy header information from original
-        for key in matrix_hdus[0][1].header:
-            if key not in ['NAXIS1', 'NAXIS2', 'TFIELDS'] and key != '':
-                try:
-                    hdu_rejected.header[key] = matrix_hdus[0][1].header[key]
-                except (ValueError, KeyError):
-                    pass
-        
-        # Create FITS file for rejected data
-        hdul_rejected = fits.HDUList([primary_hdu, hdu_rejected])
-        hdul_rejected.writeto(output_rejected, overwrite=True)
-    else:
-        # Create empty rejected file if no rejections
-        primary_rejected = fits.PrimaryHDU()
-        hdul_rejected = fits.HDUList([primary_rejected])
-        hdul_rejected.writeto(output_rejected, overwrite=True)
+    # Write rejected file only if a path was provided
+    if write_rejected:
+        if len(all_rejected) > 0:
+            table_rejected = Table(all_rejected)
+            hdu_rejected = fits.BinTableHDU(table_rejected)
+            hdu_rejected.name = matrix_hdus[0][1].name
+
+            for key in matrix_hdus[0][1].header:
+                if key not in ['NAXIS1', 'NAXIS2', 'TFIELDS'] and key != '':
+                    try:
+                        hdu_rejected.header[key] = matrix_hdus[0][1].header[key]
+                    except (ValueError, KeyError):
+                        pass
+
+            hdul_rejected = fits.HDUList([primary_hdu, hdu_rejected])
+            hdul_rejected.writeto(output_rejected, overwrite=True)
+        else:
+            primary_rejected = fits.PrimaryHDU()
+            hdul_rejected = fits.HDUList([primary_rejected])
+            hdul_rejected.writeto(output_rejected, overwrite=True)
     
     # Return paths and statistics
     stats = {
@@ -799,6 +876,10 @@ def filter_and_save_fits(hdul: fits.HDUList,
         'rejected_removed': removed_count,
         'rejected_param': param_rejected_count,
         'param_filter_details': param_filter_details,
+        'rejected_peaks': peaks_rejected_count,
+        'rejected_tau_science': tau_rejected_science_count,
+        'rejected_tau_tau': tau_rejected_tau_count,
+        'tau_filter_details': tau_filter_details,
     }
     
     return output_clean, output_rejected, stats
@@ -1370,12 +1451,24 @@ def reduce_spectra(hdul: fits.HDUList,
 
     # Save the original data type of the spectrum column
     original_spectrum_dtype = data[spectrum_column].dtype
-    
+
     # Start with the original spectra (convert to float for processing)
     spectra = np.array([np.array(spec, dtype=float) for spec in data[spectrum_column]])
-    
+
     # Track which rows to keep (for when we filter spectra)
     keep_mask = np.ones(len(spectra), dtype=bool)
+
+    # Identify calibration rows (TSYS, TAU_SIG) — these must NOT be modified
+    # by baseline subtraction, smoothing, or any other reduction step that
+    # would corrupt their calibration values.
+    NON_SCIENCE = {'TSYS', 'TAU_SIG'}
+    if 'OBJECT' in data.dtype.names:
+        def _s(v):
+            return v.decode().strip() if isinstance(v, bytes) else str(v).strip()
+        science_mask = np.array([_s(data['OBJECT'][i]) not in NON_SCIENCE
+                                 for i in range(len(data))], dtype=bool)
+    else:
+        science_mask = np.ones(len(spectra), dtype=bool)
 
     # Apply each reduction method in sequence
     if 'unblank' in methods:
@@ -1482,33 +1575,30 @@ def reduce_spectra(hdul: fits.HDUList,
                 min(spectra.shape[1] - 1, window[1])
             )
         
-        spectra = _reduce_baseline(spectra, order=order, window=window)
+        reduced = _reduce_baseline(spectra[science_mask], order=order, window=window)
+        spectra[science_mask] = reduced
         
         # Calculate RMS of channels OUTSIDE the baseline window
         # This is done AFTER baseline subtraction on the baselined spectra
         if baseline_window_info is not None:
             ch_min_window, ch_max_window = baseline_window_info
-            rms_baseline_values = np.zeros(spectra.shape[0], dtype=np.float32)
-            for i in range(spectra.shape[0]):
-                spec = spectra[i]
-                # Create mask for channels outside window
-                outside_mask = np.concatenate([
-                    np.ones(ch_min_window, dtype=bool),
-                    np.zeros(ch_max_window - ch_min_window + 1, dtype=bool),
-                    np.ones(spectra.shape[1] - ch_max_window - 1, dtype=bool)
-                ])
-                # Calculate standard deviation of channels outside window (on baselined spectrum)
-                outside_channels = spec[outside_mask]
+            rms_baseline_values = np.full(spectra.shape[0], np.nan, dtype=np.float32)
+            outside_mask = np.concatenate([
+                np.ones(ch_min_window, dtype=bool),
+                np.zeros(ch_max_window - ch_min_window + 1, dtype=bool),
+                np.ones(spectra.shape[1] - ch_max_window - 1, dtype=bool)
+            ])
+            for i in np.where(science_mask)[0]:
+                outside_channels = spectra[i][outside_mask]
                 n_valid = np.sum(~np.isnan(outside_channels))
                 if n_valid >= 2:
                     rms_baseline_values[i] = np.nanstd(outside_channels)
-                else:
-                    rms_baseline_values[i] = np.nan
 
     if 'smooth' in methods:
         params = methods['smooth']
         window_size = params.get('window_size', 5)
-        spectra = _reduce_smooth(spectra, window_size=window_size)
+        smoothed = _reduce_smooth(spectra[science_mask], window_size=window_size)
+        spectra[science_mask] = smoothed
 
     if 'decimate' in methods:
         factor = methods['decimate'].get('factor', 1)
@@ -1536,10 +1626,14 @@ def reduce_spectra(hdul: fits.HDUList,
     # After extraction+baseline, the spectrum is reduced and extracted
     table[spectrum_column] = spectra
 
-    # If decimation was applied, update DELTAV to reflect the new effective channel width.
+    # If decimation was applied, update DELTAV and FREQRES to reflect the new effective channel width.
     # Decimating by factor N makes each output channel N times wider.
-    if '_decimate_factor' in methods and 'DELTAV' in table.colnames:
-        table['DELTAV'] = table['DELTAV'] * methods['_decimate_factor']
+    if '_decimate_factor' in methods:
+        factor = methods['_decimate_factor']
+        if 'DELTAV' in table.colnames:
+            table['DELTAV'] = table['DELTAV'] * factor
+        if 'FREQRES' in table.colnames:
+            table['FREQRES'] = table['FREQRES'] * factor
 
     # All columns from the input are preserved, including:
     # - VELOCITY, DELTAV, CRPIX1 (reference values for original spectrum)

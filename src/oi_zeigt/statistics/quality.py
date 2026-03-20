@@ -124,6 +124,7 @@ def get_spechistogram(hdul: fits.HDUList,
     # Map metric names to FITS column names
     metric_mapping = {
         'rmsratio': ('RMSRATIO', 'RMS Ratio'),
+        'rmsratiob': ('RMSRATIOB', 'RMS Ratio (radiometer)'),
         'squality': ('SQUALITY', 'Signal Quality'),
         'roll_rms_n': ('ROLL_RMS_N', 'Roll RMS'),
         'mh2o': ('MH2O', 'Water Vapor (MH₂O)'),
@@ -144,7 +145,7 @@ def get_spechistogram(hdul: fits.HDUList,
         n_metrics = len(metrics)
         cols = min(3, n_metrics)
         rows = (n_metrics + cols - 1) // cols
-        figsize = (5 * cols, 4 * rows)
+        figsize = (6 * cols, 5 * rows)
 
     # Create subplots
     n_metrics = len(metrics)
@@ -222,8 +223,8 @@ def get_spechistogram(hdul: fits.HDUList,
     # Add overall title
     obj_label = f" ({object_filter})" if object_filter else ""
     fig.suptitle(f'Spectral Quality Metrics{obj_label}', fontsize=14, fontweight='bold')
-    
-    plt.tight_layout()
+
+    plt.tight_layout(pad=2.0, h_pad=8.0, w_pad=2.5, rect=[0, 0, 1, 0.96])
 
     return fig, stats_dict
 

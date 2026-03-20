@@ -98,10 +98,17 @@ def load_spectra_by_mission(fits_file: str) -> Dict[str, Dict]:
         logger.info(f"Loaded {len(data)} total spectra from {spectra_hdu.name} HDU")
         
         # Extract mission IDs and telescopes
-        mission_id_col = np.array([str(x).strip() if isinstance(x, bytes) else str(x).strip() 
-                                    for x in data['MISSION_ID']])
-        telescop_col = np.array([str(x).strip() if isinstance(x, bytes) else str(x).strip() 
-                                 for x in data['TELESCOP']])
+        def _col_to_str(x):
+            if isinstance(x, bytes):
+                return x.decode().strip()
+            if isinstance(x, str):
+                return x.strip()
+            if isinstance(x, np.ndarray):
+                return ''  # 18C complex array (CLASS artifact)
+            return str(x).strip()
+
+        mission_id_col = np.array([_col_to_str(x) for x in data['MISSION_ID']])
+        telescop_col = np.array([_col_to_str(x) for x in data['TELESCOP']])
         
         # Get unique mission/telescope combinations
         unique_pairs = np.unique(list(zip(mission_id_col, telescop_col)), axis=0)

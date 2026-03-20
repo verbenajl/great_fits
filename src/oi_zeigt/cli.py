@@ -1392,11 +1392,28 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     help="Keep rows where COLUMN <= VALUE (filter out above). "
          "Rows with NaN in the column always pass. Can be repeated."
 )
+@click.option(
+    "--filter-spectrum-peaks",
+    "spectrum_peak_threshold",
+    type=float,
+    default=None,
+    metavar="VALUE",
+    help="Reject science spectra that contain any channel with |value| > VALUE (e.g. 500)."
+)
+@click.option(
+    "--filter-tau",
+    "filter_tau",
+    is_flag=True,
+    default=False,
+    help="Reject science spectra linked (via TAU_SIG_INDEX) to a TAU_SIG spectrum "
+         "with any channel outside [0.001, 1.0]. Also removes the bad TAU_SIG rows."
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
                 nan_threshold: float, output_clean: Optional[str],
                 output_rejected: Optional[str], remove: Optional[str],
                 remove_values: tuple, apply_only_to_object: bool, filter_zero: bool,
-                filter_below: tuple, filter_above: tuple):
+                filter_below: tuple, filter_above: tuple,
+                spectrum_peak_threshold: Optional[float], filter_tau: bool):
     """
     Filter FITS data by object, NaN content, all-zero spectra, and/or column values.
     
@@ -1510,11 +1527,7 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             except (NameError, KeyError):
                 pass
         
-        if output_rejected is None and config:
-            try:
-                output_rejected = config_data.get("output", {}).get("rejected_fits")
-            except (NameError, KeyError):
-                pass
+        # output_rejected is only written when explicitly provided via --output-rejected
         
         click.echo(f"\nFiltering data for object: {object}")
         click.echo(f"NaN threshold: {nan_threshold:.1%}")
@@ -1553,6 +1566,11 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             param_filters.append((col, 'above', val))
             click.echo(f"Parameter filter: keep {col} >= {val}")
 
+        if spectrum_peak_threshold is not None:
+            click.echo(f"Spectrum peak filter: reject science spectra with any |channel| > {spectrum_peak_threshold}")
+        if filter_tau:
+            click.echo("TAU filter: reject science spectra linked to TAU_SIG with channels outside [0.001, 1.0]")
+
         # Filter and save
         clean_path, rejected_path, stats = filter_and_save_fits(
             hdul,
@@ -1565,21 +1583,18 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             apply_to_all=not apply_only_to_object,
             filter_zero_spectra=filter_zero,
             param_filters=param_filters if param_filters else None,
+            spectrum_peak_threshold=spectrum_peak_threshold,
+            filter_tau=filter_tau,
         )
         
         # Get statistics before closing
         from astropy.io import fits as fits_lib
         hdul_clean = fits_lib.open(clean_path)
-        hdul_rejected = fits_lib.open(rejected_path)
-        
         n_clean = len(hdul_clean[1].data) if len(hdul_clean) > 1 else 0
-        n_rejected = len(hdul_rejected[1].data) if len(hdul_rejected) > 1 and hdul_rejected[1].data is not None else 0
-        
         hdul_clean.close()
-        hdul_rejected.close()
-        
+
         hdul.close()
-        
+
         # Print results
         click.echo("="*70)
         click.echo(click.style("✓ Successfully created FITS files", fg="green"))
@@ -1588,9 +1603,14 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         click.echo(f"  Records: {n_clean}")
         click.echo(f"  (Contains all non-{object} objects + filtered {object} spectra)")
         click.echo(f"  (Only M51 spectra with < {nan_threshold:.1%} NaN channels)")
-        click.echo(f"\nRejected FITS file: {rejected_path}")
-        click.echo(f"  Records: {n_rejected}")
-        
+
+        if rejected_path is not None:
+            hdul_rejected = fits_lib.open(rejected_path)
+            n_rejected = len(hdul_rejected[1].data) if len(hdul_rejected) > 1 and hdul_rejected[1].data is not None else 0
+            hdul_rejected.close()
+            click.echo(f"\nRejected FITS file: {rejected_path}")
+            click.echo(f"  Records: {n_rejected}")
+
         # Print detailed rejection statistics
         click.echo(f"\n  Rejection breakdown:")
         click.echo(f"    - NaN threshold violations: {stats['rejected_nan']}")
@@ -1603,6 +1623,15 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             for col, direction, value, n in stats.get('param_filter_details', []):
                 op = '<=' if direction == 'below' else '>='
                 click.echo(f"        kept {col} {op} {value}: {n} removed individually")
+        if spectrum_peak_threshold is not None:
+            click.echo(f"    - Removed by --filter-spectrum-peaks {spectrum_peak_threshold}: {stats.get('rejected_peaks', 0)}")
+        if filter_tau:
+            n_sci = stats.get('rejected_tau_science', 0)
+            n_tau = stats.get('rejected_tau_tau', 0)
+            click.echo(f"    - Removed by --filter-tau: {n_sci} science spectra, {n_tau} TAU_SIG spectra")
+            for orig_idx_val, n_sci_removed in stats.get('tau_filter_details', []):
+                if n_sci_removed > 0:
+                    click.echo(f"        TAU_SIG original index {orig_idx_val}: removed {n_sci_removed} science spectra")
         
         click.echo()
         
@@ -1717,25 +1746,22 @@ def apply_baseline(config, fits, order, window, output):
               help='Polynomial order for baseline (default: read from config or 1).')
 @click.option('--baseline-window', type=(int, int), default=None,
               help='Channel range [start end] to exclude from baseline fitting (default: read from config [reduction].line_window or None to use all channels).')
-@click.option('--smooth', is_flag=True, default=False,
-              help='Apply smoothing.')
-@click.option('--smooth-window', type=int, default=5,
-              help='Smoothing window size (default: 5).')
-@click.option('--decimate', type=int, default=None,
-              help='Decimate spectra by taking every Nth channel after smoothing (e.g. --decimate 5). VELOCITY_AXIS is updated accordingly.')
+@click.option('--smooth', type=int, default=None, is_flag=False, flag_value=5,
+              help='Apply boxcar smoothing. Optional window size (default: 5). E.g. --smooth or --smooth 7.')
+@click.option('--decimate', is_flag=True, default=False,
+              help='Decimate spectra by taking every Nth channel after smoothing, using the --smooth window size as the decimation factor.')
 @click.option('--output', type=click.Path(), default=None,
               help='Output FITS file path.')
 def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, baseline_window,
-                       smooth, smooth_window, decimate, output):
+                       smooth, decimate, output):
     """
     Perform spectral reduction with selected methods.
     
     Applies reduction methods in sequence:
     1. Unblank (--unblank): Fill NaN values using interpolation
     2. Baseline subtraction (--baseline): Remove polynomial baseline
-    3. Smoothing (--smooth): Apply boxcar smoothing
-    4. Decimation (--decimate N): Keep every Nth channel; VELOCITY_AXIS is updated accordingly.
-       Typically used together with --smooth --smooth-window N for proper Nyquist sampling.
+    3. Smoothing (--smooth [N]): Apply boxcar smoothing with window N (default: 5).
+    4. Decimation (--decimate): Keep every Nth channel using the --smooth window size as N; VELOCITY_AXIS is updated accordingly.
 
     More methods can be added in the future.
     
@@ -1753,6 +1779,7 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
         reduce_spectra --config config.toml --clean --baseline
         reduce_spectra --config config.toml --unblank --baseline --baseline-order 2 --baseline-window 100 120
         reduce_spectra --fits clean_data.fits --unblank --baseline --smooth --output my_reduced.fits
+        reduce_spectra --config config.toml --smooth 7
     """
     try:
         # Load config
@@ -1833,16 +1860,25 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
                 except (ValueError, TypeError):
                     pass
         
-        if smooth:
+        smooth_from_config = reduction_cfg.get('smooth', None)
+        decimate_from_config = reduction_cfg.get('decimate', False)
+
+        effective_smooth = smooth if smooth is not None else (int(smooth_from_config) if smooth_from_config is not None else None)
+        effective_decimate = decimate or bool(decimate_from_config)
+
+        if effective_smooth is not None:
             methods['smooth'] = {
-                'window_size': smooth_window
+                'window_size': effective_smooth
             }
 
-        if decimate is not None and decimate > 1:
-            methods['decimate'] = {'factor': decimate}
+        if effective_decimate:
+            if effective_smooth is None:
+                click.echo(click.style("Error: --decimate requires --smooth to be set.", fg='red'), err=True)
+                sys.exit(1)
+            methods['decimate'] = {'factor': effective_smooth}
 
         if not methods:
-            click.echo(click.style("No reduction methods selected. Use --unblank, --baseline, and/or --smooth.", 
+            click.echo(click.style("No reduction methods selected. Use --unblank, --baseline, and/or --smooth [N].",
                                   fg="yellow"), err=True)
             sys.exit(1)
         
@@ -1876,12 +1912,14 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
                 click.echo(f"    - Baseline subtraction (order={baseline_order}){source}")
             methods_applied = True
         
-        if smooth:
-            click.echo(f"    - Smoothing (window={smooth_window})")
+        if effective_smooth is not None:
+            source = " (from config)" if smooth is None and smooth_from_config is not None else ""
+            click.echo(f"    - Smoothing (window={effective_smooth}){source}")
             methods_applied = True
 
-        if decimate is not None and decimate > 1:
-            click.echo(f"    - Decimation (factor={decimate})")
+        if effective_decimate:
+            source = " (from config)" if not decimate and decimate_from_config else ""
+            click.echo(f"    - Decimation (factor={effective_smooth}){source}")
             methods_applied = True
 
         if not methods_applied:
@@ -2126,12 +2164,16 @@ def average_cmd(config, reduced, output, object, group_by, no_group, plot):
               help='Use pcad.fits from config [output].pcad_fits.')
 @click.option('--postfiltered', is_flag=True, default=False,
               help='Use post_filtered.fits from config [output].post_filtered_fits.')
+@click.option('--postprocessed', is_flag=True, default=False,
+              help='Use post_processed_fits from config [output].post_processed_fits.')
 @click.option('--object', type=str, default=None,
               help='Filter by object name. If not specified, uses "object" from config.toml if available.')
 @click.option('--all', 'all_metrics', is_flag=True, default=False,
               help='Include all available quality metrics.')
 @click.option('--rmsratio', is_flag=True, default=False,
               help='Include RMSRATIO metric.')
+@click.option('--rmsratiob', is_flag=True, default=False,
+              help='Include RMSRATIOB (radiometer-based RMS ratio) metric.')
 @click.option('--squality', is_flag=True, default=False,
               help='Include signal quality metric.')
 @click.option('--roll-rms-n', is_flag=True, default=False,
@@ -2152,7 +2194,7 @@ def average_cmd(config, reduced, output, object, group_by, no_group, plot):
               help='Number of histogram bins (default: 30).')
 @click.option('--plot', type=click.Path(), default=None,
               help='Output path for plot. If not specified, plot is shown but not saved.')
-def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, postfiltered, object, all_metrics, rmsratio, squality, roll_rms_n, mh2o, 
+def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, postfiltered, postprocessed, object, all_metrics, rmsratio, rmsratiob, squality, roll_rms_n, mh2o,
                       tsys, tau_atm, chi_sqr, err_pwv, rms_baseline, bins, plot):
     """
     Generate histograms of multiple spectral quality metrics.
@@ -2165,6 +2207,7 @@ def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, po
     
     Available metrics:
     - --rmsratio: RMS ratio quality metric
+    - --rmsratiob: RMS ratio vs radiometer equation (from post_process_data)
     - --squality: Signal quality flag
     - --roll-rms-n: RMS rolloff (mean across channels)
     - --mh2o: Water vapor column density
@@ -2235,6 +2278,13 @@ def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, po
             if not fits_file:
                 click.echo(click.style("Error: --postfiltered flag specified but [output].post_filtered_fits not defined in config", fg="red"), err=True)
                 sys.exit(1)
+        elif postprocessed:
+            output_cfg = cfg.get('output', {})
+            fits_file = output_cfg.get('post_processed_fits')
+            file_description = f"post-processed"
+            if not fits_file:
+                click.echo(click.style("Error: --postprocessed flag specified but [output].post_processed_fits not defined in config", fg="red"), err=True)
+                sys.exit(1)
         elif reduced:
             output_cfg = cfg.get('output', {})
             fits_file = output_cfg.get('reduced_fits')
@@ -2279,11 +2329,13 @@ def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, po
         
         # If --all is specified, enable all metrics
         if all_metrics:
-            metrics = ['rmsratio', 'squality', 'roll_rms_n', 'mh2o', 'tsys', 'tau_atm', 'chi_sqr', 'err_pwv', 'rms_baseline']
+            metrics = ['rmsratio', 'rmsratiob', 'squality', 'roll_rms_n', 'mh2o', 'tsys', 'tau_atm', 'chi_sqr', 'err_pwv', 'rms_baseline']
         else:
             # Build list from individual flags
             if rmsratio:
                 metrics.append('rmsratio')
+            if rmsratiob:
+                metrics.append('rmsratiob')
             if squality:
                 metrics.append('squality')
             if roll_rms_n:
@@ -2302,7 +2354,7 @@ def spechistogram_cmd(config, fits, reduced, clean, rejected, prepared, pcad, po
                 metrics.append('rms_baseline')
         
         if not metrics:
-            click.echo(click.style("Error: No metrics selected. Use --all or at least one of: --rmsratio, --squality, --roll-rms-n, --mh2o, --tsys, --tau-atm, --chi-sqr, --err-pwv, --rms-baseline", fg="red"), err=True)
+            click.echo(click.style("Error: No metrics selected. Use --all or at least one of: --rmsratio, --rmsratiob, --squality, --roll-rms-n, --mh2o, --tsys, --tau-atm, --chi-sqr, --err-pwv, --rms-baseline", fg="red"), err=True)
             sys.exit(1)
         
         # Generate histograms
@@ -3057,9 +3109,10 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
         if plot:
             plt.savefig(plot, dpi=150)
             click.echo(f"  Plot saved: {plot}")
+        else:
+            plt.show()
 
         click.echo()
-        plt.show()
         plt.close()
 
     except FileNotFoundError as e:
@@ -3386,9 +3439,16 @@ def combine_fits(input, output, single_hdu):
     default=None,
     help="Filter to specific SCAN number (e.g., 13686) for faster testing"
 )
+@click.option(
+    "--fill-telluric-with-noise",
+    "fill_noise",
+    is_flag=True,
+    default=False,
+    help="Fill telluric line channels with Gaussian noise (default: off)"
+)
 def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional[str],
                    pca_source: Optional[str], object: Optional[str], mission_id: Optional[str],
-                   scan: Optional[int]):
+                   scan: Optional[int], fill_noise: bool):
     """
     Prepare FITS data for PCA analysis.
     
@@ -3432,7 +3492,8 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
             pca_source=pca_source,
             object_filter=object,
             mission_id=mission_id,
-            scan=scan
+            scan=scan,
+            fill_noise=fill_noise
         )
         
         click.echo("\n" + "="*70)
@@ -3464,8 +3525,10 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
 @click.option('--reduced', is_flag=True, default=False,
               help='Use reduced_fits from config instead of pcad.')
 @click.option('--output', type=click.Path(), default=None,
-              help='Output FITS file path. Defaults to output.postpcarmsr from config.')
-def post_process_data_cmd(config, pcad, clean, prepared, reduced, output):
+              help='Output FITS file path. Defaults to output.post_processed_fits from config.')
+@click.option('--refill-telluric-noise', 'refill_telluric', is_flag=True, default=False,
+              help='Refill telluric line channels with Gaussian noise at the post-PCA noise level.')
+def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill_telluric):
     """
     Post-process spectra: compute per-spectrum RMS outside the line window.
 
@@ -3526,9 +3589,9 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output):
 
         # --- Determine output file ---
         if output is None:
-            output = output_cfg.get('postpcarmsr')
+            output = output_cfg.get('post_processed_fits')
             if not output:
-                click.echo(click.style("Error: no --output given and output.postpcarmsr not in config", fg='red'), err=True)
+                click.echo(click.style("Error: no --output given and output.post_processed_fits not in config", fg='red'), err=True)
                 sys.exit(1)
 
         # --- Get line_window from config (km/s) ---
@@ -3576,40 +3639,123 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output):
 
         spectra       = np.array(data['SPECTRUM'],  dtype=np.float64)
         tsys_vals     = np.array(data['TSYS'],      dtype=np.float64)   # K
-        deltav_vals   = np.array(data['DELTAV'],    dtype=np.float64)   # m/s
+        deltav_vals   = np.array(data['DELTAV'],    dtype=np.float64)   # m/s (actual channel width after decimation)
         restfreq_vals = np.array(data['RESTFREQ'],  dtype=np.float64)   # Hz
         spectime_vals = np.array(data['SPECTIME'],  dtype=np.float64)   # s, on-source
         reftime_vals  = np.array(data['REFTIME'],   dtype=np.float64)   # s, off-source
+        tau_vals      = np.array(data['TAU-ATM'],   dtype=np.float64)   # opacity
+        elev_vals     = np.array(data['ELEVATIO'],  dtype=np.float64)   # degrees
 
-        rms_measured    = np.full(n_spectra, np.nan, dtype=np.float32)
-        rms_theoretical = np.full(n_spectra, np.nan, dtype=np.float32)
-        rms_ratio       = np.full(n_spectra, np.nan, dtype=np.float32)
+        # --- Compute measured and theoretical RMS (fully vectorised) ---
 
-        for i in range(n_spectra):
-            # Measured RMS outside line window
-            outside_channels = spectra[i][outside_mask]
-            n_valid = int(np.sum(~np.isnan(outside_channels)))
-            if n_valid >= 2:
-                rms_measured[i] = np.nanstd(outside_channels)
+        # Measured RMS: nanstd over outside-window channels for each spectrum
+        outside_spectra = spectra[:, outside_mask]          # (n_spectra, n_outside)
+        n_valid_per = np.sum(~np.isnan(outside_spectra), axis=1)
+        with np.errstate(invalid='ignore'):
+            rms_measured = np.where(
+                n_valid_per >= 2,
+                np.nanstd(outside_spectra, axis=1),
+                np.nan
+            ).astype(np.float32)
 
-            # Theoretical radiometer RMS:
-            #   Δν = |DELTAV| / c * RESTFREQ  (channel bandwidth in Hz)
-            #   σ  = T_sys * sqrt(1/t_sig + 1/t_ref) / sqrt(Δν)
-            # If REFTIME <= 0, reduce to σ = T_sys / sqrt(Δν * t_sig)
-            delta_nu = abs(deltav_vals[i]) / C_MS * restfreq_vals[i]
-            t_sig = spectime_vals[i]
-            t_ref = reftime_vals[i]
+        # Theoretical radiometer RMS:
+        #   σ = T_sys / sqrt(Δν_Hz) * sqrt(1/t_sig + 1/t_ref) * exp(tau/sin(elev))
+        # Δν is computed from DELTAV (actual channel width after any decimation) and RESTFREQ.
+        # FREQRES reflects the original pre-decimation channel width and must not be used here.
+        # Opacity correction skipped when TAU-ATM <= 0 (unphysical values).
+        delta_nu = np.abs(deltav_vals) / C_MS * restfreq_vals          # Hz, shape (n_spectra,)
+        elev_rad = elev_vals * (np.pi / 180.0)
+        sin_elev = np.sin(elev_rad)
+        opacity  = np.where(
+            (tau_vals > 0) & (sin_elev > 0),
+            np.exp(tau_vals / np.where(sin_elev > 0, sin_elev, 1.0)),
+            1.0
+        )
 
-            if delta_nu > 0 and t_sig > 0:
-                if t_ref > 0:
-                    rms_theoretical[i] = tsys_vals[i] * np.sqrt(1.0/t_sig + 1.0/t_ref) / np.sqrt(delta_nu)
-                else:
-                    rms_theoretical[i] = tsys_vals[i] / np.sqrt(delta_nu * t_sig)
+        valid_base = (delta_nu > 0) & (spectime_vals > 0)
+        safe_tref  = np.where(reftime_vals > 0, reftime_vals, np.inf)  # inf → 1/t_ref = 0
 
-            if np.isfinite(rms_measured[i]) and np.isfinite(rms_theoretical[i]) and rms_theoretical[i] > 0:
-                rms_ratio[i] = rms_measured[i] / rms_theoretical[i]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            rms_theoretical = np.where(
+                valid_base,
+                tsys_vals / np.sqrt(delta_nu) * np.sqrt(1.0 / spectime_vals + 1.0 / safe_tref) * opacity,
+                np.nan
+            ).astype(np.float32)
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            rms_ratio = np.where(
+                np.isfinite(rms_measured) & np.isfinite(rms_theoretical) & (rms_theoretical > 0),
+                rms_measured / rms_theoretical,
+                np.nan
+            ).astype(np.float32)
 
         n_valid_rms = int(np.sum(~np.isnan(rms_measured)))
+
+        # --- Optionally refill telluric channels with post-PCA noise ---
+        if refill_telluric:
+            from .pca_analysis.prepare_for_pca import get_telluric_indices, load_mission_parameters
+            click.echo("Refilling telluric channels with post-PCA Gaussian noise...")
+
+            if 'MISSION_ID' not in data.dtype.names:
+                click.echo(click.style("Warning: MISSION_ID column not found — skipping telluric refill", fg='yellow'), err=True)
+            else:
+                mission_ids = np.array([
+                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                    for s in data['MISSION_ID']
+                ])
+                objects_col = np.array([
+                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                    for s in data['OBJECT']
+                ])
+                NON_SCIENCE = {'TSYS', 'TAU_SIG', 'SKYCHOPDIFF'}
+                science_mask = np.array([o not in NON_SCIENCE for o in objects_col])
+
+                unique_missions = list(set(mission_ids))
+                mission_params_cache = {mid: load_mission_parameters(mid) for mid in unique_missions}
+
+                n_refilled = 0
+                has_vel_col = 'VELOCITY_AXIS' in data.dtype.names
+
+                # Batch by mission_id: telluric mask is the same for all spectra
+                # sharing the same mission_id and velocity axis.
+                # Only science spectra are refilled — TSYS, TAU_SIG, SKYCHOPDIFF are left unchanged.
+                for mid in unique_missions:
+                    params = mission_params_cache.get(mid, {})
+                    if not params or 'telluric_line_center' not in params:
+                        continue
+
+                    idx = np.where((mission_ids == mid) & science_mask)[0]
+
+                    # Representative velocity axis (same for all spectra in a mission)
+                    if has_vel_col:
+                        vel_kms = data['VELOCITY_AXIS'][idx[0]] / 1000.0
+                    else:
+                        vel_kms = velocity_axis_kms
+
+                    telluric_mask = get_telluric_indices(mid, vel_kms)
+                    if telluric_mask is None or not np.any(telluric_mask):
+                        continue
+
+                    n_tel = int(np.sum(telluric_mask))
+                    clean_mask = outside_mask & ~telluric_mask
+
+                    # Vectorised: noise level per spectrum from clean channels
+                    batch = spectra[idx]                            # (n_batch, n_chan)
+                    if np.any(clean_mask):
+                        with np.errstate(invalid='ignore'):
+                            noise_levels = np.nanstd(batch[:, clean_mask], axis=1)
+                    else:
+                        with np.errstate(invalid='ignore'):
+                            noise_levels = np.nanstd(batch[:, outside_mask], axis=1)
+
+                    for j, (row_idx, nl) in enumerate(zip(idx, noise_levels)):
+                        if np.isfinite(nl) and nl > 0:
+                            spectra[row_idx][telluric_mask] = np.random.normal(0, nl, n_tel)
+                            n_refilled += 1
+
+                click.echo(f"  Refilled telluric channels in {n_refilled} / {n_spectra} spectra")
+                # Write modified spectra back into the data array
+                data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
 
         # --- Restrict summary to science rows only ---
         # Science rows are those whose OBJECT matches object_filter.
@@ -3704,6 +3850,90 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output):
         click.echo(click.style(f"Error: {e}", fg='red'), err=True)
         sys.exit(1)
     except ValueError as e:
+        click.echo(click.style(f"Error: {e}", fg='red'), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg='red'), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.option('--fits', 'cube_fits', required=True, type=click.Path(exists=True),
+              help='Path to the 3D FITS datacube to collapse.')
+@click.option('--velocity-range', type=(float, float), default=None, nargs=2,
+              help='Integration range in km/s (e.g., --velocity-range 500 550).')
+@click.option('--zoom', 'zoom_size_arcmin', type=float, default=None,
+              help='Show a centred zoom panel of this size in arcmin, '
+                   'with colour scale recalculated for the zoomed region.')
+@click.option('--region-x', type=float, default=None,
+              help='X pixel coordinate of circular extraction aperture centre '
+                   '(as read from the plot). If omitted with --region-radius, uses map centre.')
+@click.option('--region-y', type=float, default=None,
+              help='Y pixel coordinate of circular extraction aperture centre.')
+@click.option('--region-radius', 'region_radius_arcmin', type=float, default=None,
+              help='Radius in arcmin of circular aperture for spectrum extraction. '
+                   'Adds a separate spectrum panel and a circle on the map.')
+@click.option('--use-wcs', is_flag=True, default=False,
+              help='Display map axes in RA/Dec coordinates instead of pixel indices.')
+@click.option('--plot', type=click.Path(), default=None,
+              help='Save plot to this path.')
+@click.option('--fits-output', type=click.Path(), default=None,
+              help='Save collapsed 2D map as FITS to this path.')
+@click.option('--no-show', is_flag=True, default=False,
+              help='Do not open an interactive plot window.')
+def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
+                      region_x, region_y, region_radius_arcmin, use_wcs,
+                      plot, fits_output, no_show):
+    """
+    Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
+
+    Sums the cube along the velocity axis (K km/s) within an optional velocity
+    range.  Weights are already baked into the cube from the gridding step.
+
+    Examples:
+
+        collapse_cube --fits datacube.fits --velocity-range 500 550
+
+        collapse_cube --fits datacube.fits --velocity-range 500 550 \\
+            --zoom 5 --region-radius 2.5 --plot moment0.png
+
+        collapse_cube --fits datacube.fits --velocity-range 500 550 \\
+            --zoom 5 --region-x 128 --region-y 135 --region-radius 2.5 --use-wcs
+    """
+    try:
+        from oi_zeigt.mapping.gridding import collapse_cube
+
+        click.echo(f"Collapsing cube: {cube_fits}")
+        if velocity_range:
+            click.echo(f"  Velocity range: {velocity_range[0]:.1f} – {velocity_range[1]:.1f} km/s")
+        if zoom_size_arcmin:
+            click.echo(f"  Zoom: {zoom_size_arcmin:.1f} arcmin centred")
+        if region_radius_arcmin:
+            ctr = (f"pixel ({region_x}, {region_y})"
+                   if region_x is not None else "map centre")
+            click.echo(f"  Region: r = {region_radius_arcmin:.1f}′ at {ctr}")
+
+        collapsed, header2d, fig = collapse_cube(
+            cube_fits=cube_fits,
+            velocity_range=velocity_range,
+            zoom_size_arcmin=zoom_size_arcmin,
+            region_x=region_x,
+            region_y=region_y,
+            region_radius_arcmin=region_radius_arcmin,
+            use_wcs=use_wcs,
+            fits_output=fits_output,
+            plot_output=plot,
+        )
+
+        click.echo(f"\n✓ Collapsed map: {collapsed.shape[1]} × {collapsed.shape[0]} pixels")
+
+        if not no_show:
+            plt.show()
+        plt.close()
+
+    except (FileNotFoundError, ValueError) as e:
         click.echo(click.style(f"Error: {e}", fg='red'), err=True)
         sys.exit(1)
     except Exception as e:

@@ -1,5 +1,5 @@
 [input]
-fits_file="/home/verbena/data/m51_processed_data/m51_central_tile_1hdu.fits"
+fits_file="/home/diskB/sofiaobsdata/m51/m51_data_acquisc/kalibrated_all/m51_central_tile_1hdu_b.fits"
 
 [parameters]
 # Object name substring for filtering (PCA correction will only process spectra containing this substring)
@@ -11,10 +11,13 @@ blank_fraction = 0.20
 remove_aor_id = "04_0116_0010609"
 
 [reduction]
-baseline=3
+baseline=0
 line_window=[450, 550]
 extract=[350,700]
 group_by = "OBJECT"
+smooth=5  # smooth box
+decimate=true
+
 
 [gridding]
 # Cygrid provides more accurate astronomical gridding than scipy.griddata
@@ -40,29 +43,25 @@ n_components = 6
 pca_source="SKYCHOPDIFF"
 # smooth the components in frequency space by a box car with a
 # a kernel length of
-smoothing_kernel_size= 25
-rolling_noise_window = 15
+smoothing_kernel_size= 5
+rolling_noise_window = 5
 noise_cutoff = false
-cutoff = 0.03
+cutoff = 0.8
 global_noise_ratio_cutoff = false
-noise_ratio_cutoff = 2.0
-line_kernel_size = 11
-line_cutoff_std=2.0
+noise_ratio_cutoff = 2.5
+line_kernel_size = 21
+line_cutoff_std=1.5
 least_squares=true
 
-[filter]
-rms_ratio=2.0
-
 [output]
-clean_fits = "/home/verbena/data/m51_processed_data/clean_data.fits"
+clean_fits = "/home/diskB/data_soft/m51/processed_fits/clean_data.fits"
 rejected_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/rejected_data.fits"
-reduced_fits = "/home/verbena/data/m51_processed_data/reduced_data.fits"
+reduced_fits = "/home/diskB/data_soft/m51/processed_fits/reduced_data.fits"
 averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/averaged_data.fits"
-datacube = "/home/verbena/data/m51_processed_data/datacube.fits"
-prepared_for_pca="/home/verbena/data/m51_processed_data/prepared_for_pca.fits"
-pcad_fits="/home/verbena/data/m51_processed_data/pca_corrected.fits"
-post_filtered_fits="/home/verbena/data/m51_processed_data/postpcarmsr.fits"
-postpcarmsr="/home/verbena/data/m51_processed_data/postpcarmsr.fits"
-pca_plots_dir="/home/verbena/data/m51_pca_plots/"
+datacube = "/home/diskB/data_soft/m51/processed_fits/datacube.fits"
+prepared_for_pca="/home/diskB/data_soft/m51/processed_fits/prepared_for_pca.fits"
+pcad_fits="/home/diskB/data_soft/m51/processed_fits/pca_corrected.fits"
+post_processed_fits="/home/diskB/data_soft/m51/processed_fits/post_processed.fits"
+pca_plots_dir="/home/diskB/data_soft/m51/pca_plots/"
 
 

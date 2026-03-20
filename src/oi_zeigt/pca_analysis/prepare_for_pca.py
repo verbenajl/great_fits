@@ -152,17 +152,18 @@ def _fill_telluric_chunk(args: tuple) -> np.ndarray:
     return result
 
 
-def fill_telluric_with_noise(fits_file: str, output_fits: str, 
+def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             pca_source: str = "SKYCHOPDIFF",
                             object_filter: str = "M51CENTER",
                             mission_id: Optional[str] = None,
-                            scan: Optional[int] = None) -> None:
+                            scan: Optional[int] = None,
+                            fill_noise: bool = False) -> None:
     """
-    Filter FITS file and fill telluric lines with Gaussian noise.
-    
+    Filter FITS file and optionally fill telluric lines with Gaussian noise.
+
     Also associates each M51CENTER spectrum with its corresponding TSYS and TAU_SIG
     measurements, storing the indices as new columns in the output.
-    
+
     Parameters
     ----------
     fits_file : str
@@ -177,6 +178,9 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         Filter to specific mission_id (e.g., "2017-02-01_GR_F367")
     scan : int, optional
         Filter to specific SCAN number
+    fill_noise : bool, optional
+        If True, fill telluric channels with Gaussian noise.
+        If False (default), leave telluric channels unchanged.
     """
     logger.info(f"Opening {fits_file}...")
     
@@ -216,8 +220,15 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         logger.info(f"Filtering to OBJECT = '{pca_source}' or '{object_filter}' or TSYS/TAU_SIG...")
         
         # Get masks for filtering
-        objects = np.array([s.strip() for s in data['OBJECT']])
-        mission_ids = np.array([s.strip() for s in data['MISSION_ID']])
+        def _to_str(s):
+            if isinstance(s, (bytes, str)):
+                return s.decode().strip() if isinstance(s, bytes) else s.strip()
+            return ''  # e.g. 18C complex array (CLASS artifact) — treat as empty
+
+        objects = np.array([s.strip() if isinstance(s, str) else
+                            s.decode().strip() if isinstance(s, bytes) else ''
+                            for s in data['OBJECT']])
+        mission_ids = np.array([_to_str(s) for s in data['MISSION_ID']])
         
         # Keep spectra where OBJECT equals either pca_source or object_filter
         # Also include TSYS and TAU_SIG rows
@@ -257,55 +268,58 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         filtered_mission_ids = mission_ids[combined_mask]
         filtered_objects = objects[combined_mask]
         
-        # Fill telluric lines with Gaussian noise (parallelized)
-        logger.info("Filling telluric lines with Gaussian noise...")
+        if fill_noise:
+            # Fill telluric lines with Gaussian noise (parallelized)
+            logger.info("Filling telluric lines with Gaussian noise...")
 
-        # Pre-cache mission parameters — avoids re-parsing the YAML file for every spectrum
-        unique_mission_ids = list(set(filtered_mission_ids))
-        mission_params_cache = {mid: load_mission_parameters(mid) for mid in unique_mission_ids}
-        logger.info(f"  Cached parameters for {len(mission_params_cache)} unique mission IDs")
+            # Pre-cache mission parameters — avoids re-parsing the YAML file for every spectrum
+            unique_mission_ids = list(set(filtered_mission_ids))
+            mission_params_cache = {mid: load_mission_parameters(mid) for mid in unique_mission_ids}
+            logger.info(f"  Cached parameters for {len(mission_params_cache)} unique mission IDs")
 
-        # Build per-spectrum velocity axes as a plain numpy array for parallel workers
-        spectra_array = np.array(filtered_data['SPECTRUM'], dtype=np.float64)
-        n_spectra, n_chan = spectra_array.shape
+            # Build per-spectrum velocity axes as a plain numpy array for parallel workers
+            spectra_array = np.array(filtered_data['SPECTRUM'], dtype=np.float64)
+            n_spectra, n_chan = spectra_array.shape
 
-        if 'VELOCITY_AXIS' in filtered_data.dtype.names:
-            velocity_axes = np.array(filtered_data['VELOCITY_AXIS'], dtype=np.float64) / 1000.0
-        else:
-            velocity_axes = np.tile(velocity_axis_kms, (n_spectra, 1))
+            if 'VELOCITY_AXIS' in filtered_data.dtype.names:
+                velocity_axes = np.array(filtered_data['VELOCITY_AXIS'], dtype=np.float64) / 1000.0
+            else:
+                velocity_axes = np.tile(velocity_axis_kms, (n_spectra, 1))
 
-        # Split work into chunks — one per CPU
-        n_workers = os.cpu_count() or 1
-        chunk_size = max(1, n_spectra // n_workers)
-        chunks = []
-        for start in range(0, n_spectra, chunk_size):
-            end = min(start + chunk_size, n_spectra)
-            chunks.append((
-                spectra_array[start:end],
-                velocity_axes[start:end],
-                list(filtered_mission_ids[start:end]),
-                list(filtered_objects[start:end]),
-                mission_params_cache,
+            # Split work into chunks — one per CPU
+            n_workers = os.cpu_count() or 1
+            chunk_size = max(1, n_spectra // n_workers)
+            chunks = []
+            for start in range(0, n_spectra, chunk_size):
+                end = min(start + chunk_size, n_spectra)
+                chunks.append((
+                    spectra_array[start:end],
+                    velocity_axes[start:end],
+                    list(filtered_mission_ids[start:end]),
+                    list(filtered_objects[start:end]),
+                    mission_params_cache,
+                ))
+
+            logger.info(f"  Processing {n_spectra} spectra across {len(chunks)} chunks ({n_workers} workers)...")
+
+            filled_chunks = []
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                for chunk_result in executor.map(_fill_telluric_chunk, chunks):
+                    filled_chunks.append(chunk_result)
+
+            # Reassemble and count filled spectra
+            filled_spectra = np.concatenate(filled_chunks, axis=0)
+            n_filled = int(np.sum(
+                np.any(filled_spectra != spectra_array, axis=1) &
+                np.array([obj not in ('TSYS', 'TAU_SIG') for obj in filtered_objects])
             ))
 
-        logger.info(f"  Processing {n_spectra} spectra across {len(chunks)} chunks ({n_workers} workers)...")
+            # Write back into filtered_data in-place
+            filtered_data['SPECTRUM'][:] = filled_spectra.astype(filtered_data['SPECTRUM'].dtype)
 
-        filled_chunks = []
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            for chunk_result in executor.map(_fill_telluric_chunk, chunks):
-                filled_chunks.append(chunk_result)
-
-        # Reassemble and count filled spectra
-        filled_spectra = np.concatenate(filled_chunks, axis=0)
-        n_filled = int(np.sum(
-            np.any(filled_spectra != spectra_array, axis=1) &
-            np.array([obj not in ('TSYS', 'TAU_SIG') for obj in filtered_objects])
-        ))
-
-        # Write back into filtered_data in-place
-        filtered_data['SPECTRUM'][:] = filled_spectra.astype(filtered_data['SPECTRUM'].dtype)
-
-        logger.info(f"Filled telluric lines in {n_filled} spectra")
+            logger.info(f"Filled telluric lines in {n_filled} spectra")
+        else:
+            logger.info("Skipping telluric noise filling (--fill-telluric-with-noise not set)")
         
         # Create index columns for linking M51CENTER to TSYS and TAU_SIG
         logger.info("Creating TSYS and TAU_SIG index columns...")
@@ -470,13 +484,14 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         logger.info(f"✓ Wrote {n_filtered} spectra to {output_fits}")
 
 
-def prepare_for_pca(fits_file: Optional[str] = None, 
+def prepare_for_pca(fits_file: Optional[str] = None,
                    output_fits: Optional[str] = None,
                    config: Optional[str] = None,
                    pca_source: Optional[str] = None,
                    object_filter: Optional[str] = None,
                    mission_id: Optional[str] = None,
-                   scan: Optional[int] = None) -> None:
+                   scan: Optional[int] = None,
+                   fill_noise: bool = False) -> None:
     """
     Main entry point for prepare_for_pca functionality.
     
@@ -567,5 +582,5 @@ def prepare_for_pca(fits_file: Optional[str] = None,
         logger.info(f"Scan filter: {scan}")
     
     # Process the file
-    fill_telluric_with_noise(fits_file, output_fits, pca_source, object_filter, 
-                            mission_id=mission_id, scan=scan)
+    fill_telluric_with_noise(fits_file, output_fits, pca_source, object_filter,
+                            mission_id=mission_id, scan=scan, fill_noise=fill_noise)

@@ -21,7 +21,6 @@ from .utilities import (
     fit_baseline_poly,
     create_channel_mask,
     combine_masks,
-    normalize_spectrum,
     check_spectrum_validity,
     get_spectrum_stats,
     safe_pickle_save,
@@ -78,19 +77,26 @@ class SpectrumPreparator:
     5. Normalize
     """
     
-    def __init__(self, config: ConfigLoader, mission_id: str):
+    NON_SCIENCE_SOURCES = {"SKY-DIFF", "SKYCHOPDIFF"}
+
+    def __init__(self, config: ConfigLoader, mission_id: str, pca_source: str = "SKYCHOPDIFF"):
         """
         Initialize spectrum preparator.
-        
+
         Parameters
         ----------
         config : ConfigLoader
             Configuration loader with mission parameters
         mission_id : str
             Mission ID for accessing mission-specific parameters
+        pca_source : str
+            PCA source name (e.g. 'SKYCHOPDIFF'). Science line masking is
+            skipped for sky-difference sources, matching the original pyclass
+            behaviour where SKYCHOPDIFF spectra bypass line detection entirely.
         """
         self.config = config
         self.mission_id = mission_id
+        self.mask_science_line = pca_source not in self.NON_SCIENCE_SOURCES
         
         # Get mission-specific line parameters (in km/s from YAML)
         try:
@@ -107,7 +113,7 @@ class SpectrumPreparator:
             self.telluric_width = 10
         
         # Get baseline fitting parameters
-        self.baseline_order = config.get('pca.common.baseline_order', default=3)
+        self.baseline_order = config.get('pca.common.baseline_order', default=0)
         self.smoothing_kernel = config.get('pca.common.smoothing_kernel_size', default=3)
         self.rolling_window = config.get('pca.common.rolling_noise_window', default=11)
         
@@ -202,12 +208,16 @@ class SpectrumPreparator:
                 velocity_axis=self.velocity_axis,
                 use_velocity=True
             )
-            
-            # Science line mask (auto-detected)
-            line_mask = create_science_line_mask(spectrum, center=line_center, width=20)
-            
-            # Combined mask (exclude both artifact and science line during baseline fitting)
-            combined_mask = combine_masks(artifact_mask, line_mask)
+
+            # Science line mask (auto-detected) — only for non-sky-difference sources.
+            # SKYCHOPDIFF spectra are sky differences so the science line is absent;
+            # masking it would blank noise channels and degrade the decomposition.
+            if self.mask_science_line:
+                line_mask = create_science_line_mask(spectrum, center=line_center, width=20)
+                combined_mask = combine_masks(artifact_mask, line_mask)
+            else:
+                combined_mask = artifact_mask
+                logger.debug("Skipping science line mask (non-science source)")
             metadata['masked_channels'] = int(np.sum(combined_mask))
             
             # Step 3: Fit baseline to unmasked regions
@@ -232,20 +242,14 @@ class SpectrumPreparator:
             # Step 5: Apply mask (set masked regions to zero)
             spectrum[combined_mask] = 0.0
             
-            # Step 6: Normalize
-            if np.std(spectrum) > 0:
-                normalized, mean, std = normalize_spectrum(spectrum)
-                metadata['normalization_mean'] = float(mean)
-                metadata['normalization_std'] = float(std)
-            else:
-                normalized = spectrum.copy()
-                metadata['normalization_mean'] = 0.0
-                metadata['normalization_std'] = 1.0
-            
-            metadata['output_stats'] = get_spectrum_stats(normalized)
+            # No normalisation: amplitude is physically meaningful.
+            # SKYCHOPDIFF spectra with larger amplitude represent stronger sky
+            # contamination events and should dominate the PCA accordingly.
+            # Matches the original pyclass behaviour (scaler was commented out).
+            metadata['output_stats'] = get_spectrum_stats(spectrum)
             metadata['processing_status'] = 'success'
-            
-            return normalized, metadata
+
+            return spectrum, metadata
         
         except Exception as e:
             raise DecompositionError(f"Spectrum preparation failed: {e}")
@@ -342,7 +346,7 @@ class DecompositionDataLoader:
                 logger.warning(f"Could not apply drop filters: {e}")
             
             # Load and prepare spectra
-            preparator = SpectrumPreparator(self.config, mission_id)
+            preparator = SpectrumPreparator(self.config, mission_id, pca_source=pca_source)
             spectral_list = []
             metadata_list = []
             
@@ -1085,7 +1089,7 @@ def main_cli():
         
         # Apply spectrum preparation with telluric masking
         logger.debug(f"Creating SpectrumPreparator for mission {mission_id}")
-        preparator = SpectrumPreparator(config, mission_id)
+        preparator = SpectrumPreparator(config, mission_id, pca_source=pca_source)
         spectra = []
         failed_count = 0
         

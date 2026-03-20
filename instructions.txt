@@ -1,0 +1,9 @@
+
+pca_correct --config config.toml (vary the values of cutoff, noise_ratio_cutoff, cut_coefficients, --line_kernel_size, smoothing_kernel_size)
+
+post_process_data --config config.toml --refill-telluric-noise --pcad
+
+filter_fits --config config.toml --filter-below RMSRATIOB 1.5 --fits post_processed.fits --output-clean post_1.5.fits --filter-spectrum-peaks 500 --filter-tau
+
+compare_map_integrated --config config.toml --fits clean_data.fits --fits reduced_data.fits --fits prepared_for_pca.fits --fits pca_corrected.fits   --velocity-range 500 550 --weight-channels --weight-spectra  --fits post_processed.fits --fits post_1.5.fits --plot (name of the plot should include the cutoff, noise_ratio_cutoff, etc., values defined in pca_correct)
+

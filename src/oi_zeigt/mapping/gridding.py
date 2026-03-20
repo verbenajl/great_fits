@@ -1644,6 +1644,317 @@ def create_spectral_datacube(hdul: fits.HDUList,
         }
         save_map_to_fits(datacube, wcs_header, output_file, beam_maj_deg=beamsize_deg,
                         spectral_params=spectral_params)
-    
+
     return datacube, wcs_header, fig
+
+
+# ---------------------------------------------------------------------------
+# Collapse 3D datacube to 2D integrated map
+# ---------------------------------------------------------------------------
+
+def collapse_cube(
+    cube_fits: str,
+    velocity_range: Optional[Tuple[float, float]] = None,
+    zoom_size_arcmin: Optional[float] = None,
+    region_x: Optional[float] = None,
+    region_y: Optional[float] = None,
+    region_radius_arcmin: Optional[float] = None,
+    use_wcs: bool = False,
+    fits_output: Optional[str] = None,
+    plot_output: Optional[str] = None,
+    overwrite: bool = True,
+) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+    """
+    Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
+
+    Reads an already-gridded FITS cube (NAXIS1=RA, NAXIS2=Dec, NAXIS3=velocity),
+    sums along the velocity axis within an optional velocity range, and returns
+    the 2D map with a corresponding 2D WCS header.
+
+    Weights are not applied here — they were already baked into the cube during
+    gridding.  The resulting map has units of K km/s.
+
+    Parameters
+    ----------
+    cube_fits : str
+        Path to the 3D FITS datacube.
+    velocity_range : (float, float), optional
+        Integration range in km/s (v_min, v_max).  If None, all channels are used.
+    zoom_size_arcmin : float, optional
+        Side length in arcmin of a centred zoom region shown in the plot.
+        The zoom panel uses a colour scale recalculated for that region only.
+    region_x : float, optional
+        X pixel coordinate (as shown in the plot) of the extraction aperture
+        centre.  If None but region_radius_arcmin is given, map centre is used.
+    region_y : float, optional
+        Y pixel coordinate of the extraction aperture centre.
+    region_radius_arcmin : float, optional
+        Radius in arcmin of a circular aperture for spectrum extraction.
+        Triggers an extra spectrum panel and a circle overlay on the map(s).
+    use_wcs : bool
+        If True, display map axes in RA/Dec instead of pixel indices.
+        Default False.
+    fits_output : str, optional
+        If given, save the 2D map as a FITS file at this path.
+    plot_output : str, optional
+        If given, save the figure to this path.
+    overwrite : bool
+        Overwrite existing output files.  Default True.
+
+    Returns
+    -------
+    collapsed : np.ndarray  shape (ny, nx)
+    header2d  : fits.Header  (2D WCS)
+    fig       : matplotlib.Figure
+    """
+    # ------------------------------------------------------------------
+    # 1. Load cube
+    # ------------------------------------------------------------------
+    with fits.open(cube_fits) as hdul:
+        cube   = hdul[0].data.astype(float)   # (nvel, ny, nx)
+        header = hdul[0].header.copy()
+
+    if cube.ndim != 3:
+        raise ValueError(f"Expected a 3-D datacube, got shape {cube.shape}")
+
+    nvel, ny, nx = cube.shape
+
+    # ------------------------------------------------------------------
+    # 2. Reconstruct velocity axis from WCS keywords
+    # ------------------------------------------------------------------
+    crval3 = float(header.get('CRVAL3', 0.0))   # m/s
+    crpix3 = float(header.get('CRPIX3', 1.0))   # 1-indexed reference pixel
+    cdelt3 = float(header.get('CDELT3', 1.0))   # m/s per channel
+
+    channels_kms = (crval3 + (np.arange(nvel) - (crpix3 - 1)) * cdelt3) / 1e3
+
+    # ------------------------------------------------------------------
+    # 3. Select channels within velocity range
+    # ------------------------------------------------------------------
+    if velocity_range is not None:
+        v_min, v_max = float(velocity_range[0]), float(velocity_range[1])
+        chan_mask = (channels_kms >= v_min) & (channels_kms <= v_max)
+        if not np.any(chan_mask):
+            raise ValueError(
+                f"No channels found in velocity range [{v_min}, {v_max}] km/s. "
+                f"Cube covers {channels_kms.min():.1f} – {channels_kms.max():.1f} km/s."
+            )
+        selected_channels = channels_kms[chan_mask]
+        print(f"  Integrating {chan_mask.sum()} channels: "
+              f"{selected_channels.min():.1f} – {selected_channels.max():.1f} km/s")
+    else:
+        chan_mask = np.ones(nvel, dtype=bool)
+        print(f"  Integrating all {nvel} channels: "
+              f"{channels_kms.min():.1f} – {channels_kms.max():.1f} km/s")
+
+    # ------------------------------------------------------------------
+    # 4. Collapse: sum × |Δv| → K km/s
+    # ------------------------------------------------------------------
+    deltav_kms = abs(cdelt3) / 1e3
+    collapsed = np.nansum(cube[chan_mask, :, :], axis=0) * deltav_kms
+
+    print(f"  Collapsed map: {ny} × {nx} pixels, "
+          f"range [{np.nanmin(collapsed):.2f}, {np.nanmax(collapsed):.2f}] K km/s")
+
+    # ------------------------------------------------------------------
+    # 5. Build 2D WCS header (drop spectral axis)
+    # ------------------------------------------------------------------
+    wcs3d = WCS(header)
+    wcs2d = wcs3d.dropaxis(2)   # drop velocity (3rd WCS axis, 0-indexed)
+    header2d = wcs2d.to_header()
+    header2d['NAXIS']  = 2
+    header2d['NAXIS1'] = nx
+    header2d['NAXIS2'] = ny
+    header2d['BUNIT']  = 'K km/s'
+    header2d['OBJECT'] = header.get('OBJECT', '').strip()
+    for kw in ('BMAJ', 'BMIN', 'BPA', 'TELESCOP', 'RESTFRQ'):
+        if kw in header:
+            header2d[kw] = header[kw]
+    if velocity_range is not None:
+        header2d['VMIN'] = (v_min, '[km/s] integration start')
+        header2d['VMAX'] = (v_max, '[km/s] integration end')
+
+    # ------------------------------------------------------------------
+    # 6. Save FITS if requested
+    # ------------------------------------------------------------------
+    if fits_output:
+        fits.writeto(fits_output,
+                     collapsed.astype(np.float32),
+                     header2d,
+                     overwrite=overwrite)
+        print(f"  FITS saved: {fits_output}")
+
+    # ------------------------------------------------------------------
+    # 7. Plot
+    # ------------------------------------------------------------------
+    pixel_scale_deg = abs(float(header2d.get('CDELT2', 1.0)))
+    obj_name = header.get('OBJECT', '').strip()
+    vrange_str = (f"  [{v_min:.0f} – {v_max:.0f} km/s]"
+                  if velocity_range is not None else "")
+    title_base = f"{obj_name}  integrated intensity{vrange_str}"
+
+    from matplotlib.patches import Rectangle, Circle
+
+    # ------------------------------------------------------------------
+    # Zoom region (pixel bounds + mean spectrum)
+    # ------------------------------------------------------------------
+    if zoom_size_arcmin is not None:
+        zoom_pix = int(round((zoom_size_arcmin / 60.0) / pixel_scale_deg))
+        cy, cx = ny // 2, nx // 2
+        y0 = max(0, cy - zoom_pix // 2)
+        y1 = min(ny,  cy + zoom_pix // 2)
+        x0 = max(0, cx - zoom_pix // 2)
+        x1 = min(nx,  cx + zoom_pix // 2)
+        zoomed    = collapsed[y0:y1, x0:x1]
+        zoom_spec = np.nanmean(cube[:, y0:y1, x0:x1], axis=(1, 2))
+    else:
+        y0 = y1 = x0 = x1 = None
+        zoomed = zoom_spec = None
+
+    # ------------------------------------------------------------------
+    # Circular extraction region (pixel centre + mask + mean spectrum)
+    # ------------------------------------------------------------------
+    if region_radius_arcmin is not None:
+        radius_pix = region_radius_arcmin / 60.0 / pixel_scale_deg
+        cx_reg = float(region_x) if region_x is not None else nx / 2.0
+        cy_reg = float(region_y) if region_y is not None else ny / 2.0
+        reg_label = (f"r = {region_radius_arcmin:.1f}′  "
+                     f"(x={cx_reg:.1f}, y={cy_reg:.1f})")
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        region_mask = (xx - cx_reg) ** 2 + (yy - cy_reg) ** 2 <= radius_pix ** 2
+        n_reg_pix = region_mask.sum()
+        if n_reg_pix == 0:
+            raise ValueError("Region aperture contains no map pixels — "
+                             "check pixel coordinates and radius.")
+        region_spec = np.nanmean(cube[:, region_mask], axis=1)
+        print(f"  Region aperture: {n_reg_pix} pixels, "
+              f"centre ({cx_reg:.1f}, {cy_reg:.1f}), r = {radius_pix:.1f} px")
+    else:
+        region_mask = region_spec = cx_reg = cy_reg = radius_pix = None
+        reg_label = None
+
+    # ------------------------------------------------------------------
+    # If neither zoom nor region: use full-map mean spectrum
+    # ------------------------------------------------------------------
+    if zoom_size_arcmin is None and region_radius_arcmin is None:
+        full_spec = np.nanmean(cube, axis=(1, 2))
+    else:
+        full_spec = None
+
+    # ------------------------------------------------------------------
+    # WCS objects for map axes (built once, reused per panel)
+    # ------------------------------------------------------------------
+    if use_wcs:
+        wcs2d_obj = WCS(header2d)
+        if zoom_size_arcmin is not None:
+            h_zoom = header2d.copy()
+            h_zoom['CRPIX1'] = float(header2d.get('CRPIX1', nx / 2 + 1)) - x0
+            h_zoom['CRPIX2'] = float(header2d.get('CRPIX2', ny / 2 + 1)) - y0
+            wcs2d_zoom = WCS(h_zoom)
+        else:
+            wcs2d_zoom = None
+    else:
+        wcs2d_obj = wcs2d_zoom = None
+
+    # ------------------------------------------------------------------
+    # 2×2 figure layout
+    #   [0,0] full map          (always)
+    #   [0,1] zoom map          (if zoom,   else hidden)
+    #   [1,0] zoom/full spectrum(always)
+    #   [1,1] region spectrum   (if region, else hidden)
+    # ------------------------------------------------------------------
+    has_zoom   = zoom_size_arcmin is not None
+    has_region = region_radius_arcmin is not None
+
+    fig = plt.figure(figsize=(14, 11))
+
+    def _add_map_subplot(pos, wcs_proj=None):
+        if wcs_proj is not None:
+            return fig.add_subplot(2, 2, pos, projection=wcs_proj)
+        return fig.add_subplot(2, 2, pos)
+
+    ax_full      = _add_map_subplot(1, wcs2d_obj)
+    ax_zoom      = _add_map_subplot(2, wcs2d_zoom) if has_zoom else fig.add_subplot(2, 2, 2)
+    ax_spec_zoom = fig.add_subplot(2, 2, 3)
+    ax_spec_reg  = fig.add_subplot(2, 2, 4)
+
+    if not has_zoom:
+        ax_zoom.set_visible(False)
+    if not has_region:
+        ax_spec_reg.set_visible(False)
+
+    def _imshow_map(ax, data, title, wcs_proj=None, cmap='inferno'):
+        vmin_p = np.nanpercentile(data, 2)
+        vmax_p = np.nanpercentile(data, 98)
+        im = ax.imshow(data, origin='lower', cmap=cmap,
+                       vmin=vmin_p, vmax=vmax_p, interpolation='nearest')
+        ax.set_title(title, fontsize=10)
+        if wcs_proj is not None:
+            ax.coords[0].set_axislabel('RA')
+            ax.coords[1].set_axislabel('Dec')
+            ax.coords[0].set_major_formatter('hh:mm:ss')
+            ax.coords[1].set_major_formatter('dd:mm:ss')
+        else:
+            ax.set_xlabel('RA pixel')
+            ax.set_ylabel('Dec pixel')
+        fig.colorbar(im, ax=ax, label='K km/s', fraction=0.046, pad=0.04)
+
+    def _plot_spec(ax, vel, spec, title, color='steelblue'):
+        ax.plot(vel, spec, color=color, linewidth=1.0)
+        ax.set_xlabel('Velocity (km/s)')
+        ax.set_ylabel('Mean T$_A^*$ (K)')
+        ax.set_title(title, fontsize=10)
+        ax.axhline(0, color='gray', linewidth=0.5, linestyle=':')
+        if velocity_range is not None:
+            ax.axvspan(v_min, v_max, alpha=0.15, color=color,
+                       label=f'{v_min:.0f}–{v_max:.0f} km/s')
+            ax.legend(fontsize=8)
+
+    # Full map
+    _imshow_map(ax_full, collapsed, title_base, wcs_proj=wcs2d_obj)
+
+    # Zoom box on full map + zoom panel
+    if has_zoom:
+        pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
+        ax_full.add_patch(Rectangle(
+            (x0 - 0.5, y0 - 0.5), x1 - x0, y1 - y0,
+            linewidth=1.5, edgecolor='white', facecolor='none',
+            linestyle='--', transform=pix_tf_full))
+        _imshow_map(ax_zoom, zoomed,
+                    f"Zoom centre  {zoom_size_arcmin:.1f}′ × {zoom_size_arcmin:.1f}′",
+                    wcs_proj=wcs2d_zoom)
+
+    # Circle overlay on full map (and zoom map if active)
+    if has_region:
+        pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
+        ax_full.add_patch(Circle(
+            (cx_reg, cy_reg), radius_pix,
+            linewidth=1.5, edgecolor='lime', facecolor='none',
+            transform=pix_tf_full))
+        if has_zoom and ax_zoom is not None:
+            pix_tf_zoom = ax_zoom.get_transform('pixel') if use_wcs else ax_zoom.transData
+            ax_zoom.add_patch(Circle(
+                (cx_reg - x0, cy_reg - y0), radius_pix,
+                linewidth=1.5, edgecolor='lime', facecolor='none',
+                transform=pix_tf_zoom))
+
+    # Spectrum panels
+    if has_zoom:
+        _plot_spec(ax_spec_zoom, channels_kms, zoom_spec,
+                   f"Mean spectrum — zoom {zoom_size_arcmin:.1f}′")
+    else:
+        _plot_spec(ax_spec_zoom, channels_kms, full_spec,
+                   "Mean spectrum — full map")
+
+    if has_region:
+        _plot_spec(ax_spec_reg, channels_kms, region_spec,
+                   f"Mean spectrum — {reg_label}", color='tomato')
+
+    fig.tight_layout()
+
+    if plot_output:
+        fig.savefig(plot_output, dpi=150, bbox_inches='tight')
+        print(f"  Plot saved: {plot_output}")
+
+    return collapsed, header2d, fig
 
