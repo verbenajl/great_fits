@@ -7,26 +7,26 @@
 
 2016-05-12_GR_F296:
   telluric_line_center: 569
-  telluric_line_width: 57
+  telluric_line_width: 60
 
 2016-05-18_GR_F298:
   telluric_line_center: 566
-  telluric_line_width: 30
+  telluric_line_width: 60
     
 2016-05-19_GR_F299:
   telluric_line_center: 566
-  telluric_line_width: 30
+  telluric_line_width: 60
     
 2016-05-24_GR_F301:
   telluric_line_center: 566
-  telluric_line_width: 30
+  telluric_line_width: 60
   drop:
     telescope:
       - LFAV_3
 
 2016-05-25_GR_F302:
   telluric_line_center: 566
-  telluric_line_width: 30
+  telluric_line_width: 60
   drop:
     telescope:
       - LFAV_3
@@ -36,15 +36,15 @@
 
 2016-05-26_GR_F303:
   telluric_line_center: 566
-  telluric_line_width: 30
+  telluric_line_width: 60
 
 2016-05-27_GR_F304:
   telluric_line_center: 566
-  telluric_line_width: 30
+  telluric_line_width: 60
 
 2016-11-18_GR_F352:
   telluric_line_center: 600
-  telluric_line_width: 30
+  telluric_line_width: 60
 
 2017-02-01_GR_F367:
   telluric_line_center: 593
@@ -60,7 +60,7 @@
 
 2017-02-02_GR_F368:
   telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_width: 60
   drop:
     scans:
       complete:
@@ -69,7 +69,7 @@
 
 2017-02-08_GR_F371:
   telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_width: 60
   drop:
     scans:
       complete:
@@ -77,7 +77,7 @@
 
 2017-02-09_GR_F372:
   telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_width: 60
   drop:
     scans:
       telescope:
@@ -88,13 +88,13 @@
 
 2017-02-10_GR_F373:
   telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_width: 60
   spikes:
     - LFAH_3
 
 2017-02-14_GR_F374:
   telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_width: 60
   drop:
     scans:
       telescope:
@@ -104,11 +104,11 @@
 # JLVC added this          
 2017-02-15_GR_F375:
   telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_width: 60
   
 2017-02-16_GR_F376:
-  telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_center: 590
+  telluric_line_width: 60
   drop:
     scans:
       telescope:
@@ -119,15 +119,15 @@
 
 2017-02-17_GR_F377:
   telluric_line_center: 592
-  telluric_line_width: 30
+  telluric_line_width: 60
   # refine?
   drop:
     telescope:
       - LFAV_4
 
 2017-06-07_GR_F401:
-  telluric_line_center: 564
-  telluric_line_width: 30
+  telluric_line_center: 600
+  telluric_line_width: 60
   drop:
     scans:
       complete:
@@ -139,15 +139,15 @@
 # 19765
 
 2017-06-09_GR_F403:
-  telluric_line_center: 564
-  telluric_line_width: 30
+  telluric_line_center: 600
+  telluric_line_width: 60
   drop:
     telescope:
       - LFAV_2
 
 2017-06-10_GR_F404:
   telluric_line_center: 564
-  telluric_line_width: 30
+  telluric_line_width: 60
   drop:
     scans:
       telescope:
@@ -155,31 +155,26 @@
           - 20187
 
 2017-06-14_GR_F406:
-  telluric_line_center: 564
-  telluric_line_width: 30
+  telluric_line_center: 594
+  telluric_line_width: 60
 
 2017-06-15_GR_F407:
-  telluric_line_center: 564
-  telluric_line_width: 30
+  telluric_line_center: 594
+  telluric_line_width: 60
 
 
 # JLVC added this, not in the original file, get
 # the right parameters
 
-2018-11-16_GR_F528:
-  telluric_line_center: 602
-  telluric_line_width: 30
-
-
 2018-11-29_GR_F531:
-  telluric_line_center: 602
-  telluric_line_width: 30
+  telluric_line_center: 575
+  telluric_line_width: 60
 
 ######################################################
 
 2018-12-01_GR_F532:
-  telluric_line_center: 602
-  telluric_line_width: 30
+  telluric_line_center: 572
+  telluric_line_width: 60
   drop:
     telescope:
       - LFAV_0
@@ -191,8 +186,8 @@
       - LFAV_6
 
 2018-12-05_GR_F534:
-  telluric_line_center: 602
-  telluric_line_width: 30
+  telluric_line_center: 575
+  telluric_line_width: 60
   drop:
     telescope:
       - LFAV_0
@@ -205,8 +200,8 @@
 
 # Check again V2 is not entirely bad
 2018-12-06_GR_F535:
-  telluric_line_center: 602
-  telluric_line_width: 30
+  telluric_line_center: 575
+  telluric_line_width: 60
   drop:
     telescope:
       - LFAV_0

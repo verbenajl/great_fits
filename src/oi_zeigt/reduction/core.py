@@ -457,6 +457,167 @@ def analyze_spectrum_values(hdul: fits.HDUList, sample_size: int = 100) -> dict:
     return analysis
 
 
+def split_fits_by_mission(fits_path: Union[str, Path],
+                          output_dir: Union[str, Path],
+                          manifest_path: Optional[Union[str, Path]] = None,
+                          manifest_science_path: Optional[Union[str, Path]] = None,
+                          split_by_scan: bool = True) -> Tuple[list, list]:
+    """
+    Split a large FITS file into per-(MISSION_ID, TELESCOP, SCAN) chunks.
+
+    TELESCOP is the receiver/pixel identifier (e.g. ``LFAV_PX00_S``).
+    Each scan contains its own complete set of calibration rows (TSYS,
+    TAU_SIG, SKYCHOPDIFF, …) alongside the science rows, so scan-level
+    splitting is safe.
+
+    Chunks that contain only ``TREC (SSB)`` rows are written but kept in a
+    separate list so the pipeline can skip them for science-processing steps.
+
+    TSYS_INDEX and TAU_SIG_INDEX (if present) are remapped to be valid
+    within each chunk.
+
+    Parameters
+    ----------
+    fits_path : str or Path
+        Input FITS file (opened with memmap — no full-file RAM copy).
+    output_dir : str or Path
+        Directory where chunk files are written.
+    manifest_path : str or Path, optional
+        Text file listing *all* chunk paths, one per line.
+    manifest_science_path : str or Path, optional
+        Text file listing only chunks that contain science rows
+        (i.e. not TREC-only chunks).  Pass this to the pipeline steps.
+    split_by_scan : bool, optional
+        If True (default) split by (MISSION_ID, TELESCOP, SCAN).
+        If False split by (MISSION_ID, TELESCOP) only.
+
+    Returns
+    -------
+    all_paths : list of Path
+        All written chunk files.
+    science_paths : list of Path
+        Subset that contain at least one non-``TREC (SSB)`` row.
+    """
+    fits_path  = Path(fits_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with fits.open(fits_path, memmap=True) as hdul:
+        spec_hdu = None
+        for hdu in hdul:
+            if (hasattr(hdu, 'data') and hdu.data is not None
+                    and hasattr(hdu.data, 'dtype')
+                    and 'SPECTRUM' in hdu.data.dtype.names):
+                spec_hdu = hdu
+                break
+        if spec_hdu is None:
+            raise ValueError("No HDU with SPECTRUM column found in input file")
+
+        data        = spec_hdu.data
+        orig_header = spec_hdu.header
+        hdu_name    = spec_hdu.name
+        primary_hdu = hdul[0].copy()
+        n_rows      = len(data)
+
+        def _to_str_array(col):
+            raw = data[col]
+            if raw.dtype.kind in ('S', 'U'):
+                return np.char.strip(raw.astype('U'))
+            return np.array([str(v).strip() for v in raw])
+
+        if 'MISSION_ID' not in data.dtype.names:
+            raise ValueError("FITS file has no MISSION_ID column")
+
+        mission_ids = _to_str_array('MISSION_ID')
+        telescopes  = _to_str_array('TELESCOP') if 'TELESCOP' in data.dtype.names \
+                      else np.full(n_rows, 'UNKNOWN', dtype='U20')
+        objects     = _to_str_array('OBJECT')
+
+        if split_by_scan and 'SCAN' in data.dtype.names:
+            scans  = data['SCAN'].astype(np.int64)
+            groups = sorted(set(zip(mission_ids, telescopes, scans)))
+        else:
+            scans  = None
+            groups = sorted(set(zip(mission_ids, telescopes)))
+
+        has_tsys = 'TSYS_INDEX'    in data.dtype.names
+        has_tau  = 'TAU_SIG_INDEX' in data.dtype.names
+
+        safe = lambda s: str(s).replace('/', '_').replace(' ', '_').replace(':', '-')
+
+        all_paths     = []
+        science_paths = []
+
+        for group in groups:
+            if len(group) == 3:
+                mission_id, telescop, scan = group
+                mask = (mission_ids == mission_id) & (telescopes == telescop) & (scans == scan)
+                chunk_name = f"{safe(mission_id)}__{safe(telescop)}__scan{scan:05d}.fits"
+            else:
+                mission_id, telescop = group
+                mask = (mission_ids == mission_id) & (telescopes == telescop)
+                chunk_name = f"{safe(mission_id)}__{safe(telescop)}.fits"
+
+            orig_indices = np.where(mask)[0]
+            chunk = data[mask].copy()
+
+            # Remap row-index columns if present
+            if has_tsys or has_tau:
+                lut_keys = orig_indices.astype(np.int64)
+                lut_vals = np.arange(len(orig_indices), dtype=np.int32)
+
+                def _remap(col_name):
+                    old      = chunk[col_name].astype(np.int64)
+                    new      = np.full(len(old), -1, dtype=np.int32)
+                    pos_mask = old >= 0
+                    if np.any(pos_mask):
+                        ins = np.searchsorted(lut_keys, old[pos_mask])
+                        hit = (ins < len(lut_keys)) & (lut_keys[ins] == old[pos_mask])
+                        tmp = np.full(int(np.sum(pos_mask)), -1, dtype=np.int32)
+                        tmp[hit] = lut_vals[ins[hit]]
+                        new[pos_mask] = tmp
+                    chunk[col_name] = new
+
+                if has_tsys:
+                    _remap('TSYS_INDEX')
+                if has_tau:
+                    _remap('TAU_SIG_INDEX')
+
+            out_path = output_dir / chunk_name
+            hdu_out  = fits.BinTableHDU(chunk)
+            hdu_out.name = hdu_name
+            for key in orig_header:
+                if key not in ('NAXIS1', 'NAXIS2', 'TFIELDS', ''):
+                    try:
+                        hdu_out.header[key] = orig_header[key]
+                    except (ValueError, KeyError):
+                        pass
+
+            fits.HDUList([primary_hdu, hdu_out]).writeto(out_path, overwrite=True)
+            all_paths.append(out_path)
+
+            # Science chunk = has at least one row that is not TREC (SSB)
+            chunk_objects = objects[mask]
+            if not np.all(chunk_objects == 'TREC (SSB)'):
+                science_paths.append(out_path)
+
+            del chunk
+
+    def _write_manifest(path, paths):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w') as f:
+            for p in paths:
+                f.write(str(p.resolve()) + '\n')
+
+    if manifest_path is not None:
+        _write_manifest(manifest_path, all_paths)
+    if manifest_science_path is not None:
+        _write_manifest(manifest_science_path, science_paths)
+
+    return all_paths, science_paths
+
+
 def filter_and_save_fits(hdul: fits.HDUList,
                         object_name: str,
                         nan_threshold: float = 0.20,
@@ -581,13 +742,14 @@ def filter_and_save_fits(hdul: fits.HDUList,
     if not matrix_hdus:
         raise ValueError("No HDU with SPECTRUM column found")
     
-    # Combine data from all HDUs
-    all_data = []
-    for idx, hdu in matrix_hdus:
-        all_data.append(hdu.data)
-    
-    # Concatenate all data
-    data = np.concatenate(all_data)
+    # Combine data from all HDUs.
+    # When there is only one spectrum HDU keep the memory-mapped reference so
+    # we never load the entire file into RAM up front.  Multiple HDUs still
+    # require a concatenation (and therefore a RAM copy).
+    if len(matrix_hdus) == 1:
+        data = matrix_hdus[0][1].data
+    else:
+        data = np.concatenate([hdu.data for _, hdu in matrix_hdus])
 
     # Track the original row index of every row through all filtering steps so
     # that TSYS_INDEX / TAU_SIG_INDEX can be remapped to the new positions in
@@ -611,10 +773,7 @@ def filter_and_save_fits(hdul: fits.HDUList,
         for col, direction, value in param_filters:
             if col not in rows.dtype.names:
                 raise ValueError(f"Filter column '{col}' not found in FITS data")
-            col_vals = np.array([
-                float(r[col]) if np.isfinite(float(r[col])) else np.nan
-                for r in rows
-            ], dtype=np.float64)
+            col_vals = rows[col].astype(np.float64)
             finite = np.isfinite(col_vals)
             if direction == 'below':
                 cond_mask = (~finite) | (col_vals <= value)
@@ -629,13 +788,54 @@ def filter_and_save_fits(hdul: fits.HDUList,
         """Remap an integer index column using old→new row mapping. -1 if not found."""
         if col_name not in arr.dtype.names:
             return
-        old_vals = arr[col_name].copy()
+        old_vals = arr[col_name].astype(np.int64)
         new_vals = np.full(len(old_vals), -1, dtype=np.int32)
-        for i, v in enumerate(old_vals):
-            iv = int(v)
-            if iv >= 0:
-                new_vals[i] = row_mapping.get(iv, -1)
+        if row_mapping:
+            keys = np.array(sorted(row_mapping.keys()), dtype=np.int64)
+            vals = np.array([row_mapping[k] for k in keys], dtype=np.int32)
+            pos_mask = old_vals >= 0
+            if np.any(pos_mask):
+                ins = np.searchsorted(keys, old_vals[pos_mask])
+                valid = (ins < len(keys)) & (keys[ins] == old_vals[pos_mask])
+                tmp = np.full(int(np.sum(pos_mask)), -1, dtype=np.int32)
+                tmp[valid] = vals[ins[valid]]
+                new_vals[pos_mask] = tmp
         arr[col_name] = new_vals
+
+    # Chunk size for per-spectrum operations.  Limits peak RAM to
+    # ~chunk_size × n_channels × 4 bytes regardless of total file size.
+    _CHUNK = 2000
+
+    def _nan_fractions_chunked(spectra_col):
+        """NaN fraction per spectrum — processes in chunks to avoid a full float64 copy."""
+        n = len(spectra_col)
+        result = np.empty(n, dtype=np.float32)
+        for i in range(0, n, _CHUNK):
+            chunk = np.asarray(spectra_col[i:i + _CHUNK], dtype=np.float32)
+            result[i:i + _CHUNK] = np.isnan(chunk).mean(axis=1)
+        return result
+
+    def _peak_mask_chunked(spectra_col, threshold):
+        """Boolean mask: True where any |channel| > threshold."""
+        n = len(spectra_col)
+        result = np.zeros(n, dtype=bool)
+        for i in range(0, n, _CHUNK):
+            chunk = np.asarray(spectra_col[i:i + _CHUNK], dtype=np.float32)
+            with np.errstate(invalid='ignore'):
+                result[i:i + _CHUNK] = np.any(np.abs(chunk) > threshold, axis=1)
+        return result
+
+    def _zero_mask_chunked(spectra_col):
+        """Boolean mask: True where spectrum is all-NaN or all-zero (ignoring NaN)."""
+        n = len(spectra_col)
+        result = np.zeros(n, dtype=bool)
+        for i in range(0, n, _CHUNK):
+            chunk = np.asarray(spectra_col[i:i + _CHUNK], dtype=np.float32)
+            nan_2d = np.isnan(chunk)
+            all_nan = np.all(nan_2d, axis=1)
+            all_zero = np.all((chunk == 0) | nan_2d, axis=1)
+            result[i:i + _CHUNK] = all_nan | all_zero
+        return result
 
     # Apply removal filter if specified (before object separation)
     removed_data = np.array([])  # Track removed rows for rejected file
@@ -643,15 +843,12 @@ def filter_and_save_fits(hdul: fits.HDUList,
         if remove_column not in data.dtype.names:
             raise ValueError(f"Column '{remove_column}' not found in FITS data")
 
-        keep_mask = np.ones(len(data), dtype=bool)
-        for i, row in enumerate(data):
-            value = row[remove_column]
-            if isinstance(value, bytes):
-                value = value.decode('utf-8').strip()
-            else:
-                value = str(value).strip()
-            if value in remove_values:
-                keep_mask[i] = False
+        raw = data[remove_column]
+        if raw.dtype.kind in ('S', 'U'):
+            str_vals = np.char.strip(raw.astype('U'))
+        else:
+            str_vals = np.array([str(v).strip() for v in raw])
+        keep_mask = ~np.isin(str_vals, remove_values)
 
         removed_data = data[~keep_mask]
         data     = data[keep_mask]
@@ -660,12 +857,17 @@ def filter_and_save_fits(hdul: fits.HDUList,
     # Always separate target object from calibration rows first.
     # param_filters are ONLY applied to science (target) rows — never to
     # TSYS, TAU_SIG, SKYCHOPDIFF or any other calibration source.
-    target_mask = np.array([object_name.lower() in str(obj).lower()
-                            for obj in data['OBJECT']])
+    obj_col = data['OBJECT']
+    if obj_col.dtype.kind in ('S', 'U'):
+        obj_strs = np.char.lower(obj_col.astype('U'))
+    else:
+        obj_strs = np.array([str(o).lower() for o in obj_col])
+    target_mask = np.char.find(obj_strs, object_name.lower()) >= 0
     other_data      = data[~target_mask]         # calibration rows — always kept
     other_orig_idx  = orig_idx[~target_mask]
     target_data     = data[target_mask]
     target_orig_idx = orig_idx[target_mask]
+    del data, orig_idx  # free the base arrays — all data now lives in other_data / target_data
 
     # Apply param_filters exclusively to the target (science) rows.
     target_data, pf_rejected, param_filter_details, pf_keep_mask = _apply_param_filters(target_data)
@@ -678,9 +880,7 @@ def filter_and_save_fits(hdul: fits.HDUList,
     peaks_rejected_count = 0
     peaks_rejected_data  = np.array([])
     if spectrum_peak_threshold is not None and len(target_data) > 0:
-        spectra_arr = np.array(target_data['SPECTRUM'], dtype=np.float64)
-        with np.errstate(invalid='ignore'):
-            peak_mask = np.any(np.abs(spectra_arr) > spectrum_peak_threshold, axis=1)
+        peak_mask = _peak_mask_chunked(target_data['SPECTRUM'], spectrum_peak_threshold)
         peaks_rejected_data  = target_data[peak_mask]
         peaks_rejected_count = int(np.sum(peak_mask))
         target_data     = target_data[~peak_mask]
@@ -699,22 +899,27 @@ def filter_and_save_fits(hdul: fits.HDUList,
         def _to_str(v):
             return v.decode().strip() if isinstance(v, bytes) else str(v).strip()
 
-        tau_sig_pos = np.array([
-            _to_str(other_data['OBJECT'][j]) == 'TAU_SIG'
-            for j in range(len(other_data))
-        ], dtype=bool)
+        tau_obj_col = other_data['OBJECT']
+        if tau_obj_col.dtype.kind in ('S', 'U'):
+            tau_obj_strs = np.char.strip(tau_obj_col.astype('U'))
+        else:
+            tau_obj_strs = np.array([_to_str(v) for v in tau_obj_col])
+        tau_sig_pos = tau_obj_strs == 'TAU_SIG'
 
         if np.any(tau_sig_pos):
-            tau_spectra_arr = np.array(other_data['SPECTRUM'][tau_sig_pos], dtype=np.float64)
+            tau_spectra_arr = np.asarray(other_data['SPECTRUM'][tau_sig_pos], dtype=np.float32)
             tau_orig_subset = other_orig_idx[tau_sig_pos]
 
             # A TAU_SIG spectrum is "bad" if any non-NaN channel is > 1 or < 0.001
             with np.errstate(invalid='ignore'):
-                bad_tau_mask = np.zeros(np.sum(tau_sig_pos), dtype=bool)
-                for j, spec in enumerate(tau_spectra_arr):
-                    valid = spec[~np.isnan(spec)]
-                    if len(valid) > 0 and (np.any(valid > 1.0) or np.any(valid < 0.001)):
-                        bad_tau_mask[j] = True
+                nan_tau = np.isnan(tau_spectra_arr)
+                has_valid = ~np.all(nan_tau, axis=1)
+                # fill NaN with an in-range value so they don't trigger the condition
+                filled = np.where(nan_tau, np.float32(0.5), tau_spectra_arr)
+                bad_tau_mask = has_valid & (
+                    np.any(filled > np.float32(1.0), axis=1) |
+                    np.any(filled < np.float32(0.001), axis=1)
+                )
 
             if np.any(bad_tau_mask):
                 bad_tau_orig_set = set(int(v) for v in tau_orig_subset[bad_tau_mask])
@@ -753,7 +958,7 @@ def filter_and_save_fits(hdul: fits.HDUList,
         # NaN filtering applied to ALL spectra (target + calibration)
         combined          = np.concatenate([other_data, target_data]) if len(other_data) > 0 else target_data
         combined_orig_idx = np.concatenate([other_orig_idx, target_orig_idx]) if len(other_data) > 0 else target_orig_idx
-        nan_fractions  = np.array([detect_nan_channels(s)[1] for s in combined['SPECTRUM']])
+        nan_fractions  = _nan_fractions_chunked(combined['SPECTRUM'])
         clean_mask     = nan_fractions < nan_threshold
         clean_combined      = combined[clean_mask]
         clean_combined_orig = combined_orig_idx[clean_mask]
@@ -762,9 +967,10 @@ def filter_and_save_fits(hdul: fits.HDUList,
         removed_count = len(removed_data)
         if len(removed_data) > 0:
             all_rejected = np.concatenate([all_rejected, removed_data])
+        del removed_data, combined, combined_orig_idx, other_data, other_orig_idx, target_data, target_orig_idx
     else:
         # NaN filtering applied only to target object (default behavior)
-        nan_fractions = np.array([detect_nan_channels(s)[1] for s in target_data['SPECTRUM']]) if len(target_data) > 0 else np.array([])
+        nan_fractions = _nan_fractions_chunked(target_data['SPECTRUM']) if len(target_data) > 0 else np.array([], dtype=np.float32)
         clean_target_mask = nan_fractions < nan_threshold if len(nan_fractions) > 0 else np.array([], dtype=bool)
         target_clean         = target_data[clean_target_mask]
         target_clean_orig    = target_orig_idx[clean_target_mask]
@@ -773,17 +979,16 @@ def filter_and_save_fits(hdul: fits.HDUList,
         removed_count = len(removed_data)
         if len(removed_data) > 0:
             target_rejected = np.concatenate([target_rejected, removed_data])
+        del removed_data
         clean_combined      = np.concatenate([other_data, target_clean]) if len(other_data) > 0 else target_clean
         clean_combined_orig = np.concatenate([other_orig_idx, target_clean_orig]) if len(other_data) > 0 else target_clean_orig
         all_rejected        = target_rejected
+        del other_data, other_orig_idx, target_data, target_orig_idx, target_clean, target_clean_orig, target_rejected
     
     # Filter out all-zero spectra if requested
     zero_rejected_count = 0
     if filter_zero_spectra:
-        zero_mask = np.array([
-            (np.sum(~np.isnan(s)) == 0) or np.all(s[~np.isnan(s)] == 0)
-            for s in clean_combined['SPECTRUM']
-        ], dtype=bool)
+        zero_mask = _zero_mask_chunked(clean_combined['SPECTRUM'])
 
         if np.any(zero_mask):
             zero_rejected_count = int(np.sum(zero_mask))
@@ -825,13 +1030,9 @@ def filter_and_save_fits(hdul: fits.HDUList,
     # Create FITS files with same structure as original
     # Copy primary HDU
     primary_hdu = hdul[0].copy()
-    
-    # Create binary table HDU for clean data using Table
-    from astropy.table import Table
-    
-    # Convert to table, then back to FITS
-    table_clean = Table(clean_combined)
-    hdu_clean = fits.BinTableHDU(table_clean)
+
+    # Build binary table HDU directly from the numpy recarray (no Table copy)
+    hdu_clean = fits.BinTableHDU(clean_combined)
     hdu_clean.name = matrix_hdus[0][1].name  # Use name from first spectrum HDU
     
     # Copy header information from original
@@ -843,14 +1044,15 @@ def filter_and_save_fits(hdul: fits.HDUList,
                 pass
     
     # Create FITS file for clean data
+    n_clean = len(clean_combined)
     hdul_clean = fits.HDUList([primary_hdu, hdu_clean])
     hdul_clean.writeto(output_clean, overwrite=True)
-    
+    del clean_combined, hdu_clean, hdul_clean
+
     # Write rejected file only if a path was provided
     if write_rejected:
         if len(all_rejected) > 0:
-            table_rejected = Table(all_rejected)
-            hdu_rejected = fits.BinTableHDU(table_rejected)
+            hdu_rejected = fits.BinTableHDU(all_rejected)
             hdu_rejected.name = matrix_hdus[0][1].name
 
             for key in matrix_hdus[0][1].header:
@@ -869,7 +1071,7 @@ def filter_and_save_fits(hdul: fits.HDUList,
     
     # Return paths and statistics
     stats = {
-        'clean_count': len(clean_combined),
+        'clean_count': n_clean,
         'rejected_total': len(all_rejected),
         'rejected_nan': nan_rejected_count,
         'rejected_zero': zero_rejected_count,
@@ -1452,8 +1654,10 @@ def reduce_spectra(hdul: fits.HDUList,
     # Save the original data type of the spectrum column
     original_spectrum_dtype = data[spectrum_column].dtype
 
-    # Start with the original spectra (convert to float for processing)
-    spectra = np.array([np.array(spec, dtype=float) for spec in data[spectrum_column]])
+    # Load all spectra as float32 — half the memory of float64 while sufficient
+    # for the reductions applied here.  Baseline fitting temporarily converts
+    # individual chunks to float64 for numerical precision.
+    spectra = np.asarray(data[spectrum_column], dtype=np.float32)
 
     # Track which rows to keep (for when we filter spectra)
     keep_mask = np.ones(len(spectra), dtype=bool)
@@ -1463,10 +1667,12 @@ def reduce_spectra(hdul: fits.HDUList,
     # would corrupt their calibration values.
     NON_SCIENCE = {'TSYS', 'TAU_SIG'}
     if 'OBJECT' in data.dtype.names:
-        def _s(v):
-            return v.decode().strip() if isinstance(v, bytes) else str(v).strip()
-        science_mask = np.array([_s(data['OBJECT'][i]) not in NON_SCIENCE
-                                 for i in range(len(data))], dtype=bool)
+        raw_obj = data['OBJECT']
+        if raw_obj.dtype.kind in ('S', 'U'):
+            obj_strs = np.char.strip(raw_obj.astype('U'))
+        else:
+            obj_strs = np.array([str(v).strip() for v in raw_obj])
+        science_mask = ~np.isin(obj_strs, list(NON_SCIENCE))
     else:
         science_mask = np.ones(len(spectra), dtype=bool)
 
@@ -1575,30 +1781,34 @@ def reduce_spectra(hdul: fits.HDUList,
                 min(spectra.shape[1] - 1, window[1])
             )
         
-        reduced = _reduce_baseline(spectra[science_mask], order=order, window=window)
-        spectra[science_mask] = reduced
-        
-        # Calculate RMS of channels OUTSIDE the baseline window
-        # This is done AFTER baseline subtraction on the baselined spectra
+        # Process baseline in chunks: convert each chunk to float64 for numerical
+        # precision, store result back as float32.  Avoids a full float64 copy.
+        _CHUNK = 1000
+        sci_indices = np.where(science_mask)[0]
         if baseline_window_info is not None:
             ch_min_window, ch_max_window = baseline_window_info
             rms_baseline_values = np.full(spectra.shape[0], np.nan, dtype=np.float32)
-            outside_mask = np.concatenate([
-                np.ones(ch_min_window, dtype=bool),
-                np.zeros(ch_max_window - ch_min_window + 1, dtype=bool),
-                np.ones(spectra.shape[1] - ch_max_window - 1, dtype=bool)
-            ])
-            for i in np.where(science_mask)[0]:
-                outside_channels = spectra[i][outside_mask]
-                n_valid = np.sum(~np.isnan(outside_channels))
-                if n_valid >= 2:
-                    rms_baseline_values[i] = np.nanstd(outside_channels)
+            outside_mask = np.ones(spectra.shape[1], dtype=bool)
+            outside_mask[ch_min_window:ch_max_window + 1] = False
+        for start in range(0, len(sci_indices), _CHUNK):
+            idx = sci_indices[start:start + _CHUNK]
+            chunk = spectra[idx].astype(np.float64)
+            spectra[idx] = _reduce_baseline(chunk, order=order, window=window).astype(np.float32)
+            if baseline_window_info is not None:
+                for j, i in enumerate(idx):
+                    outside_channels = spectra[i][outside_mask]
+                    n_valid = int(np.sum(~np.isnan(outside_channels)))
+                    if n_valid >= 2:
+                        rms_baseline_values[i] = np.nanstd(outside_channels.astype(np.float64))
 
     if 'smooth' in methods:
         params = methods['smooth']
         window_size = params.get('window_size', 5)
-        smoothed = _reduce_smooth(spectra[science_mask], window_size=window_size)
-        spectra[science_mask] = smoothed
+        _CHUNK = 1000
+        sci_indices = np.where(science_mask)[0]
+        for start in range(0, len(sci_indices), _CHUNK):
+            idx = sci_indices[start:start + _CHUNK]
+            spectra[idx] = _reduce_smooth(spectra[idx], window_size=window_size)
 
     if 'decimate' in methods:
         factor = methods['decimate'].get('factor', 1)
@@ -1610,76 +1820,53 @@ def reduce_spectra(hdul: fits.HDUList,
     # Convert spectra back to original data type to preserve file size
     spectra = spectra.astype(original_spectrum_dtype)
 
-    # Create new HDU with reduced spectra
-    from astropy.table import Table
+    # Build output recarray — filter rows if unblank was used, then replace SPECTRUM.
+    # Using a recarray copy avoids the extra memory of an astropy Table intermediate.
+    filtered_data = data[keep_mask] if 'unblank' in methods else data[:]
 
-    # Filter the data table to match the filtered spectra (if unblank was used)
-    if 'unblank' in methods:
-        filtered_data = data[keep_mask]
+    # If the number of channels changed (extraction / decimation) we cannot simply
+    # copy the original recarray and overwrite the SPECTRUM column because the dtype
+    # is fixed to the old channel count.  Rebuild the recarray with an updated dtype.
+    original_nchans = filtered_data[spectrum_column].shape[1]
+    new_nchans = spectra.shape[1]
+    if new_nchans != original_nchans:
+        new_dtype = []
+        for name in filtered_data.dtype.names:
+            if name == spectrum_column:
+                new_dtype.append((name, original_spectrum_dtype, (new_nchans,)))
+            else:
+                new_dtype.append((name, filtered_data.dtype[name]))
+        output_data = np.recarray(len(filtered_data), dtype=new_dtype)
+        for name in filtered_data.dtype.names:
+            if name != spectrum_column:
+                output_data[name] = filtered_data[name]
+        output_data[spectrum_column] = spectra
     else:
-        filtered_data = data
-    
-    # Create table from filtered data - this preserves ALL columns from the input
-    table = Table(filtered_data)
+        output_data = filtered_data.copy()
+        output_data[spectrum_column] = spectra
+    del spectra  # free processing array before building the HDU
 
-    # Replace the spectrum column with reduced spectra (now in original dtype)
-    # After extraction+baseline, the spectrum is reduced and extracted
-    table[spectrum_column] = spectra
-
-    # If decimation was applied, update DELTAV and FREQRES to reflect the new effective channel width.
-    # Decimating by factor N makes each output channel N times wider.
+    # Update DELTAV and FREQRES if decimation was applied
     if '_decimate_factor' in methods:
         factor = methods['_decimate_factor']
-        if 'DELTAV' in table.colnames:
-            table['DELTAV'] = table['DELTAV'] * factor
-        if 'FREQRES' in table.colnames:
-            table['FREQRES'] = table['FREQRES'] * factor
+        if 'DELTAV' in output_data.dtype.names:
+            output_data['DELTAV'] = output_data['DELTAV'] * factor
+        if 'FREQRES' in output_data.dtype.names:
+            output_data['FREQRES'] = output_data['FREQRES'] * factor
 
-    # All columns from the input are preserved, including:
-    # - VELOCITY, DELTAV, CRPIX1 (reference values for original spectrum)
-    # - OBJECT, SCAN, AOR_ID, etc. (metadata)
-    # - Quality/measurement columns like RMSRATIO, SQUALITY, ROLL_RMS_N, CHI_SQR, ERR_PWV, etc.
-    # These are preserved for reference and downstream analysis
-    
-    # Add velocity axis column for easier plotting and calculations
-    # This will correspond to the extracted velocity range (or full range if no extraction)
-    try:
-        spectral_params = _extract_spectral_params(hdul)
-        velocity_axis = _create_velocity_axis(
-            spectral_params['velo_ref'],
-            spectral_params['deltav'],
-            spectral_params['crpix1_spec'],
-            spectral_params['nchans']
-        )
-        
-        # If extraction was done, use only the extracted velocity range
-        if '_extract_ch_min' in methods:
-            ch_min = methods['_extract_ch_min']
-            ch_max = methods['_extract_ch_max']
-            velocity_axis = velocity_axis[ch_min:ch_max+1]
-
-        # If decimation was done, decimate the velocity axis to match
-        if '_decimate_factor' in methods:
-            velocity_axis = velocity_axis[::methods['_decimate_factor']]
-
-        # NOTE: This stores the velocity axis once per spectrum (shape: nspectra × nchannels),
-        # making it as large as the SPECTRUM column itself and roughly doubling the output file size.
-        # It is redundant — the velocity axis can always be recomputed from VELOCITY, DELTAV,
-        # and CRPIX1 in the header. Left here intentionally for convenience.
-        velocity_axis_column = np.tile(velocity_axis, (len(spectra), 1))
-        table['VELOCITY_AXIS'] = velocity_axis_column
-    except (ValueError, KeyError) as e:
-        # If spectral parameters cannot be extracted, skip adding velocity axis
-        import warnings
-        warnings.warn(f"Could not add VELOCITY_AXIS column: {e}", UserWarning)
-    
-    # Add RMS_BASELINE column if it was calculated during baseline subtraction
+    # Add RMS_BASELINE column if it was calculated during baseline subtraction.
+    # Velocity axis is NOT stored as a column — it is always reconstructable from
+    # VELOCITY, DELTAV, and CRPIX1 via basic_io.reconstruct_velocity_axis().
     if rms_baseline_values is not None:
-        table['RMS_BASELINE'] = rms_baseline_values
+        from numpy.lib.recfunctions import append_fields
+        output_data = append_fields(output_data, 'RMS_BASELINE',
+                                    rms_baseline_values, dtypes=np.float32,
+                                    usemask=False, asrecarray=True)
 
     # Build new HDUList
     primary = hdul[0].copy()
-    new_hdu = fits.BinTableHDU(table)
+    new_hdu = fits.BinTableHDU(output_data)
+    del output_data
     new_hdu.name = matrix_hdu.name
 
     # Copy header keywords from original

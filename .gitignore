@@ -80,6 +80,7 @@ clean_data.fits
 rejected_data.fits
 averaged_data.fits
 datacube.fits
+output
 
 # Generated data files
 *.fits

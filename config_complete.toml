@@ -1,5 +1,5 @@
 [input]
-fits_file="/home/diskB/sofiaobsdata/m51/m51_data_acquisc/kalibrated_all/m51_central_tile_1hdu_b.fits"
+fits_file="/home/diskB/sofiaobsdata/m51/m51_complete/kalibrated_complete/m51_complete_1hdu.fits"
 
 [parameters]
 # Object name substring for filtering (PCA correction will only process spectra containing this substring)
@@ -8,10 +8,10 @@ object="M51CENTER"
 
 [filters]
 blank_fraction = 0.20
-remove_aor_id = "04_0116_0010609"
+#remove_aor_id = "04_0116_0010609"
 
 [reduction]
-baseline=3
+baseline=1
 line_window=[450, 550]
 extract=[350,700]
 group_by = "OBJECT"
@@ -50,19 +50,19 @@ cutoff = 0.005
 global_noise_ratio_cutoff = false
 noise_ratio_cutoff = 1.0
 line_kernel_size = 21
-line_cutoff_std=1.5
+line_cutoff_std=1.0
 least_squares=true
 cut_coefficients=0
 
 [output]
-clean_fits = "/home/diskB/data_soft/m51/processed_fits/clean_data.fits"
+clean_fits = "/home/diskB/data_soft/m51/processed_complete_fits/clean_data.fits"
 rejected_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/rejected_data.fits"
-reduced_fits = "/home/diskB/data_soft/m51/processed_fits/reduced_data.fits"
+reduced_fits = "/home/diskB/data_soft/m51/processed_complete_fits/reduced_data.fits"
 averaged_fits = "/home/diskB/sofiaobsdata/m51/m51_central_fits_output/fits_files_processed/averaged_data.fits"
-datacube = "/home/diskB/data_soft/m51/processed_fits/datacube.fits"
-prepared_for_pca="/home/diskB/data_soft/m51/processed_fits/prepared_for_pca.fits"
-pcad_fits="/home/diskB/data_soft/m51/processed_fits/pca_corrected.fits"
-post_processed_fits="/home/diskB/data_soft/m51/processed_fits/post_processed.fits"
-pca_plots_dir="/home/diskB/data_soft/m51/pca_plots/"
+datacube = "/home/diskB/data_soft/m51/processed_complete_fits/datacube.fits"
+prepared_for_pca="/home/diskB/data_soft/m51/processed_complete_fits/prepared_for_pca.fits"
+pcad_fits="/home/diskB/data_soft/m51/processed_complete_fits/pca_corrected.fits"
+post_processed_fits="/home/diskB/data_soft/m51/processed_complete_fits/post_processed.fits"
+pca_plots_dir="/home/diskB/data_soft/m51/pca_plots_complete/"
 
 

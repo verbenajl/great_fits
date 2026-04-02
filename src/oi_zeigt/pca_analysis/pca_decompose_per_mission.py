@@ -47,15 +47,26 @@ except ImportError:
     sys.exit(1)
 
 
-def load_spectra_by_mission(fits_file: str) -> Dict[str, Dict]:
+def load_spectra_by_mission(fits_file: str, mission_params: dict = None) -> Dict[str, Dict]:
     """
     Load spectra from FITS file, grouped by MISSION_ID and TELESCOP.
-    
+
+    Drop rules from mission_id_parameters.yml are applied when ``mission_params``
+    is provided:
+      - ``drop.telescope`` — skip every combination whose TELESCOP matches.
+      - ``drop.scans.complete`` — remove spectra with those SCAN numbers
+        regardless of telescope.
+      - ``drop.scans.telescope.<TELE>`` — remove those SCAN numbers only for
+        the named telescope.
+
     Parameters
     ----------
     fits_file : str
         Path to FITS file with SPECTRA table containing MISSION_ID and TELESCOP columns.
-    
+    mission_params : dict, optional
+        Parsed content of mission_id_parameters.yml.  When given, the ``drop``
+        sub-section of each mission entry is applied.
+
     Returns
     -------
     dict
@@ -190,19 +201,25 @@ def load_spectra_by_mission(fits_file: str) -> Dict[str, Dict]:
         return mission_data
 
 
-def preprocess_spectra(spectra: np.ndarray) -> np.ndarray:
+def preprocess_spectra(spectra: np.ndarray,
+                       velocity_axis: np.ndarray = None):
     """
     Preprocess spectra: filter bad spectra and fill NaNs.
-    
+
     Parameters
     ----------
     spectra : np.ndarray
         Spectra array [n_spectra, n_channels]
-    
+    velocity_axis : np.ndarray, optional
+        Velocity axis in km/s, length n_channels. If given, trimmed to the
+        same valid channel range as the spectra and returned as second value.
+
     Returns
     -------
-    np.ndarray
+    spectra : np.ndarray
         Preprocessed spectra with valid channels and NaNs filled.
+    velocity_axis : np.ndarray or None
+        Velocity axis trimmed to the valid channel range, or None if not given.
     """
     # Filter out spectra that are mostly NaN (>50% NaN)
     nan_fraction_per_spectrum = np.sum(np.isnan(spectra), axis=1) / spectra.shape[1]
@@ -227,7 +244,9 @@ def preprocess_spectra(spectra: np.ndarray) -> np.ndarray:
     first_valid = np.where(valid_channels)[0][0]
     last_valid = np.where(valid_channels)[0][-1]
     spectra = spectra[:, first_valid:last_valid+1]
-    
+    if velocity_axis is not None and len(velocity_axis) == original_n_channels:
+        velocity_axis = velocity_axis[first_valid:last_valid + 1]
+
     n_valid_channels = last_valid - first_valid + 1
     logger.info(f"Trimmed to {n_valid_channels} valid channels (out of {original_n_channels} original)")
     
@@ -255,8 +274,8 @@ def preprocess_spectra(spectra: np.ndarray) -> np.ndarray:
     
     # Final safety check: replace any inf or -inf
     spectra = np.nan_to_num(spectra, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    return spectra
+
+    return spectra, velocity_axis
 
 
 def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarray,
@@ -306,11 +325,32 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
         logger.warning(f"Skipping {mission_id}/{telescope}: no SKYCHOPDIFF spectra found")
         return None
     
-    # Preprocess
+    # Preprocess — also trims velocity_axis to match valid channel range
     logger.info(f"Preprocessing spectra...")
-    spectra = preprocess_spectra(spectra)
+    spectra, velocity_axis = preprocess_spectra(spectra, velocity_axis)
     logger.info(f"After preprocessing: {spectra.shape}")
     
+    # Baseline-subtract each SKYCHOPDIFF spectrum before decomposition,
+    # matching the original pyclass behaviour where prepare_spectrum() calls
+    # baseline() prior to adding a spectrum to the PCA input set.
+    # The telluric line window is excluded from the baseline fit so that
+    # the atmospheric emission feature does not bias the polynomial.
+    from oi_zeigt.reduction.core import baseline_subtract
+    baseline_window = None
+    if line_window_kms is not None and velocity_axis is not None:
+        v_min_bl, v_max_bl = line_window_kms
+        line_mask_bl = (velocity_axis >= v_min_bl) & (velocity_axis <= v_max_bl)
+        ch_indices = np.where(line_mask_bl)[0]
+        if len(ch_indices) > 0:
+            baseline_window = (int(ch_indices[0]), int(ch_indices[-1]) + 1)
+    baselined = np.empty_like(spectra)
+    for s_idx in range(len(spectra)):
+        baselined[s_idx] = baseline_subtract(spectra[s_idx], order=1,
+                                             window=baseline_window)
+    spectra = baselined
+    logger.info(f"  ✓ Baseline-subtracted {len(spectra)} spectra "
+                f"(order=1, excluded channels {baseline_window})")
+
     # Apply telluric line masking (from mission-specific parameters)
     if line_window_kms is not None and velocity_axis is not None:
         logger.info(f"Masking telluric line window {line_window_kms[0]:.1f}-{line_window_kms[1]:.1f} km/s for decomposition")
@@ -366,6 +406,7 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
             'n_channels': spectra.shape[1],
             'source': 'SKYCHOPDIFF',
             'mission_id': mission_id,
+            'velocity_axis_kms': velocity_axis,
         },
         reference_spectrum_indices=spectrum_indices  # Store indices to retrieve spectra from original FITS
     )
@@ -457,6 +498,20 @@ def main_cli():
         help="Number of PCA components to extract (default: from config [pca][n_components], or 5)"
     )
     parser.add_argument(
+        "--mission-id",
+        type=str,
+        default=None,
+        help="Limit decomposition to this MISSION_ID (e.g. 2016-05-18_GR_F298). "
+             "Can be combined with --telescope."
+    )
+    parser.add_argument(
+        "--telescope",
+        type=str,
+        default=None,
+        help="Limit decomposition to this TELESCOP value (e.g. LFAH_PX00_S). "
+             "Can be combined with --mission-id."
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Verbose output"
@@ -536,19 +591,19 @@ def main_cli():
         # Extract velocity axis from FITS file
         velocity_axis = None
         try:
+            from oi_zeigt.basic_io import reconstruct_velocity_axis
             with fits.open(fits_file) as hdul:
-                # Find the binary table HDU with VELOCITY_AXIS
                 for hdu in hdul:
-                    if hasattr(hdu, 'data') and hdu.data is not None:
-                        if 'VELOCITY_AXIS' in hdu.data.dtype.names:
-                            # Get first spectrum's velocity axis (should be same for all)
-                            vel_axis_m_s = hdu.data['VELOCITY_AXIS'][0]
-                            velocity_axis = vel_axis_m_s / 1000.0  # Convert m/s to km/s
-                            logger.info(f"✓ Extracted velocity axis: {len(velocity_axis)} channels, "
+                    if hasattr(hdu, 'data') and hdu.data is not None and hasattr(hdu.data, 'dtype'):
+                        names = hdu.data.dtype.names or []
+                        if 'VELOCITY' in names and 'DELTAV' in names and 'SPECTRUM' in names:
+                            vel_axis_ms = reconstruct_velocity_axis(hdu)
+                            velocity_axis = vel_axis_ms / 1000.0  # Convert m/s to km/s
+                            logger.info(f"✓ Reconstructed velocity axis: {len(velocity_axis)} channels, "
                                       f"range: {velocity_axis[0]:.1f} to {velocity_axis[-1]:.1f} km/s")
                             break
         except Exception as e:
-            logger.warning(f"Could not extract velocity axis from FITS: {e}")
+            logger.warning(f"Could not reconstruct velocity axis from FITS: {e}")
             logger.warning(f"Proceeding without velocity axis (line masking will be skipped)")
         
         # Load mission-specific parameters from mission_id_parameters.yml
@@ -578,12 +633,49 @@ def main_cli():
         if not mission_data:
             logger.error("No MISSION_ID data found in FITS file")
             sys.exit(1)
-        
+
+        # Filter to a single mission_id / telescope if requested
+        if args.mission_id or args.telescope:
+            before = len(mission_data)
+            mission_data_full = mission_data  # keep for error reporting
+            mission_data = {
+                k: v for k, v in mission_data.items()
+                if (args.mission_id is None or v['mission_id'] == args.mission_id)
+                and (args.telescope is None or v['telescop'] == args.telescope)
+            }
+            if not mission_data:
+                logger.error(
+                    f"No combinations matched mission_id={args.mission_id!r} "
+                    f"telescope={args.telescope!r} (had {before} total)."
+                )
+                # Show available values to help the user correct the typo
+                all_missions  = sorted({v['mission_id'] for v in mission_data_full.values()})
+                all_telescopes = sorted({v['telescop']   for v in mission_data_full.values()})
+                if args.mission_id:
+                    import difflib
+                    close = difflib.get_close_matches(args.mission_id, all_missions, n=5, cutoff=0.6)
+                    if close:
+                        logger.error(f"  Did you mean one of: {', '.join(close)}")
+                    else:
+                        logger.error(f"  Available mission_ids (first 10): {', '.join(all_missions[:10])}")
+                if args.telescope:
+                    import difflib
+                    close = difflib.get_close_matches(args.telescope, all_telescopes, n=5, cutoff=0.6)
+                    if close:
+                        logger.error(f"  Did you mean telescope: {', '.join(close)}")
+                    else:
+                        logger.error(f"  Available telescopes: {', '.join(all_telescopes)}")
+                sys.exit(1)
+            logger.info(
+                f"Filtered to {len(mission_data)}/{before} combination(s): "
+                f"mission_id={args.mission_id!r}  telescope={args.telescope!r}"
+            )
+
         # Check for missions with no SKYCHOPDIFF spectra
         missions_no_sky = [m for m, d in mission_data.items() if d['metadata']['n_spectra'] == 0]
         if missions_no_sky:
-            logger.warning(f"Missions with NO SKYCHOPDIFF spectra: {', '.join(missions_no_sky)}")
-        
+            logger.warning(f"Missions with NO SKYCHOPDIFF spectra: {', '.join(str(m) for m in missions_no_sky)}")
+
         logger.info(f"\n{'='*80}")
         logger.info(f"PROCESSING {len(mission_data)} MISSION/TELESCOPE COMBINATIONS")
         logger.info(f"{'='*80}\n")
@@ -655,29 +747,38 @@ def main_cli():
                             mean_spectrum = result.mean_spectrum
                             n_components = components.shape[0]
                             n_channels = components.shape[1]
-                            
-                            # Create component plots (without velocity axis)
+
+                            # Use the trimmed velocity axis stored in result metadata
+                            vax = result.metadata.get('velocity_axis_kms')
+                            if vax is not None and len(vax) == n_channels:
+                                x_axis = vax
+                                x_label = 'Velocity (km/s)'
+                            else:
+                                x_axis = np.arange(n_channels)
+                                x_label = 'Channel'
+
+                            # Create component plots
                             fig, axes = plt.subplots(n_components + 1, 1, figsize=(14, 3*(n_components + 1)))
-                            
+
                             # Plot mean spectrum
-                            axes[0].plot(mean_spectrum, 'b-', linewidth=1.5)
+                            axes[0].plot(x_axis, mean_spectrum, 'b-', linewidth=1.5)
                             axes[0].set_title(f'Mean Spectrum - {mission_id}/{telescop}', fontsize=12, fontweight='bold')
                             axes[0].set_ylabel('Intensity')
-                            axes[0].set_xlim(0, n_channels)
+                            axes[0].set_xlim(x_axis[0], x_axis[-1])
                             axes[0].grid(True, alpha=0.3)
-                            
+
                             # Plot each component
                             for i in range(n_components):
-                                axes[i+1].plot(components[i], 'r-', linewidth=1.5)
+                                axes[i+1].plot(x_axis, components[i], 'r-', linewidth=1.5)
                                 axes[i+1].set_title(
                                     f'Component {i+1} (Variance: {100*explained_variance_ratio[i]:.2f}%) - {mission_id}/{telescop}',
                                     fontsize=12, fontweight='bold'
                                 )
                                 axes[i+1].set_ylabel('Loadings')
-                                axes[i+1].set_xlim(0, n_channels)
+                                axes[i+1].set_xlim(x_axis[0], x_axis[-1])
                                 axes[i+1].grid(True, alpha=0.3)
                                 if i == n_components - 1:
-                                    axes[i+1].set_xlabel('Channel')
+                                    axes[i+1].set_xlabel(x_label)
                             
                             plt.tight_layout()
                             

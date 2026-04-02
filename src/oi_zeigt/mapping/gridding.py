@@ -1656,8 +1656,14 @@ def collapse_cube(
     cube_fits: str,
     velocity_range: Optional[Tuple[float, float]] = None,
     zoom_size_arcmin: Optional[float] = None,
+    zoom_x: Optional[float] = None,
+    zoom_y: Optional[float] = None,
+    zoom_ra: Optional[float] = None,
+    zoom_dec: Optional[float] = None,
     region_x: Optional[float] = None,
     region_y: Optional[float] = None,
+    region_ra: Optional[float] = None,
+    region_dec: Optional[float] = None,
     region_radius_arcmin: Optional[float] = None,
     use_wcs: bool = False,
     fits_output: Optional[str] = None,
@@ -1681,13 +1687,28 @@ def collapse_cube(
     velocity_range : (float, float), optional
         Integration range in km/s (v_min, v_max).  If None, all channels are used.
     zoom_size_arcmin : float, optional
-        Side length in arcmin of a centred zoom region shown in the plot.
+        Side length in arcmin of the zoom region shown in the plot.
         The zoom panel uses a colour scale recalculated for that region only.
+    zoom_x : float, optional
+        X pixel coordinate of the zoom region centre.  Defaults to map centre.
+        Takes priority over zoom_ra/zoom_dec.
+    zoom_y : float, optional
+        Y pixel coordinate of the zoom region centre.
+    zoom_ra : float, optional
+        RA in degrees of the zoom region centre.
+    zoom_dec : float, optional
+        Dec in degrees of the zoom region centre.
     region_x : float, optional
         X pixel coordinate (as shown in the plot) of the extraction aperture
-        centre.  If None but region_radius_arcmin is given, map centre is used.
+        centre.  Takes priority over region_ra/region_dec if both are given.
+        If None but region_radius_arcmin is given, map centre is used.
     region_y : float, optional
         Y pixel coordinate of the extraction aperture centre.
+    region_ra : float, optional
+        RA in degrees of the extraction aperture centre (used when region_x/y
+        are not given).
+    region_dec : float, optional
+        Dec in degrees of the extraction aperture centre.
     region_radius_arcmin : float, optional
         Radius in arcmin of a circular aperture for spectrum extraction.
         Triggers an extra spectrum panel and a circle overlay on the map(s).
@@ -1796,11 +1817,31 @@ def collapse_cube(
     from matplotlib.patches import Rectangle, Circle
 
     # ------------------------------------------------------------------
+    # RA/Dec → pixel conversion helper (uses the 2D WCS)
+    # ------------------------------------------------------------------
+    def _radec_to_pix(ra_deg, dec_deg):
+        """Return (x_pix, y_pix) for a sky position using the 2D WCS."""
+        from astropy.wcs import WCS as _WCS
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        sky = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
+        x_pix, y_pix = wcs2d.world_to_pixel(sky)
+        return float(x_pix), float(y_pix)
+
+    # ------------------------------------------------------------------
     # Zoom region (pixel bounds + mean spectrum)
     # ------------------------------------------------------------------
     if zoom_size_arcmin is not None:
         zoom_pix = int(round((zoom_size_arcmin / 60.0) / pixel_scale_deg))
-        cy, cx = ny // 2, nx // 2
+        if zoom_x is not None and zoom_y is not None:
+            cx, cy = int(round(zoom_x)), int(round(zoom_y))
+        elif zoom_ra is not None and zoom_dec is not None:
+            _zx, _zy = _radec_to_pix(zoom_ra, zoom_dec)
+            cx, cy = int(round(_zx)), int(round(_zy))
+            print(f"  Zoom centre RA={zoom_ra:.5f}° Dec={zoom_dec:.5f}° "
+                  f"→ pixel ({cx}, {cy})")
+        else:
+            cy, cx = ny // 2, nx // 2
         y0 = max(0, cy - zoom_pix // 2)
         y1 = min(ny,  cy + zoom_pix // 2)
         x0 = max(0, cx - zoom_pix // 2)
@@ -1816,8 +1857,14 @@ def collapse_cube(
     # ------------------------------------------------------------------
     if region_radius_arcmin is not None:
         radius_pix = region_radius_arcmin / 60.0 / pixel_scale_deg
-        cx_reg = float(region_x) if region_x is not None else nx / 2.0
-        cy_reg = float(region_y) if region_y is not None else ny / 2.0
+        if region_x is not None and region_y is not None:
+            cx_reg, cy_reg = float(region_x), float(region_y)
+        elif region_ra is not None and region_dec is not None:
+            cx_reg, cy_reg = _radec_to_pix(region_ra, region_dec)
+            print(f"  Region centre RA={region_ra:.5f}° Dec={region_dec:.5f}° "
+                  f"→ pixel ({cx_reg:.1f}, {cy_reg:.1f})")
+        else:
+            cx_reg, cy_reg = nx / 2.0, ny / 2.0
         reg_label = (f"r = {region_radius_arcmin:.1f}′  "
                      f"(x={cx_reg:.1f}, y={cy_reg:.1f})")
         yy, xx = np.mgrid[0:ny, 0:nx]

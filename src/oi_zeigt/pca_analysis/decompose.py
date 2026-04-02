@@ -354,15 +354,21 @@ class DecompositionDataLoader:
             
             for data, header, metadata in source_data.get_all_fits_data():
                 try:
-                    # Extract VELOCITY_AXIS column if available (preferred for telluric masking)
+                    # Reconstruct velocity axis from VELOCITY/DELTAV/CRPIX1 columns
                     velocity_axis = None
-                    
-                    # Check if data is a structured array with columns (from FITS binary table)
                     if isinstance(data, np.ndarray) and data.dtype.names is not None:
-                        if 'VELOCITY_AXIS' in data.dtype.names:
-                            # Extract first row's velocity axis (should be same for all)
-                            velocity_axis = data['VELOCITY_AXIS'][0] if len(data) > 0 else None
-                            logger.debug("Using VELOCITY_AXIS from FITS file")
+                        if 'VELOCITY' in data.dtype.names and 'DELTAV' in data.dtype.names and len(data) > 0:
+                            try:
+                                velo_ref = float(data['VELOCITY'][0])
+                                deltav   = float(data['DELTAV'][0])
+                                nchans   = data['SPECTRUM'].shape[1] if 'SPECTRUM' in data.dtype.names else None
+                                if nchans is not None:
+                                    crpix1 = float(header.get('CRPIX1', 1.0)) if header else 1.0
+                                    ch = np.arange(nchans, dtype=np.float64)
+                                    velocity_axis = velo_ref + (ch - (crpix1 - 1.0)) * deltav
+                                    logger.debug("Velocity axis reconstructed from FITS parameters")
+                            except Exception:
+                                pass
                     
                     # Extract 1D and 2D spectra from SPECTRUM column (if binary table)
                     if isinstance(data, np.ndarray) and data.dtype.names is not None and 'SPECTRUM' in data.dtype.names:
@@ -1074,11 +1080,14 @@ def main_cli():
             else:
                 mission_id = 'unknown'
             
-            # Extract velocity axis if available (for telluric masking)
+            # Reconstruct velocity axis for telluric masking
             velocity_axis = None
-            if 'VELOCITY_AXIS' in matrix_hdu.data.dtype.names:
-                velocity_axis = matrix_hdu.data['VELOCITY_AXIS'][0] if len(matrix_hdu.data) > 0 else None
-                logger.debug("Using VELOCITY_AXIS from FITS file for telluric masking")
+            try:
+                from oi_zeigt.basic_io import reconstruct_velocity_axis
+                velocity_axis = reconstruct_velocity_axis(matrix_hdu)
+                logger.debug("Velocity axis reconstructed from FITS parameters")
+            except Exception:
+                pass
             
             # Get header for WCS information
             matrix_header = matrix_hdu.header
@@ -1176,16 +1185,18 @@ def main_cli():
                                 matrix_hdu = hdu
                                 break
                     
-                    if matrix_hdu is not None and 'VELOCITY_AXIS' in matrix_hdu.data.dtype.names:
-                        velocity_axis_ms = matrix_hdu.data['VELOCITY_AXIS'][0]
-                        velocity_axis_kms = velocity_axis_ms / 1000.0
-                        
-                        _plot_decomposition_results(
-                            result, velocity_axis_kms, mission_id, output_dir
-                        )
-                        logger.info("✓ Plots generated successfully")
+                    if matrix_hdu is not None:
+                        try:
+                            from oi_zeigt.basic_io import reconstruct_velocity_axis
+                            velocity_axis_kms = reconstruct_velocity_axis(matrix_hdu) / 1000.0
+                            _plot_decomposition_results(
+                                result, velocity_axis_kms, mission_id, output_dir
+                            )
+                            logger.info("✓ Plots generated successfully")
+                        except Exception as ve:
+                            logger.warning(f"Could not reconstruct velocity axis for plots: {ve}")
                     else:
-                        logger.warning("Could not find VELOCITY_AXIS in FITS file, skipping plots")
+                        logger.warning("Could not find spectrum HDU in FITS file, skipping plots")
             except Exception as e:
                 logger.warning(f"Could not generate plots: {e}")
         

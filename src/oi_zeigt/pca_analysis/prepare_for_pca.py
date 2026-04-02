@@ -157,7 +157,8 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             object_filter: str = "M51CENTER",
                             mission_id: Optional[str] = None,
                             scan: Optional[int] = None,
-                            fill_noise: bool = False) -> None:
+                            fill_noise: bool = False,
+                            filter_missions: bool = False) -> None:
     """
     Filter FITS file and optionally fill telluric lines with Gaussian noise.
 
@@ -192,28 +193,12 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         n_channels = len(data['SPECTRUM'][0])
         
         try:
-            # Try to get VELOCITY_AXIS column first (velocity per channel)
-            if 'VELOCITY_AXIS' in data.dtype.names:
-                velocity_axis_ms = data['VELOCITY_AXIS'][0]  # m/s per channel
-                velocity_axis_kms = velocity_axis_ms / 1000.0  # Convert to km/s
-                logger.info(f"Velocity axis from VELOCITY_AXIS column: {len(velocity_axis_kms)} channels, {velocity_axis_kms[0]:.1f} to {velocity_axis_kms[-1]:.1f} km/s")
-            # Fall back to constructing from VELOCITY and DELTAV
-            elif ('VELOCITY' in data.dtype.names and 'DELTAV' in data.dtype.names):
-                velo_ref = float(data['VELOCITY'][0])
-                deltav = float(data['DELTAV'][0])
-                
-                # Get reference pixel from header
-                crpix1_spec = float(header.get('CRPIX1', 1.0))
-                
-                # Create velocity axis
-                channel_indices = np.arange(n_channels, dtype=np.float64)
-                velocity_axis = velo_ref + (channel_indices - (crpix1_spec - 1.0)) * deltav
-                velocity_axis_kms = velocity_axis / 1000.0  # Convert m/s to km/s
-                logger.info(f"Velocity axis from VELOCITY/DELTAV: {len(velocity_axis_kms)} channels, {velocity_axis_kms[0]:.1f} to {velocity_axis_kms[-1]:.1f} km/s")
-            else:
-                raise KeyError("VELOCITY_AXIS, VELOCITY, or DELTAV columns missing")
+            from oi_zeigt.basic_io import reconstruct_velocity_axis
+            velocity_axis_kms = reconstruct_velocity_axis(hdul[1]) / 1000.0
+            logger.info(f"Velocity axis reconstructed: {len(velocity_axis_kms)} channels, "
+                        f"{velocity_axis_kms[0]:.1f} to {velocity_axis_kms[-1]:.1f} km/s")
         except (AttributeError, KeyError, TypeError, ValueError) as e:
-            logger.warning(f"Could not construct velocity axis: {e}")
+            logger.warning(f"Could not reconstruct velocity axis: {e}")
             velocity_axis_kms = np.arange(n_channels)
         
         # Filter data
@@ -254,6 +239,71 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
             after_filter = np.sum(combined_mask)
             logger.info(f"  After scan filter: {after_filter}/{before_filter} rows kept")
         
+        # Apply mission drop rules from mission_id_parameters.yml
+        if filter_missions:
+            import yaml as _yaml
+            mission_yml = Path(__file__).parent / 'mission_id_parameters.yml'
+            if not mission_yml.exists():
+                logger.warning(f"--filter-missions requested but YAML not found: {mission_yml}")
+            else:
+                with open(mission_yml, 'r') as _f:
+                    mission_params = _yaml.safe_load(_f) or {}
+                scan_col = np.array(data['SCAN']) if 'SCAN' in data.dtype.names else None
+                telescop_col = np.array([
+                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                    for s in data['TELESCOP']
+                ]) if 'TELESCOP' in data.dtype.names else None
+                n_before_drop = int(np.sum(combined_mask))
+                for mid, params in mission_params.items():
+                    if not params:
+                        continue
+                    drop_cfg = params.get('drop') or {}
+                    if not drop_cfg:
+                        continue
+                    mid_mask = mission_ids == mid
+                    if not np.any(mid_mask & combined_mask):
+                        continue  # mission not present in current data, skip silently
+
+                    # Prefix match: YAML name "LFAV_3" matches FITS "LFAV_3_S" etc.
+                    def _tele_match(tele):
+                        return np.array([t == tele or t.startswith(tele + '_') for t in telescop_col])
+
+                    # drop.telescope
+                    for tele in (drop_cfg.get('telescope') or []):
+                        if telescop_col is not None:
+                            drop = combined_mask & mid_mask & _tele_match(tele)
+                            n = int(np.sum(drop))
+                            if n:
+                                logger.info(f"  drop.telescope: {mid} / {tele} — removing {n} rows")
+                                combined_mask &= ~drop
+                            else:
+                                logger.warning(f"  drop.telescope: {mid} / {tele} — 0 rows matched")
+
+                    # drop.scans
+                    scans_cfg = drop_cfg.get('scans') or {}
+                    if scans_cfg and scan_col is not None:
+                        for scan_num in (scans_cfg.get('complete') or []):
+                            drop = combined_mask & mid_mask & (scan_col == int(scan_num))
+                            n = int(np.sum(drop))
+                            if n:
+                                logger.info(f"  drop.scans.complete: {mid} / scan {scan_num} — removing {n} rows")
+                                combined_mask &= ~drop
+                            else:
+                                logger.warning(f"  drop.scans.complete: {mid} / scan {scan_num} — 0 rows matched")
+                        for tele, scan_list in ((scans_cfg.get('telescope') or {}).items()):
+                            if telescop_col is not None:
+                                for scan_num in (scan_list or []):
+                                    drop = combined_mask & mid_mask & _tele_match(tele) & (scan_col == int(scan_num))
+                                    n = int(np.sum(drop))
+                                    if n:
+                                        logger.info(f"  drop.scans.telescope: {mid} / {tele} / scan {scan_num} — removing {n} rows")
+                                        combined_mask &= ~drop
+                                    else:
+                                        logger.warning(f"  drop.scans.telescope: {mid} / {tele} / scan {scan_num} — 0 rows matched")
+                n_after_drop = int(np.sum(combined_mask))
+                logger.info(f"Mission drop rules: removed {n_before_drop - n_after_drop} rows "
+                            f"({n_before_drop} → {n_after_drop})")
+
         n_original = len(data)
         n_filtered = np.sum(combined_mask)
         n_tsys = np.sum(objects[combined_mask] == 'TSYS')
@@ -281,10 +331,7 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
             spectra_array = np.array(filtered_data['SPECTRUM'], dtype=np.float64)
             n_spectra, n_chan = spectra_array.shape
 
-            if 'VELOCITY_AXIS' in filtered_data.dtype.names:
-                velocity_axes = np.array(filtered_data['VELOCITY_AXIS'], dtype=np.float64) / 1000.0
-            else:
-                velocity_axes = np.tile(velocity_axis_kms, (n_spectra, 1))
+            velocity_axes = np.tile(velocity_axis_kms, (n_spectra, 1))
 
             # Split work into chunks — one per CPU
             n_workers = os.cpu_count() or 1
@@ -491,7 +538,8 @@ def prepare_for_pca(fits_file: Optional[str] = None,
                    object_filter: Optional[str] = None,
                    mission_id: Optional[str] = None,
                    scan: Optional[int] = None,
-                   fill_noise: bool = False) -> None:
+                   fill_noise: bool = False,
+                   filter_missions: bool = False) -> None:
     """
     Main entry point for prepare_for_pca functionality.
     
@@ -583,4 +631,5 @@ def prepare_for_pca(fits_file: Optional[str] = None,
     
     # Process the file
     fill_telluric_with_noise(fits_file, output_fits, pca_source, object_filter,
-                            mission_id=mission_id, scan=scan, fill_noise=fill_noise)
+                            mission_id=mission_id, scan=scan, fill_noise=fill_noise,
+                            filter_missions=filter_missions)

@@ -360,7 +360,7 @@ def _pca_get_decomp(mission_id, telescope, mission_decompositions):
 def _pca_apply_correction(spectrum, components, variance_ratio,
                           good_channels_fit, good_channels_sub,
                           cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size,
-                          use_lstsq=False, per_component_cutoffs=None,
+                          use_lstsq=False,
                           cut_coefficients=0):
     """
     Pure-function PCA correction for one spectrum.
@@ -446,16 +446,7 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
                                  'coeff': coeff[i], 'noise_ratio': noise_ratio}
             continue
 
-        # Noise ratio cutoff: per_component_cutoffs (KDE) takes precedence.
-        if per_component_cutoffs is not None:
-            comp_cutoff = per_component_cutoffs[i] if i < len(per_component_cutoffs) else np.inf
-            if np.isnan(comp_cutoff):
-                component_info[i] = {'used': False, 'reason': 'global_noise_ratio_cutoff',
-                                     'coeff': coeff[i], 'noise_ratio': noise_ratio}
-                continue
-            effective_cutoff = comp_cutoff if np.isfinite(comp_cutoff) else None
-        else:
-            effective_cutoff = cutoff_noise_ratio
+        effective_cutoff = cutoff_noise_ratio
 
         if effective_cutoff is not None and noise_ratio > effective_cutoff:
             component_info[i] = {'used': False, 'reason': 'noise_ratio_cutoff',
@@ -723,7 +714,6 @@ def _pca_spectrum_worker(args):
     """
     args_base = args[:6]
     idx, spectrum, gcf, gcs, mission_id, telescope = args_base
-    per_component_cutoffs = args[6] if len(args) > 6 else None
     s = _pca_worker_state
     try:
         if s['mission_decompositions'] and mission_id is not None:
@@ -744,7 +734,6 @@ def _pca_spectrum_worker(args):
             spectrum, components, variance_ratio, gcf, gcs,
             s['cutoff_variance'], s['cutoff_noise_ratio'], s['smoothing_kernel_size'],
             use_lstsq=s.get('use_lstsq', False),
-            per_component_cutoffs=per_component_cutoffs,
             cut_coefficients=s.get('cut_coefficients', 0),
         )
         details['status'] = 'ok'
@@ -825,14 +814,14 @@ class PCACorrector:
             raise FileNotFoundError(f"Decomposition file not found: {pkl_path}")
         
         file_size = os.path.getsize(pkl_path)
-        logger.info(f"DEBUG: Loading decomposition from {pkl_path} (size: {file_size} bytes)")
+        logger.debug(f"Loading decomposition from {pkl_path} (size: {file_size} bytes)")
         
         with open(pkl_path, 'rb') as f:
             decomposition = pickle.load(f)
         
         # Log the keys in the loaded decomposition dict for debugging
         if isinstance(decomposition, dict):
-            logger.info(f"DEBUG: Decomposition dict keys: {list(decomposition.keys())}")
+            logger.debug(f"Decomposition dict keys: {list(decomposition.keys())}")
             if 'reference_spectrum_indices' in decomposition:
                 indices = decomposition.get('reference_spectrum_indices')
                 if indices is not None:
@@ -1460,13 +1449,14 @@ class PCACorrector:
                 logger.info(f"  All {n_after_zero_filter} spectra have sufficient signal")
             
             # Get velocity axis if available
-            velocity_axis = None
-            if 'VELOCITY_AXIS' in hdu.columns.names:
-                velocity_axis = data['VELOCITY_AXIS'][0]  # Same for all spectra
-                velocity_axis_kms = velocity_axis / 1000.0  # Convert m/s to km/s
-                logger.info(f"  Using VELOCITY_AXIS: {len(velocity_axis)} channels")
-            else:
-                velocity_axis_kms = None
+            velocity_axis_kms = None
+            try:
+                from oi_zeigt.basic_io import reconstruct_velocity_axis
+                vel_axis_ms = reconstruct_velocity_axis(hdu)
+                velocity_axis_kms = vel_axis_ms / 1000.0
+                logger.info(f"  Reconstructed velocity axis: {len(velocity_axis_kms)} channels")
+            except Exception as e:
+                logger.warning(f"  Could not reconstruct velocity axis: {e}")
             
             # Prepare for iterative line detection (following original pca_correct.py)
             # Convert string columns to consistent format once
@@ -1493,18 +1483,30 @@ class PCACorrector:
             )
             
             logger.info(f"  Found {len(unique_groups)} unique mission/telescope/scan/subscan combinations (for line detection)")
-            logger.info(f"  Will generate {len(unique_groups_for_plotting)} plots (one per mission/telescope/scan)")
+            if generate_plots:
+                logger.info(f"  Will generate {len(unique_groups_for_plotting)} plots (one per mission/telescope/scan)")
             logger.info(f"  Total spectra to process: {len(indices)}")
             
-            # Load telluric line mask from mission parameters
+            # Load telluric line mask from mission parameters (per-mission)
             telluric_line_mask = None
-            if velocity_axis_kms is not None and mission_id != "UNKNOWN":
+            if velocity_axis_kms is not None:
                 try:
-                    telluric_line_mask = get_telluric_line_mask(mission_id, velocity_axis_kms, len(indices))
-                    if telluric_line_mask is not None:
-                        telluric_channels = np.any(telluric_line_mask, axis=0)
-                        n_telluric_channels = np.sum(telluric_channels)
-                        logger.info(f"  Loaded telluric line mask: {n_telluric_channels} channels masked")
+                    n_filtered = len(indices)
+                    n_channels = len(velocity_axis_kms)
+                    mask_array = np.zeros((n_filtered, n_channels), dtype=bool)
+                    any_mask = False
+                    for mid in np.unique(mission_ids):
+                        if mid == "UNKNOWN":
+                            continue
+                        mid_result = get_telluric_line_mask(mid, velocity_axis_kms, 1)
+                        if mid_result is not None:
+                            channel_mask = mid_result[0]
+                            mask_array[mission_ids == mid] = channel_mask
+                            any_mask = True
+                    if any_mask:
+                        telluric_line_mask = mask_array
+                        n_telluric_channels = np.sum(np.any(telluric_line_mask, axis=0))
+                        logger.info(f"  Loaded per-mission telluric line masks: {n_telluric_channels} channels masked")
                 except Exception as e:
                     logger.debug(f"  Could not load telluric mask: {e}")
             
@@ -1832,7 +1834,7 @@ class PCACorrector:
 
                         if generate_plots:
                             kde_plot_path = (Path(output_dir) /
-                                             f"kde_noise_ratios_{group_label}.png")
+                                             f"pca_correction_{group_label}_kdeplot.png")
                             try:
                                 _plot_kde_noise_ratios(
                                     kde_params, component_cutoffs, kde_plot_path, group_label)
@@ -1960,7 +1962,6 @@ class PCACorrector:
                             cutoff_noise_ratio,
                             self.smoothing_kernel_size,
                             use_lstsq=self.use_lstsq,
-                            per_component_cutoffs=per_spectrum_cutoffs[spec_idx],
                             cut_coefficients=cut_coefficients,
                         )
 
@@ -2086,6 +2087,29 @@ class PCACorrector:
                         logger.debug(f"Restoring header keyword {key} that was lost during table restructuring")
                         output_table.header[key] = value
             
+            # Add PCAPARAM as a column so it is visible per-row alongside SPECTRUM etc.
+            def _fmt(v):
+                return 'none' if v is None or v is False else str(v)
+            pca_param_str = (
+                f"vc={_fmt(cutoff_variance)} "
+                f"nr={_fmt(cutoff_noise_ratio)} "
+                f"sk={_fmt(self.smoothing_kernel_size)} "
+                f"cc={_fmt(cut_coefficients)} "
+                f"gnr={_fmt(global_noise_ratio_cutoff)} "
+                f"lk={self.line_kernel_size} "
+                f"lstsq={int(self.use_lstsq)}"
+            )
+            n_rows = len(output_table.data)
+            pcaparam_col = fits.Column(
+                name='PCAPARAM',
+                format=f'{len(pca_param_str)}A',
+                array=np.full(n_rows, pca_param_str),
+            )
+            output_table = fits.BinTableHDU.from_columns(
+                output_table.columns + fits.ColDefs([pcaparam_col]),
+                header=output_table.header,
+            )
+
             # Write output FITS
             os.makedirs(os.path.dirname(output_fits) or '.', exist_ok=True)
             hdul_out = fits.HDUList([hdul[0], output_table])
@@ -2119,7 +2143,7 @@ class PCACorrector:
                 
                 # Generate plots with all filtered spectra
                 self._generate_plots(filtered_data, filtered_original, filtered_corrected, filtered_details,
-                                   velocity_axis, mission_id, output_dir,
+                                   velocity_axis_kms, mission_id, output_dir,
                                    science_line_mask=detected_lines_mask,
                                    telluric_line_mask=telluric_line_mask,
                                    input_fits=input_fits,
@@ -2258,7 +2282,7 @@ class PCACorrector:
             
             # Setup x_axis
             if velocity_axis is not None and len(velocity_axis) > 0:
-                x_axis = velocity_axis / 1000.0  # Convert m/s to km/s
+                x_axis = velocity_axis  # already in km/s
                 x_label = 'Velocity (km/s)'
             else:
                 # Safe to access now since we've checked shape above

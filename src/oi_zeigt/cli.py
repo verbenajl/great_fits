@@ -12,10 +12,10 @@ import matplotlib.pyplot as plt
 from astropy.io import fits
 
 from .basic_io import read_fits_from_config, read_fits, get_config, combine_fits_from_list
-from .reduction.core import (analyze_spectrum_values, detect_blank_channels, 
+from .reduction.core import (analyze_spectrum_values, detect_blank_channels,
                             detect_nan_channels, filter_and_save_fits,
                             apply_baseline_from_config, reduce_spectra_from_config,
-                            average_spectra_from_config)
+                            average_spectra_from_config, split_fits_by_mission)
 from .statistics.quality import get_spechistogram, get_rmsratio_histogram, rmsratio_statistics
 
 
@@ -176,16 +176,30 @@ def _print_object_info(hdul, object_filter=None):
                         if 'MISSION_ID' in hdu.columns.names:
                             filtered_mission_ids = filtered_data['MISSION_ID']
                             mission_id_counts = Counter(filtered_mission_ids)
-                            
+
                             click.echo(f"\nMISSION_IDs in filtered data ({len(mission_id_counts)} unique):")
                             sorted_mission_ids = sorted(mission_id_counts.items(), key=lambda x: x[1], reverse=True)
-                            max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id) 
+                            max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id)
                                                   for mission_id, _ in sorted_mission_ids)
-                            
+
                             for mission_id, count in sorted_mission_ids:
                                 mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
                                 click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
-                        
+
+                        # Show TELESCOP for filtered data
+                        if 'TELESCOP' in hdu.columns.names:
+                            filtered_telescopes = filtered_data['TELESCOP']
+                            telescop_counts = Counter(filtered_telescopes)
+
+                            click.echo(f"\nBackends/TELESCOPs in filtered data ({len(telescop_counts)} unique):")
+                            sorted_telescopes = sorted(telescop_counts.items(), key=lambda x: x[0])
+                            max_tel_len = max(len(t.decode() if isinstance(t, bytes) else t)
+                                              for t, _ in sorted_telescopes)
+
+                            for tel, count in sorted_telescopes:
+                                tel_str = tel.decode().strip() if isinstance(tel, bytes) else str(tel).strip()
+                                click.echo(f"  {tel_str:<{max_tel_len}}  : {count:6d} entries")
+
                         click.echo("="*70 + "\n")
                         return  # Skip the general AOR/MISSION display if we're showing filtered data
                     except (OSError, ValueError, TypeError):
@@ -241,11 +255,36 @@ def _print_object_info(hdul, object_filter=None):
                         for mission_id, count in sorted_mission_ids:
                             mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
                             click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
-                        
+
                         click.echo("="*70 + "\n")
                 except (OSError, ValueError, TypeError):
                     pass
-        
+
+                # Check for TELESCOP column (only if not filtered)
+                try:
+                    if 'TELESCOP' in hdu.columns.names:
+                        telescopes = hdu.data['TELESCOP']
+
+                        telescop_counts = Counter(telescopes)
+
+                        click.echo("="*70)
+                        click.echo("UNIQUE BACKENDS/TELESCOPES IN FITS FILE")
+                        click.echo("="*70)
+                        click.echo(f"Total unique backends: {len(telescop_counts)}\n")
+
+                        sorted_telescopes = sorted(telescop_counts.items(), key=lambda x: x[0])
+
+                        max_tel_len = max(len(t.decode() if isinstance(t, bytes) else t)
+                                          for t, _ in sorted_telescopes)
+
+                        for tel, count in sorted_telescopes:
+                            tel_str = tel.decode().strip() if isinstance(tel, bytes) else str(tel).strip()
+                            click.echo(f"  {tel_str:<{max_tel_len}}  : {count:6d} entries")
+
+                        click.echo("="*70 + "\n")
+                except (OSError, ValueError, TypeError):
+                    pass
+
         except (OSError, UnicodeDecodeError, ValueError, TypeError, MemoryError) as e:
             click.echo(f"WARNING: Could not read object information from HDU: {e}")
 
@@ -662,20 +701,13 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
         click.echo(f"Plotting {sample_size} spectra for object '{object}'")
         click.echo(f"Original FITS row indices (for reference): {original_indices}\n")
         
-        # Check if VELOCITY_AXIS column exists, or create one on-the-fly
-        velocity_axis_from_fits = None
-        has_velocity_axis_column = 'VELOCITY_AXIS' in data.dtype.names
-        
-        if not has_velocity_axis_column:
-            # Try to create velocity axis on-the-fly
-            nchans = data['SPECTRUM'][0].shape[0]
-            velocity_axis_from_fits = _create_velocity_axis_from_fits(matrix_hdu, nchans)
-            if velocity_axis_from_fits is not None:
-                click.echo("✓ Created velocity axis on-the-fly from FITS parameters")
-            else:
-                click.echo("  No velocity axis column; using channel indices for x-axis")
+        # Reconstruct velocity axis from VELOCITY/DELTAV/CRPIX1 columns
+        nchans = data['SPECTRUM'][0].shape[0]
+        velocity_axis_from_fits = _create_velocity_axis_from_fits(matrix_hdu, nchans)
+        if velocity_axis_from_fits is not None:
+            click.echo("✓ Velocity axis reconstructed from FITS parameters")
         else:
-            click.echo("✓ Using velocity axis from FITS column")
+            click.echo("  No velocity parameters found; using channel indices for x-axis")
         
         # Create plot
         num_to_plot = len(spectra_to_plot)
@@ -695,20 +727,9 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
             spectrum = spectrum_data['SPECTRUM']
             obj_name = spectrum_data['OBJECT'].decode().strip() if isinstance(spectrum_data['OBJECT'], bytes) else str(spectrum_data['OBJECT']).strip()
             
-            # Determine x-axis: priority is VELOCITY_AXIS column, then on-the-fly creation
             x_axis = None
             x_label = "Channel"
-            
-            if has_velocity_axis_column:
-                try:
-                    velocity_axis = spectrum_data['VELOCITY_AXIS']
-                    if velocity_axis is not None and len(velocity_axis) == len(spectrum):
-                        x_axis = velocity_axis / 1000.0  # Convert m/s to km/s
-                        x_label = "Velocity (km/s)"
-                except (IndexError, TypeError):
-                    pass
-            elif velocity_axis_from_fits is not None:
-                # Use the on-the-fly created axis
+            if velocity_axis_from_fits is not None:
                 x_axis = velocity_axis_from_fits / 1000.0  # Convert m/s to km/s
                 x_label = "Velocity (km/s)"
             
@@ -1601,9 +1622,9 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         click.echo("="*70)
         click.echo(f"\nClean FITS file: {clean_path}")
         click.echo(f"  Records: {n_clean}")
-        click.echo(f"  (Contains all non-{object} objects + filtered {object} spectra)")
-        click.echo(f"  (Only M51 spectra with < {nan_threshold:.1%} NaN channels)")
+        click.echo(f"  (Science spectra passing all filters + calibration rows not rejected by --filter-tau)")
 
+        n_rejected = 0
         if rejected_path is not None:
             hdul_rejected = fits_lib.open(rejected_path)
             n_rejected = len(hdul_rejected[1].data) if len(hdul_rejected) > 1 and hdul_rejected[1].data is not None else 0
@@ -1612,7 +1633,11 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             click.echo(f"  Records: {n_rejected}")
 
         # Print detailed rejection statistics
-        click.echo(f"\n  Rejection breakdown:")
+        n_sci_rejected = (stats['rejected_nan'] + stats['rejected_zero'] + stats['rejected_removed']
+                          + stats['rejected_param'] + stats.get('rejected_peaks', 0)
+                          + stats.get('rejected_tau_science', 0))
+        n_cal_rejected = stats.get('rejected_tau_tau', 0)
+        click.echo(f"\n  Rejection breakdown (science = {object}, filters applied to science rows only):")
         click.echo(f"    - NaN threshold violations: {stats['rejected_nan']}")
         if filter_zero:
             click.echo(f"    - All-zero spectra: {stats['rejected_zero']}")
@@ -1628,11 +1653,17 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         if filter_tau:
             n_sci = stats.get('rejected_tau_science', 0)
             n_tau = stats.get('rejected_tau_tau', 0)
-            click.echo(f"    - Removed by --filter-tau: {n_sci} science spectra, {n_tau} TAU_SIG spectra")
+            click.echo(f"    - Removed by --filter-tau: {n_sci} science spectra, {n_tau} calibration (TAU_SIG) spectra")
             for orig_idx_val, n_sci_removed in stats.get('tau_filter_details', []):
                 if n_sci_removed > 0:
                     click.echo(f"        TAU_SIG original index {orig_idx_val}: removed {n_sci_removed} science spectra")
-        
+        click.echo(f"    ----------------------------------------")
+        click.echo(f"    Total science rejected : {n_sci_rejected}")
+        click.echo(f"    Total calibration rejected: {n_cal_rejected}")
+        click.echo(f"    Total rejected         : {n_sci_rejected + n_cal_rejected}  (file records: {n_rejected})")
+        click.echo(f"    Clean records          : {n_clean}")
+        click.echo(f"    Input total (est.)     : {n_clean + n_rejected}")
+
         click.echo()
         
     except FileNotFoundError as e:
@@ -1647,9 +1678,158 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
 
 
 @click.command()
-@click.option('--config', type=click.Path(exists=True), 
+@click.option(
+    "--fits",
+    type=click.Path(exists=True),
+    required=True,
+    help="Input FITS file to filter."
+)
+@click.option(
+    "--output",
+    type=click.Path(),
+    required=True,
+    help="Output FITS file (filtered)."
+)
+@click.option(
+    "--yaml",
+    "yaml_file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to mission parameters YAML file (default: mission_id_parameters.yml bundled with the package)."
+)
+def filter_missions(fits, output, yaml_file):
+    """
+    Drop spectra from a FITS file according to the drop rules in mission_id_parameters.yml.
+
+    For each mission, three drop rules are supported:
+
+    \b
+      drop:
+        telescope:            # drop ALL rows for these telescopes in this mission
+          - LFAV_3
+        scans:
+          complete:           # drop ALL rows for these scans (any telescope)
+            - 14381
+          telescope:          # drop these scans only for the named telescope
+            LFAV_0:
+              - 18611
+
+    Rows that match any rule are removed from the output; all other rows are kept unchanged.
+
+    Examples:
+
+        filter_missions --fits clean.fits --output clean_filtered.fits
+
+        filter_missions --fits clean.fits --output clean_filtered.fits \\
+            --yaml /path/to/custom_parameters.yml
+    """
+    import yaml as _yaml
+    from pathlib import Path as _Path
+    from astropy.io import fits as _fits
+
+    # Resolve YAML file
+    if yaml_file is None:
+        yaml_file = _Path(__file__).parent / "pca_analysis" / "mission_id_parameters.yml"
+    else:
+        yaml_file = _Path(yaml_file)
+
+    if not yaml_file.exists():
+        click.echo(click.style(f"Error: YAML file not found: {yaml_file}", fg="red"), err=True)
+        sys.exit(1)
+
+    with open(yaml_file, "r") as f:
+        mission_params = _yaml.safe_load(f) or {}
+
+    click.echo(f"Loaded {len(mission_params)} mission entries from {yaml_file}")
+
+    # Load FITS
+    click.echo(f"Reading {fits} ...")
+    with _fits.open(fits) as hdul:
+        primary_hdu = hdul[0].copy()
+        # Find table HDU
+        table_hdu = None
+        for hdu in hdul[1:]:
+            if hasattr(hdu, "data") and hdu.data is not None and hasattr(hdu.data, "dtype"):
+                if "MISSION_ID" in hdu.data.dtype.names:
+                    table_hdu = hdu
+                    break
+        if table_hdu is None:
+            click.echo(click.style("Error: no HDU with MISSION_ID column found.", fg="red"), err=True)
+            sys.exit(1)
+
+        data = table_hdu.data
+        header = table_hdu.header.copy()
+        n_total = len(data)
+        click.echo(f"  {n_total} rows total")
+
+        def _to_str(x):
+            if isinstance(x, bytes):
+                return x.decode().strip()
+            return str(x).strip()
+
+        mission_id_col = np.array([_to_str(x) for x in data["MISSION_ID"]])
+        telescop_col   = np.array([_to_str(x) for x in data["TELESCOP"]])
+        scan_col       = np.array([int(x) for x in data["SCAN"]]) if "SCAN" in data.dtype.names else None
+
+        keep = np.ones(n_total, dtype=bool)
+        n_dropped_total = 0
+
+        for mission_id, params in mission_params.items():
+            if not params:
+                continue
+            drop_cfg = params.get("drop") or {}
+            if not drop_cfg:
+                continue
+
+            mission_mask = mission_id_col == mission_id
+
+            # drop.telescope: remove all rows for these telescopes in this mission
+            for tele in (drop_cfg.get("telescope") or []):
+                affected = mission_mask & (telescop_col == tele)
+                n = int(np.sum(affected))
+                if n:
+                    keep &= ~affected
+                    n_dropped_total += n
+                    click.echo(f"  {mission_id} / {tele}: dropped {n} rows (drop.telescope)")
+
+            # drop.scans
+            scans_cfg = drop_cfg.get("scans") or {}
+            if scans_cfg and scan_col is not None:
+
+                # drop.scans.complete: any telescope
+                for scan_num in (scans_cfg.get("complete") or []):
+                    affected = mission_mask & (scan_col == int(scan_num))
+                    n = int(np.sum(affected))
+                    if n:
+                        keep &= ~affected
+                        n_dropped_total += n
+                        click.echo(f"  {mission_id} / scan {scan_num} (all telescopes): dropped {n} rows")
+
+                # drop.scans.telescope.<TELE>: specific telescope
+                for tele, scan_list in ((scans_cfg.get("telescope") or {}).items()):
+                    for scan_num in (scan_list or []):
+                        affected = mission_mask & (telescop_col == tele) & (scan_col == int(scan_num))
+                        n = int(np.sum(affected))
+                        if n:
+                            keep &= ~affected
+                            n_dropped_total += n
+                            click.echo(f"  {mission_id} / {tele} / scan {scan_num}: dropped {n} rows")
+
+        n_kept = int(np.sum(keep))
+        click.echo(f"\nDropped {n_dropped_total} rows, keeping {n_kept} / {n_total}")
+
+        filtered_data = data[keep]
+        new_hdu = _fits.BinTableHDU(data=filtered_data, header=header)
+        new_hdu.name = table_hdu.name
+        _fits.HDUList([primary_hdu, new_hdu]).writeto(output, overwrite=True)
+
+    click.echo(click.style(f"\nWritten to {output}", fg="green"))
+
+
+@click.command()
+@click.option('--config', type=click.Path(exists=True),
               help='Path to config.toml file.')
-@click.option('--fits', type=click.Path(exists=True), 
+@click.option('--fits', type=click.Path(exists=True),
               help='Path to FITS file (overrides config).')
 @click.option('--order', type=int, default=None,
               help='Baseline polynomial order (default: read from config or 1).')
@@ -3285,12 +3465,9 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         if plot:
             plt.savefig(plot, dpi=150)
             click.echo(f"  Plot saved: {plot}")
+        plt.close()
 
         click.echo()
-
-        # Always show the plot
-        plt.show()
-        plt.close()
 
         hdul.close()
 
@@ -3304,6 +3481,63 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
         import traceback
         traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.option("--fits", "fits_path", type=click.Path(exists=True), required=True,
+              help="Input FITS file to split.")
+@click.option("--output-dir", type=click.Path(), required=True,
+              help="Directory to write chunk files into.")
+@click.option("--manifest", "manifest_path", type=click.Path(), default=None,
+              help="Write a manifest listing all chunk paths (for combine_fits --input).")
+@click.option("--manifest-science", "manifest_science_path", type=click.Path(), default=None,
+              help="Write a manifest listing only science chunks (excludes TREC-only scans).")
+@click.option("--no-scan-split", is_flag=True, default=False,
+              help="Split by (MISSION_ID, TELESCOP) only, skipping the SCAN dimension.")
+def split_fits_cmd(fits_path, output_dir, manifest_path, manifest_science_path, no_scan_split):
+    """
+    Split a large FITS file into one chunk per (MISSION_ID, TELESCOP, SCAN).
+
+    TELESCOP is the receiver/pixel identifier (e.g. LFAV_PX00_S).  Each scan
+    contains its own complete calibration rows (TSYS, TAU_SIG, SKYCHOPDIFF, …)
+    alongside science rows, so scan-level splitting is safe.
+
+    Two manifests can be written:
+
+    \b
+      --manifest         all chunks (including TREC-only scans)
+      --manifest-science science chunks only (skip TREC-only scans in pipeline)
+
+    Use --no-scan-split for one chunk per flight × receiver instead.
+
+    Examples:
+
+        split_fits --fits big.fits --output-dir chunks/ \\
+            --manifest chunks/manifest.txt \\
+            --manifest-science chunks/manifest_science.txt
+    """
+    try:
+        split_by_scan = not no_scan_split
+        label = "MISSION_ID / TELESCOP / SCAN" if split_by_scan else "MISSION_ID / TELESCOP"
+        click.echo(f"Splitting {fits_path} by {label} ...")
+        all_paths, science_paths = split_fits_by_mission(
+            fits_path, output_dir,
+            manifest_path=manifest_path,
+            manifest_science_path=manifest_science_path,
+            split_by_scan=split_by_scan,
+        )
+        n_trec = len(all_paths) - len(science_paths)
+        click.echo(click.style(f"✓ Written {len(all_paths)} chunk files to {output_dir}", fg="green"))
+        click.echo(f"  Science chunks : {len(science_paths)}")
+        click.echo(f"  TREC-only chunks: {n_trec}")
+        if manifest_path:
+            click.echo(f"  All-chunks manifest    : {manifest_path}")
+        if manifest_science_path:
+            click.echo(f"  Science manifest       : {manifest_science_path}")
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        import traceback; traceback.print_exc()
         sys.exit(1)
 
 
@@ -3446,9 +3680,16 @@ def combine_fits(input, output, single_hdu):
     default=False,
     help="Fill telluric line channels with Gaussian noise (default: off)"
 )
+@click.option(
+    "--filter-missions",
+    "filter_missions",
+    is_flag=True,
+    default=False,
+    help="Apply drop rules from mission_id_parameters.yml (telescope/scan exclusions per mission)."
+)
 def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional[str],
                    pca_source: Optional[str], object: Optional[str], mission_id: Optional[str],
-                   scan: Optional[int], fill_noise: bool):
+                   scan: Optional[int], fill_noise: bool, filter_missions: bool):
     """
     Prepare FITS data for PCA analysis.
     
@@ -3493,7 +3734,8 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
             object_filter=object,
             mission_id=mission_id,
             scan=scan,
-            fill_noise=fill_noise
+            fill_noise=fill_noise,
+            filter_missions=filter_missions,
         )
         
         click.echo("\n" + "="*70)
@@ -3618,17 +3860,13 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill
         data = matrix_hdu.data
         n_spectra = len(data)
 
-        if 'VELOCITY_AXIS' in data.dtype.names:
-            # Use first spectrum's axis (same for all after reduce_spectra)
-            velocity_axis_kms = data['VELOCITY_AXIS'][0] / 1000.0
-        else:
-            velocity_axis_ms = _create_velocity_axis(
-                spectral_params['velo_ref'],
-                spectral_params['deltav'],
-                spectral_params['crpix1_spec'],
-                spectral_params['nchans'],
-            )
-            velocity_axis_kms = velocity_axis_ms / 1000.0
+        velocity_axis_ms = _create_velocity_axis(
+            spectral_params['velo_ref'],
+            spectral_params['deltav'],
+            spectral_params['crpix1_spec'],
+            spectral_params['nchans'],
+        )
+        velocity_axis_kms = velocity_axis_ms / 1000.0
 
         outside_mask = (velocity_axis_kms < v_min_kms) | (velocity_axis_kms > v_max_kms)
         n_outside = int(np.sum(outside_mask))
@@ -3714,7 +3952,6 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill
                 mission_params_cache = {mid: load_mission_parameters(mid) for mid in unique_missions}
 
                 n_refilled = 0
-                has_vel_col = 'VELOCITY_AXIS' in data.dtype.names
 
                 # Batch by mission_id: telluric mask is the same for all spectra
                 # sharing the same mission_id and velocity axis.
@@ -3726,11 +3963,8 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill
 
                     idx = np.where((mission_ids == mid) & science_mask)[0]
 
-                    # Representative velocity axis (same for all spectra in a mission)
-                    if has_vel_col:
-                        vel_kms = data['VELOCITY_AXIS'][idx[0]] / 1000.0
-                    else:
-                        vel_kms = velocity_axis_kms
+                    # Velocity axis reconstructed from VELOCITY/DELTAV/CRPIX1 (same for all spectra)
+                    vel_kms = velocity_axis_kms
 
                     telluric_mask = get_telluric_indices(mid, vel_kms)
                     if telluric_mask is None or not np.any(telluric_mask):
@@ -3867,11 +4101,25 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill
 @click.option('--zoom', 'zoom_size_arcmin', type=float, default=None,
               help='Show a centred zoom panel of this size in arcmin, '
                    'with colour scale recalculated for the zoomed region.')
+@click.option('--zoom-x', type=float, default=None,
+              help='X pixel coordinate of the zoom region centre (default: map centre).')
+@click.option('--zoom-y', type=float, default=None,
+              help='Y pixel coordinate of the zoom region centre.')
+@click.option('--zoom-ra', type=str, default=None,
+              help='RA of the zoom region centre: decimal degrees or hh:mm:ss.s '
+                   '(used when --zoom-x/y not given).')
+@click.option('--zoom-dec', type=str, default=None,
+              help='Dec of the zoom region centre: decimal degrees or dd:mm:ss.s')
 @click.option('--region-x', type=float, default=None,
-              help='X pixel coordinate of circular extraction aperture centre '
-                   '(as read from the plot). If omitted with --region-radius, uses map centre.')
+              help='X pixel coordinate of circular extraction aperture centre. '
+                   'If omitted with --region-radius, uses map centre.')
 @click.option('--region-y', type=float, default=None,
               help='Y pixel coordinate of circular extraction aperture centre.')
+@click.option('--region-ra', type=str, default=None,
+              help='RA of extraction aperture centre: decimal degrees or hh:mm:ss.s '
+                   '(used when --region-x/y not given).')
+@click.option('--region-dec', type=str, default=None,
+              help='Dec of extraction aperture centre: decimal degrees or dd:mm:ss.s')
 @click.option('--region-radius', 'region_radius_arcmin', type=float, default=None,
               help='Radius in arcmin of circular aperture for spectrum extraction. '
                    'Adds a separate spectrum panel and a circle on the map.')
@@ -3884,7 +4132,9 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill
 @click.option('--no-show', is_flag=True, default=False,
               help='Do not open an interactive plot window.')
 def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
-                      region_x, region_y, region_radius_arcmin, use_wcs,
+                      zoom_x, zoom_y, zoom_ra, zoom_dec,
+                      region_x, region_y, region_ra, region_dec,
+                      region_radius_arcmin, use_wcs,
                       plot, fits_output, no_show):
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
@@ -3901,26 +4151,62 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
 
         collapse_cube --fits datacube.fits --velocity-range 500 550 \\
             --zoom 5 --region-x 128 --region-y 135 --region-radius 2.5 --use-wcs
+
+        collapse_cube --fits datacube.fits --velocity-range 500 550 \\
+            --zoom 5 --zoom-ra 202.4 --zoom-dec 47.2 \\
+            --region-ra 202.4 --region-dec 47.2 --region-radius 2.5 --use-wcs
     """
+    def _parse_angle(value, is_ra=False):
+        """Parse decimal degrees or sexagesimal string → float degrees."""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            from astropy.coordinates import Angle
+            import astropy.units as u
+            unit = u.hourangle if is_ra else u.deg
+            return float(Angle(value, unit=unit).deg)
+
     try:
         from oi_zeigt.mapping.gridding import collapse_cube
+
+        zoom_ra   = _parse_angle(zoom_ra,   is_ra=True)
+        zoom_dec  = _parse_angle(zoom_dec,  is_ra=False)
+        region_ra  = _parse_angle(region_ra,  is_ra=True)
+        region_dec = _parse_angle(region_dec, is_ra=False)
 
         click.echo(f"Collapsing cube: {cube_fits}")
         if velocity_range:
             click.echo(f"  Velocity range: {velocity_range[0]:.1f} – {velocity_range[1]:.1f} km/s")
         if zoom_size_arcmin:
-            click.echo(f"  Zoom: {zoom_size_arcmin:.1f} arcmin centred")
+            if zoom_ra is not None and zoom_dec is not None:
+                click.echo(f"  Zoom: {zoom_size_arcmin:.1f} arcmin centred on RA={zoom_ra}, Dec={zoom_dec}")
+            elif zoom_x is not None and zoom_y is not None:
+                click.echo(f"  Zoom: {zoom_size_arcmin:.1f} arcmin centred on pixel ({zoom_x}, {zoom_y})")
+            else:
+                click.echo(f"  Zoom: {zoom_size_arcmin:.1f} arcmin centred on map centre")
         if region_radius_arcmin:
-            ctr = (f"pixel ({region_x}, {region_y})"
-                   if region_x is not None else "map centre")
+            if region_ra is not None and region_dec is not None:
+                ctr = f"RA={region_ra}, Dec={region_dec}"
+            elif region_x is not None and region_y is not None:
+                ctr = f"pixel ({region_x}, {region_y})"
+            else:
+                ctr = "map centre"
             click.echo(f"  Region: r = {region_radius_arcmin:.1f}′ at {ctr}")
 
         collapsed, header2d, fig = collapse_cube(
             cube_fits=cube_fits,
             velocity_range=velocity_range,
             zoom_size_arcmin=zoom_size_arcmin,
+            zoom_x=zoom_x,
+            zoom_y=zoom_y,
+            zoom_ra=zoom_ra,
+            zoom_dec=zoom_dec,
             region_x=region_x,
             region_y=region_y,
+            region_ra=region_ra,
+            region_dec=region_dec,
             region_radius_arcmin=region_radius_arcmin,
             use_wcs=use_wcs,
             fits_output=fits_output,
@@ -3938,6 +4224,195 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
         sys.exit(1)
     except Exception as e:
         click.echo(click.style(f"Unexpected error: {e}", fg='red'), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.option(
+    "--config",
+    type=click.Path(exists=False),
+    default=None,
+    help="Path to config.toml file"
+)
+@click.option(
+    "--fits",
+    "fits_file",
+    type=click.Path(exists=False),
+    default=None,
+    help="Path to FITS file to read directly"
+)
+@click.option(
+    "--reduced", is_flag=True, default=False,
+    help="Read from output.reduced_fits in config"
+)
+@click.option(
+    "--clean", is_flag=True, default=False,
+    help="Read from output.clean_fits in config"
+)
+@click.option(
+    "--prepared", is_flag=True, default=False,
+    help="Read from output.prepared_for_pca in config"
+)
+@click.option(
+    "--pcad", is_flag=True, default=False,
+    help="Read from output.pcad_fits in config"
+)
+@click.option(
+    "--sky",
+    type=click.Choice(["obs", "OBS", "fit", "FIT"], case_sensitive=False),
+    default="fit",
+    show_default=True,
+    help="Which telluric object type to plot: 'fit' → S-H_FIT (default), 'obs' → S-H_OBS"
+)
+@click.option(
+    "--output",
+    type=click.Path(),
+    default=None,
+    help="Output file for the plot (PNG or PDF). If not given, displays interactively."
+)
+@click.option(
+    "--no-show",
+    is_flag=True,
+    default=False,
+    help="Do not open the interactive plot window (useful with --output)."
+)
+def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, output, no_show):
+    """
+    Plot the averaged telluric spectrum per mission_id/telescop combination.
+
+    By default plots the average of OBJECT=S-H_FIT spectra.  Pass --sky obs
+    to plot OBJECT=S-H_OBS instead.  One panel is produced per unique
+    (MISSION_ID, TELESCOP) group found in the file.
+
+    Examples:
+
+        examine_telluric --config config.toml
+        examine_telluric --fits data.fits --sky obs --output telluric_obs.png
+    """
+    import math as _math
+
+    try:
+        # Resolve FITS path
+        fits_path = fits_file
+        if fits_path is None:
+            try:
+                import tomllib
+            except ModuleNotFoundError:
+                import tomli as tomllib
+            cfg_path = config or "config.toml"
+            with open(cfg_path, "rb") as f:
+                cfg = tomllib.load(f)
+            out_cfg = cfg.get("output", {})
+            if pcad:
+                fits_path = out_cfg.get("pcad_fits")
+            elif prepared:
+                fits_path = out_cfg.get("prepared_for_pca")
+            elif clean:
+                fits_path = out_cfg.get("clean_fits")
+            elif reduced:
+                fits_path = out_cfg.get("reduced_fits")
+            else:
+                fits_path = out_cfg.get("prepared_for_pca") or out_cfg.get("reduced_fits")
+            if not fits_path:
+                click.echo(click.style("Error: could not determine FITS path from config.", fg="red"), err=True)
+                sys.exit(1)
+
+        hdul = read_fits(fits_path)
+        matrix_hdu = next(
+            (hdu for hdu in hdul
+             if hasattr(hdu, "data") and hdu.data is not None
+             and "SPECTRUM" in hdu.data.dtype.names),
+            None,
+        )
+        if matrix_hdu is None:
+            click.echo(click.style("Error: no HDU with SPECTRUM column found.", fg="red"), err=True)
+            sys.exit(1)
+
+        data = matrix_hdu.data
+
+        # Reconstruct velocity axis
+        from .basic_io import reconstruct_velocity_axis
+        try:
+            vel_ms = reconstruct_velocity_axis(matrix_hdu)
+            vel_kms = vel_ms / 1000.0
+        except Exception as e:
+            click.echo(f"Warning: could not reconstruct velocity axis ({e}); using channel numbers.")
+            vel_kms = None
+
+        # Determine target OBJECT string
+        target_obj = "S-H_FIT" if sky.lower() == "fit" else "S-H_OBS"
+
+        def _str(v):
+            return v.decode().strip() if isinstance(v, bytes) else str(v).strip()
+
+        # Group rows by MISSION_ID only (average all telescops within each mission)
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i, row in enumerate(data):
+            obj = _str(row["OBJECT"])
+            if obj != target_obj:
+                continue
+            mission = _str(row["MISSION_ID"]) if "MISSION_ID" in data.dtype.names else "UNKNOWN"
+            groups[mission].append(i)
+
+        if not groups:
+            click.echo(click.style(
+                f"No spectra with OBJECT='{target_obj}' found in {fits_path}.", fg="red"), err=True)
+            sys.exit(1)
+
+        sorted_keys = sorted(groups.keys())
+        n_groups = len(sorted_keys)
+        click.echo(f"Found {n_groups} missions with OBJECT='{target_obj}'")
+
+        # Layout: roughly square grid
+        n_cols = min(4, n_groups)
+        n_rows = _math.ceil(n_groups / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols,
+                                 figsize=(5 * n_cols, 3 * n_rows),
+                                 squeeze=False)
+        fig.suptitle(f"Average {target_obj} per mission", fontsize=11)
+
+        for idx, mission in enumerate(sorted_keys):
+            row_idx = idx // n_cols
+            col_idx = idx % n_cols
+            ax = axes[row_idx][col_idx]
+
+            indices = groups[mission]
+            spectra = np.array([data["SPECTRUM"][i] for i in indices], dtype=np.float64)
+            avg = np.nanmean(spectra, axis=0)
+
+            x = vel_kms if vel_kms is not None else np.arange(len(avg))
+            x_label = "Velocity (km/s)" if vel_kms is not None else "Channel"
+
+            ax.plot(x, avg, linewidth=0.8, color="steelblue")
+            ax.set_title(mission, fontsize=8)
+            ax.set_xlabel(x_label, fontsize=7)
+            ax.set_ylabel("T (K)", fontsize=7)
+            ax.tick_params(labelsize=6)
+            ax.grid(True, alpha=0.3)
+            ax.text(0.97, 0.95, f"n={len(indices)}",
+                    transform=ax.transAxes, ha="right", va="top", fontsize=6)
+
+        # Hide unused axes
+        for idx in range(n_groups, n_rows * n_cols):
+            axes[idx // n_cols][idx % n_cols].set_visible(False)
+
+        fig.tight_layout()
+
+        if output:
+            fig.savefig(output, dpi=150, bbox_inches="tight")
+            click.echo(f"✓ Saved plot to {output}")
+        if not no_show:
+            plt.show()
+        plt.close(fig)
+
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
         import traceback
         traceback.print_exc()
         sys.exit(1)

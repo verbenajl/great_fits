@@ -6,12 +6,42 @@ import os
 from pathlib import Path
 from typing import Optional, Union
 
+import numpy as np
+
 try:
     import tomllib  # Built-in for Python 3.11+
 except ImportError:
     import tomli as tomllib  # Fallback for Python < 3.11
 
 from astropy.io import fits
+
+
+def reconstruct_velocity_axis(hdu) -> np.ndarray:
+    """
+    Reconstruct the velocity axis (m/s) from FITS header/column parameters.
+
+    Uses the VELOCITY column (reference velocity at CRPIX1), DELTAV column
+    (channel spacing), and CRPIX1 header key (reference pixel, 1-indexed).
+    These values are always present and already account for any channel
+    extraction or decimation applied by ``reduce_spectra``.
+
+    Parameters
+    ----------
+    hdu : astropy.io.fits.BinTableHDU
+        Binary table HDU containing SPECTRUM, VELOCITY, and DELTAV columns.
+
+    Returns
+    -------
+    np.ndarray
+        Velocity axis in m/s, shape ``(n_channels,)``.
+    """
+    data     = hdu.data
+    velo_ref = float(data['VELOCITY'][0])
+    deltav   = float(data['DELTAV'][0])
+    crpix1   = float(hdu.header.get('CRPIX1', 1.0))
+    nchans   = data['SPECTRUM'].shape[1]
+    ch       = np.arange(nchans, dtype=np.float64)
+    return velo_ref + (ch - (crpix1 - 1.0)) * deltav
 
 
 def get_config(config_path: Optional[Union[str, Path]] = None) -> dict:
@@ -177,68 +207,89 @@ def combine_fits_files(fits_file_list: list, output_hdul: fits.HDUList = None,
     >>> combined_hdul.writeto("/path/to/combined_single.fits", overwrite=True)
     """
     import numpy as np
-    from astropy.table import Table
-    
+    import tempfile
+    import os
+
     if not fits_file_list:
         raise ValueError("fits_file_list cannot be empty")
-    
+
     if single_hdu:
-        # Mode: Combine all data into a single binary table HDU
-        all_tables = []
+        # Streaming implementation: peak RAM ≈ size of largest single input file.
+        #
+        # Strategy:
+        #   1. Scan all files with memmap=True → get dtype, total rows, headers.
+        #      RAM: negligible (only headers and metadata).
+        #   2. Allocate a disk-backed numpy.memmap of (total_rows,) with the
+        #      correct dtype.  RAM: zero (backed by a temp file on disk).
+        #   3. Fill the memmap one file at a time.
+        #      RAM: one file's data at a time (≈ total / n_files).
+        #   4. Build the output HDUList from the memmap and write to disk.
+        #      RAM: one file's data at a time (astropy streams the memmap).
+        #   5. Delete the temp file.
+
+        # ── Phase 1: inventory ───────────────────────────────────────────────
         primary_hdu = None
-        first_spectrum_hdu = None  # To preserve header information
-        
+        first_table_header = None
+        dtype = None
+        total_rows = 0
+
         for fits_file_path in fits_file_list:
             fits_path = Path(fits_file_path)
             if not fits_path.exists():
                 raise FileNotFoundError(f"FITS file not found: {fits_path}")
-            
-            with fits.open(fits_path) as hdul:
-                # Save primary HDU from first file
+            with fits.open(fits_path, memmap=True) as hdul:
                 if primary_hdu is None:
                     primary_hdu = hdul[0].copy()
-                
-                # Collect all binary table data (all extension HDUs)
+                    first_table_header = hdul[1].header.copy()
+                    dtype = hdul[1].data.dtype
                 for hdu in hdul[1:]:
-                    if hasattr(hdu, 'data') and hdu.data is not None:
-                        all_tables.append(Table(hdu.data))
-                        # Save first spectrum HDU header for coordinate information
-                        if first_spectrum_hdu is None:
-                            first_spectrum_hdu = hdu
-        
-        # Concatenate all tables
-        if not all_tables:
+                    if hdu.data is not None:
+                        total_rows += len(hdu.data)
+
+        if total_rows == 0:
             raise ValueError("No spectral data found in any FITS files")
-        
-        combined_table = Table(np.concatenate([table.as_array() for table in all_tables]))
-        
-        # Create new binary table HDU with combined data
-        combined_bintable_hdu = fits.BinTableHDU(combined_table)
-        combined_bintable_hdu.name = "SPECTRA"
-        
-        # Copy important header keywords from first spectrum HDU (especially coordinate info)
-        # These include CRVAL2/CRVAL3 (reference coordinates) and CRPIX1 (spectral reference)
-        # which are crucial for mapping and velocity axis reconstruction
-        if first_spectrum_hdu is not None:
-            # WCS keywords for spatial axes (RA/Dec)
-            spatial_wcs_keys = ['CRVAL2', 'CRVAL3', 'CRPIX2', 'CRPIX3', 'CTYPE2', 'CTYPE3', 'CUNIT2', 'CUNIT3', 'CDELT2', 'CDELT3']
-            # WCS keywords for spectral axis (frequency or velocity)
-            spectral_wcs_keys = ['CRVAL1', 'CRPIX1', 'CTYPE1', 'CUNIT1', 'CDELT1']
-            # Other important spectral parameters
-            spectral_param_keys = ['VELOCITY', 'DELTAV', 'RESTFREQ', 'VELDEF']
-            
-            all_keys_to_copy = spatial_wcs_keys + spectral_wcs_keys + spectral_param_keys
-            
-            # Copy to both PRIMARY header and binary table header
-            # PRIMARY header: for tools that read spectral info from primary
-            # BinTable header: for data that's in the table
-            for key in all_keys_to_copy:
-                if key in first_spectrum_hdu.header:
-                    primary_hdu.header[key] = first_spectrum_hdu.header[key]
-                    combined_bintable_hdu.header[key] = first_spectrum_hdu.header[key]
-        
-        # Create output HDUList
-        output_hdul = fits.HDUList([primary_hdu, combined_bintable_hdu])
+
+        # ── Phase 2: disk-backed staging array ──────────────────────────────
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.memmap')
+        os.close(tmp_fd)
+        try:
+            combined = np.memmap(tmp_path, dtype=dtype, mode='w+', shape=(total_rows,))
+
+            # ── Phase 3: fill one file at a time ────────────────────────────
+            offset = 0
+            for fits_file_path in fits_file_list:
+                with fits.open(fits_file_path, memmap=True) as hdul:
+                    for hdu in hdul[1:]:
+                        if hdu.data is not None:
+                            n = len(hdu.data)
+                            combined[offset:offset + n] = hdu.data[:]
+                            offset += n
+                combined.flush()
+
+            # ── Phase 4: build output HDUList ────────────────────────────────
+            combined_bintable_hdu = fits.BinTableHDU(combined)
+            combined_bintable_hdu.name = "SPECTRA"
+
+            # Copy WCS and spectral keywords from the first table header
+            keys_to_copy = [
+                'CRVAL2', 'CRVAL3', 'CRPIX2', 'CRPIX3',
+                'CTYPE2', 'CTYPE3', 'CUNIT2', 'CUNIT3', 'CDELT2', 'CDELT3',
+                'CRVAL1', 'CRPIX1', 'CTYPE1', 'CUNIT1', 'CDELT1',
+                'VELOCITY', 'DELTAV', 'RESTFREQ', 'VELDEF',
+            ]
+            for key in keys_to_copy:
+                if key in first_table_header:
+                    primary_hdu.header[key] = first_table_header[key]
+                    combined_bintable_hdu.header[key] = first_table_header[key]
+
+            output_hdul = fits.HDUList([primary_hdu, combined_bintable_hdu])
+
+        finally:
+            # ── Phase 5: remove temp file ────────────────────────────────────
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     else:
         # Mode: Keep separate HDUs (original behavior)
         # Initialize with the first file's HDUList

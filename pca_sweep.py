@@ -6,7 +6,8 @@ For each parameter combination the script runs:
   1. pca_correct        — apply PCA correction
   2. post_process_data  — compute RMS / refill telluric noise
   3. filter_fits        — apply RMSRATIOB, peak, and tau filters
-  4. compare_map_integrated — produce a comparison plot
+  4. create_datacube    — grid post_1.5.fits into a temporary 3D cube
+  5. collapse_cube      — moment-0 map + spectra plot (saved with parameter tag)
 
 Plot files are saved to PLOT_DIR with filenames that encode
 all parameter values.  FITS files are overwritten on every run.
@@ -27,23 +28,29 @@ CONFIG = "config.toml"          # path to config.toml (relative or absolute)
 
 # Virtual environment executables
 # pca_correct / post_process_data / filter_fits need OpenCV → oi venv
-# compare_map_integrated needs cygrid → cygrid venv
+# create_datacube / collapse_cube need cygrid → cygrid venv
 OI_BIN      = Path("~/.venv/oi/bin").expanduser()
 CYGRID_BIN  = Path("~/.venv/cygrid/bin").expanduser()
 
 # Fixed paths (must match config.toml [output] section)
-POST_FITS    = "/home/diskB/data_soft/m51/processed_fits/post_processed.fits"
-POST_15_FITS = "/home/diskB/data_soft/m51/processed_fits/post_1.5.fits"
-CLEAN_FITS   = "/home/diskB/data_soft/m51/processed_fits/clean_data.fits"
-REDUCED_FITS = "/home/diskB/data_soft/m51/processed_fits/reduced_data.fits"
-PREP_FITS    = "/home/diskB/data_soft/m51/processed_fits/prepared_for_pca.fits"
-PCAD_FITS    = "/home/diskB/data_soft/m51/processed_fits/pca_corrected.fits"
+POST_FITS      = "/home/diskB/data_soft/m51/processed_fits/post_processed.fits"
+POST_15_FITS   = "/home/diskB/data_soft/m51/processed_fits/post_1.5.fits"
+CLEAN_FITS     = "/home/diskB/data_soft/m51/processed_fits/clean_data.fits"
+REDUCED_FITS   = "/home/diskB/data_soft/m51/processed_fits/reduced_data.fits"
+PREP_FITS      = "/home/diskB/data_soft/m51/processed_fits/prepared_for_pca.fits"
+PCAD_FITS      = "/home/diskB/data_soft/m51/processed_fits/pca_corrected.fits"
+DATACUBE_TEMP  = "/home/diskB/data_soft/m51/processed_fits/datacube_temp.fits"
 
-# Where comparison plots are saved
-PLOT_DIR = Path("/home/diskB/data_soft/m51/pca_sweep_plots_00")
+# Where collapse_cube plots are saved
+PLOT_DIR = Path("/home/diskB/data_soft/m51/pca_sweep_plots_01")
 
-# Velocity range for compare_map_integrated (km/s)
-VEL_MIN, VEL_MAX = 500, 550
+# collapse_cube parameters
+COLLAPSE_VEL_MIN  = 425
+COLLAPSE_VEL_MAX  = 575
+COLLAPSE_ZOOM     = 1.0
+COLLAPSE_REGION_X = 25
+COLLAPSE_REGION_Y = 25
+COLLAPSE_REGION_R = 0.2
 
 # ---------------------------------------------------------------------------
 # GRID — edit values here
@@ -53,7 +60,7 @@ VEL_MIN, VEL_MAX = 500, 550
 #   Lower → more components used → more aggressive correction.
 #   Higher → fewer components → less aggressive correction.
 #   Config default: 0.005
-VARIANCE_CUTOFFS = [0.005, 0.008, 0.01, 0.02]
+VARIANCE_CUTOFFS = [0.005, 0.01, 0.02]
 
 # noise_ratio_cutoff: skip a component if its noise ratio exceeds this.
 #   Lower → fewer components applied.
@@ -63,12 +70,12 @@ NOISE_RATIO_CUTOFFS = [1.0, 2.5, 5.0]
 # line_kernel_size: Gaussian blur kernel for OpenCV science-line detection.
 #   Must be odd.  Larger → smoother, misses narrow features.
 #   Config default: 21
-LINE_KERNEL_SIZES = [11, 21, 51]
+LINE_KERNEL_SIZES = [11, 21, 31]
 
 # smoothing_kernel: boxcar size applied to PCA components before subtraction.
 #   None → disabled.  Larger → smoother correction, lower spectral resolution.
 #   Config default: 5
-SMOOTHING_KERNELS = [None, 3, 5, 7, 11]
+SMOOTHING_KERNELS = [5, 7]
 
 # cut_coefficients: skip component if |coeff| < this value.
 #   0 → disabled (no coefficient cutoff).
@@ -76,11 +83,9 @@ SMOOTHING_KERNELS = [None, 3, 5, 7, 11]
 #   Original pyclass default: 0.1; M51 config: disabled (0).
 CUT_COEFFICIENTS = [0, 0.05, 0.1]
 
-# global_noise_ratio_cutoff: enables KDE-based per-group component rejection.
-#   None → disabled (falls back to simple noise_ratio_cutoff threshold).
-#   When set, fits a KDE to the noise ratio distribution across all spectra
-#   per group per component; rejects component globally if KDE peak > this value.
-GLOBAL_NOISE_RATIO_CUTOFFS = [None, 3.0, 5.0]
+# global_noise_ratio_cutoff: KDE-based rejection — removed from pca_correct.
+# Kept as a single None entry so the grid structure is unchanged.
+GLOBAL_NOISE_RATIO_CUTOFFS = [None]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,26 +106,21 @@ def run(cmd: list[str], label: str, env: dict | None = None) -> bool:
 
 def param_tag(vc, nr, lk, sk, cc, gnr) -> str:
     sk_str = str(sk) if sk is not None else "none"
-    gnr_str = str(gnr) if gnr is not None else "none"
-    return f"vc{vc}_nr{nr}_lk{lk}_sk{sk_str}_cc{cc}_gnr{gnr_str}"
+    return f"vc{vc}_nr{nr}_lk{lk}_sk{sk_str}_cc{cc}"
 
 
-def build_pca_correct_cmd(vc, nr, lk, sk, cc, gnr, plot_dir: Path) -> list[str]:
+def build_pca_correct_cmd(vc, nr, lk, sk, cc, gnr) -> list[str]:
     cmd = [
         str(OI_BIN / "pca_correct"),
         "--config", CONFIG,
         "--variance-cutoff", str(vc),
         "--noise-ratio-cutoff", str(nr),
         "--line-kernel-size", str(lk),
-        "--plot",
-        "--plot-dir", str(plot_dir),
     ]
     if sk is not None:
         cmd += ["--smoothing-kernel", str(sk)]
     if cc:
         cmd += ["--cut-coefficients", str(cc)]
-    if gnr is not None:
-        cmd += ["--global-noise-ratio-cutoff", str(gnr)]
     return cmd
 
 
@@ -145,19 +145,28 @@ def build_filter_fits_cmd() -> list[str]:
     ]
 
 
-def build_compare_cmd(plot_path: Path) -> list[str]:
+def build_create_datacube_cmd() -> list[str]:
     return [
-        str(CYGRID_BIN / "compare_map_integrated"),
+        str(CYGRID_BIN / "create_datacube"),
         "--config", CONFIG,
-        "--fits", CLEAN_FITS,
-        "--fits", REDUCED_FITS,
-        "--fits", PREP_FITS,
-        "--fits", PCAD_FITS,
-        "--fits", POST_FITS,
         "--fits", POST_15_FITS,
-        "--velocity-range", str(VEL_MIN), str(VEL_MAX),
+        "--output", DATACUBE_TEMP,
         "--weight-spectra",
         "--weight-channels",
+    ]
+
+
+def build_collapse_cube_cmd(plot_path: Path) -> list[str]:
+    return [
+        str(CYGRID_BIN / "collapse_cube"),
+        "--fits", DATACUBE_TEMP,
+        "--velocity-range", str(COLLAPSE_VEL_MIN), str(COLLAPSE_VEL_MAX),
+        "--zoom", str(COLLAPSE_ZOOM),
+        "--region-x", str(COLLAPSE_REGION_X),
+        "--region-y", str(COLLAPSE_REGION_Y),
+        "--region-radius", str(COLLAPSE_REGION_R),
+        "--use-wcs",
+        "--no-show",
         "--plot", str(plot_path),
     ]
 
@@ -186,30 +195,32 @@ def main():
 
     for i, (vc, nr, lk, sk, cc, gnr) in enumerate(grid, 1):
         tag = param_tag(vc, nr, lk, sk, cc, gnr)
-        pca_plot_dir = PLOT_DIR / tag
         plot_path = PLOT_DIR / f"compare_{tag}.png"
 
         print(f"\n{'#'*70}")
         print(f"  Combination {i}/{n_total}: {tag}")
         print(f"  variance_cutoff={vc}  noise_ratio_cutoff={nr}  line_kernel={lk}  "
-              f"smoothing_kernel={sk}  cut_coefficients={cc}  global_noise_ratio_cutoff={gnr}")
+              f"smoothing_kernel={sk}  cut_coefficients={cc}")
         print(f"{'#'*70}")
 
         t0 = time.time()
         failed_at = None
 
-        if not run(build_pca_correct_cmd(vc, nr, lk, sk, cc, gnr, pca_plot_dir),
-                   "Step 1/4 — pca_correct"):
+        if not run(build_pca_correct_cmd(vc, nr, lk, sk, cc, gnr),
+                   "Step 1/5 — pca_correct"):
             failed_at = "pca_correct"
         elif not run(build_post_process_cmd(),
-                     "Step 2/4 — post_process_data"):
+                     "Step 2/5 — post_process_data"):
             failed_at = "post_process_data"
         elif not run(build_filter_fits_cmd(),
-                     "Step 3/4 — filter_fits"):
+                     "Step 3/5 — filter_fits"):
             failed_at = "filter_fits"
-        elif not run(build_compare_cmd(plot_path),
-                     "Step 4/4 — compare_map_integrated"):
-            failed_at = "compare_map_integrated"
+        elif not run(build_create_datacube_cmd(),
+                     "Step 4/5 — create_datacube"):
+            failed_at = "create_datacube"
+        elif not run(build_collapse_cube_cmd(plot_path),
+                     "Step 5/5 — collapse_cube"):
+            failed_at = "collapse_cube"
 
         elapsed = time.time() - t0
         status = f"FAILED at {failed_at}" if failed_at else f"OK → {plot_path.name}"
