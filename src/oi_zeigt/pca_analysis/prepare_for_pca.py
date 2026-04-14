@@ -157,8 +157,10 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             object_filter: str = "M51CENTER",
                             mission_id: Optional[str] = None,
                             scan: Optional[int] = None,
+                            aor_id: Optional[str] = None,
                             fill_noise: bool = False,
-                            filter_missions: bool = False) -> None:
+                            filter_missions: bool = False,
+                            filter_flight: Optional[list] = None) -> None:
     """
     Filter FITS file and optionally fill telluric lines with Gaussian noise.
 
@@ -220,15 +222,29 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         combined_mask = (objects == pca_source) | (objects == object_filter) | \
                        (objects == 'TSYS') | (objects == 'TAU_SIG')
         
-        # Apply mission_id filter if specified
+        # Apply mission_id filter if specified (substring match: F373 matches 2017-02-10_GR_F373)
         if mission_id:
-            logger.info(f"Filtering to MISSION_ID = '{mission_id}'...")
-            mission_filter = mission_ids == mission_id
+            logger.info(f"Filtering to MISSION_ID containing '{mission_id}'...")
+            mission_filter = np.array([mission_id in mid for mid in mission_ids])
             before_filter = np.sum(combined_mask)
             combined_mask = combined_mask & mission_filter
             after_filter = np.sum(combined_mask)
+            matched = sorted(set(mission_ids[mission_filter].tolist()))
+            logger.info(f"  Matched missions: {matched}")
             logger.info(f"  After mission_id filter: {after_filter}/{before_filter} rows kept")
         
+        # Apply flight filter: remove all rows whose MISSION_ID contains any of the given strings
+        if filter_flight:
+            logger.info(f"Filtering out flights: {filter_flight}...")
+            keep_mask = np.array([not any(f in mid for f in filter_flight) for mid in mission_ids])
+            removed_missions = sorted(set(mission_ids[~keep_mask].tolist()))
+            before_filter = int(np.sum(combined_mask))
+            combined_mask = combined_mask & keep_mask
+            after_filter = int(np.sum(combined_mask))
+            for mid in removed_missions:
+                logger.info(f"  Removed flight: {mid}")
+            logger.info(f"  After flight filter: {after_filter}/{before_filter} rows kept")
+
         # Apply scan filter if specified
         if scan is not None:
             logger.info(f"Filtering to SCAN = {scan}...")
@@ -238,7 +254,23 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
             combined_mask = combined_mask & scan_filter
             after_filter = np.sum(combined_mask)
             logger.info(f"  After scan filter: {after_filter}/{before_filter} rows kept")
-        
+
+        # Apply AOR_ID filter if specified
+        if aor_id is not None and 'AOR_ID' in data.dtype.names:
+            terms = [t.strip() for t in aor_id.split(',') if t.strip()]
+            logger.info(f"Filtering to AOR_ID containing any of {terms}...")
+            aor_id_col = np.array([
+                s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                for s in data['AOR_ID']
+            ])
+            aor_filter = np.array([any(t in a for t in terms) for a in aor_id_col])
+            before_filter = int(np.sum(combined_mask))
+            combined_mask = combined_mask & aor_filter
+            after_filter = int(np.sum(combined_mask))
+            matched = sorted(set(aor_id_col[aor_filter].tolist()))
+            logger.info(f"  Matched AOR_IDs: {matched}")
+            logger.info(f"  After AOR_ID filter: {after_filter}/{before_filter} rows kept")
+
         # Apply mission drop rules from mission_id_parameters.yml
         if filter_missions:
             import yaml as _yaml
@@ -538,8 +570,10 @@ def prepare_for_pca(fits_file: Optional[str] = None,
                    object_filter: Optional[str] = None,
                    mission_id: Optional[str] = None,
                    scan: Optional[int] = None,
+                   aor_id: Optional[str] = None,
                    fill_noise: bool = False,
-                   filter_missions: bool = False) -> None:
+                   filter_missions: bool = False,
+                   filter_flight: Optional[list] = None) -> None:
     """
     Main entry point for prepare_for_pca functionality.
     
@@ -631,5 +665,6 @@ def prepare_for_pca(fits_file: Optional[str] = None,
     
     # Process the file
     fill_telluric_with_noise(fits_file, output_fits, pca_source, object_filter,
-                            mission_id=mission_id, scan=scan, fill_noise=fill_noise,
-                            filter_missions=filter_missions)
+                            mission_id=mission_id, scan=scan, aor_id=aor_id,
+                            fill_noise=fill_noise, filter_missions=filter_missions,
+                            filter_flight=filter_flight)

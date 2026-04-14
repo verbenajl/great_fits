@@ -8,6 +8,7 @@ Falls back to scipy griddata if cygrid is not available.
 
 from typing import Optional, Tuple, Dict, Any
 import os
+from pathlib import Path
 import numpy as np
 from astropy.io import fits
 from astropy import units as u
@@ -352,60 +353,82 @@ def _get_spectral_axis_params(hdul: fits.HDUList) -> Tuple[float, float, float, 
         - Channel 0: v = 470000 + (0 - 505) * 500 = 217500 m/s
         - Channel 1263: v = 470000 + (1263 - 505) * 500 = 849000 m/s
     """
-    # Get the binary table
+    # Get the binary table and its header (CLASS FITS stores spectral params here)
     table = hdul[1].data
-    
-    # Extract reference velocity (should be same for all observations)
+    table_header = hdul[1].header
+    primary_header = hdul[0].header if len(hdul) > 0 else fits.Header()
+
+    def _header_get(key, fallback_keys=()):
+        """Try table header, then primary header, then fallback keys in both."""
+        for k in (key,) + tuple(fallback_keys):
+            if k in table_header:
+                return table_header[k]
+        for k in (key,) + tuple(fallback_keys):
+            if k in primary_header:
+                return primary_header[k]
+        return None
+
+    # Extract reference velocity
+    # Column takes precedence; fall back to VELO-LSR or VELOCITY header keyword
     if 'VELOCITY' in table.names:
         velo_ref = float(table['VELOCITY'][0])
     else:
-        warnings.warn("VELOCITY column not found - using 0.0 as reference", UserWarning)
-        velo_ref = 0.0
-    
+        val = _header_get('VELO-LSR', ('VELOCITY',))
+        if val is not None:
+            velo_ref = float(val)
+        else:
+            warnings.warn("VELOCITY not found in columns or headers - using 0.0 m/s", UserWarning)
+            velo_ref = 0.0
+
     # Extract velocity spacing per channel
     if 'DELTAV' in table.names:
         deltav = float(table['DELTAV'][0])
     else:
-        warnings.warn("DELTAV column not found - using 1.0 m/s as default", UserWarning)
-        deltav = 1.0
-    
+        val = _header_get('DELTAV')
+        if val is not None:
+            deltav = float(val)
+        else:
+            warnings.warn("DELTAV not found in columns or headers - using 1.0 m/s", UserWarning)
+            deltav = 1.0
+
     # Extract rest frequency
     if 'RESTFREQ' in table.names:
         restfreq = float(table['RESTFREQ'][0])
     else:
-        warnings.warn("RESTFREQ column not found - using 1.0 Hz as default", UserWarning)
-        restfreq = 1.0
-    
+        val = _header_get('RESTFREQ', ('RESTFRQ',))
+        if val is not None:
+            restfreq = float(val)
+        else:
+            warnings.warn("RESTFREQ not found in columns or headers - using 1.0 Hz", UserWarning)
+            restfreq = 1.0
+
     # Extract velocity definition
     if 'VELDEF' in table.names:
         veldef_val = table['VELDEF'][0]
-        # Handle bytes vs string
         veldef = veldef_val.decode().strip() if isinstance(veldef_val, bytes) else str(veldef_val).strip()
     else:
-        warnings.warn("VELDEF column not found - using 'RADI-LSR' as default", UserWarning)
-        veldef = 'RADI-LSR'
-    
+        val = _header_get('VELDEF')
+        if val is not None:
+            veldef = str(val).strip()
+        else:
+            warnings.warn("VELDEF not found in columns or headers - using 'RADI-LSR'", UserWarning)
+            veldef = 'RADI-LSR'
+
     # Get number of spectral channels from SPECTRUM
     if 'SPECTRUM' in table.names:
         nchans = table['SPECTRUM'].shape[1]
     else:
         raise ValueError("SPECTRUM column not found in FITS table")
-    
-    # Extract reference pixel for spectral axis
-    # First try to get it from the binary table header (CRPIX1)
-    table_header = hdul[1].header
+
+    # Extract reference pixel for spectral axis (CRPIX1)
     if 'CRPIX1' in table_header:
         crpix1_spec = float(table_header['CRPIX1'])
+    elif 'CRPIX1' in primary_header:
+        crpix1_spec = float(primary_header['CRPIX1'])
     else:
-        # Try primary header
-        primary_header = hdul[0].header if len(hdul) > 0 else None
-        if primary_header and 'CRPIX1' in primary_header:
-            crpix1_spec = float(primary_header['CRPIX1'])
-        else:
-            # Default to first pixel if not found
-            warnings.warn("CRPIX1 not found in headers - using 1.0 (first channel) as reference pixel", UserWarning)
-            crpix1_spec = 1.0
-    
+        warnings.warn("CRPIX1 not found in headers - using 1.0 (first channel)", UserWarning)
+        crpix1_spec = 1.0
+
     return velo_ref, deltav, restfreq, veldef, nchans, crpix1_spec
 
 
@@ -469,7 +492,8 @@ def grid_to_map(ras: np.ndarray, decs: np.ndarray, values: np.ndarray,
                 beamsize_deg: float,
                 ra_min: float, ra_max: float,
                 dec_min: float, dec_max: float,
-                weights: Optional[np.ndarray] = None) -> np.ndarray:
+                weights: Optional[np.ndarray] = None,
+                kernel_fwhm_deg: Optional[float] = None) -> np.ndarray:
     """
     Grid irregularly-sampled (ra, dec, value) triplets onto a regular 2D map.
 
@@ -482,9 +506,9 @@ def grid_to_map(ras: np.ndarray, decs: np.ndarray, values: np.ndarray,
     ras, decs : ndarray
         Observation coordinates in degrees (already filtered to finite values).
     values : ndarray
-        Data values to grid.  For weighted gridding pass ``values * weight``
-        here and supply the raw weights in *weights* so the function can
-        normalise correctly.
+        Data values to grid (raw, unscaled). When *weights* is provided the
+        function internally computes ``values * weights`` as the numerator and
+        ``weights`` as the denominator, yielding a proper weighted average.
     wcs_header_dict : dict
         WCS header produced by :func:`create_wcs_header` (used by cygrid).
     naxis1, naxis2 : int
@@ -502,29 +526,37 @@ def grid_to_map(ras: np.ndarray, decs: np.ndarray, values: np.ndarray,
     grid_map : ndarray, shape (naxis2, naxis1)
         Gridded 2D map as float32.
     """
-    kernelsize_sigma = beamsize_deg / 2.355
+    effective_fwhm = kernel_fwhm_deg if kernel_fwhm_deg is not None else beamsize_deg
+    kernelsize_sigma = effective_fwhm / 2.355
     kernel_type = 'gauss1d'
     kernel_params = (kernelsize_sigma,)
     kernel_support = 3.0 * kernelsize_sigma
     hpx_maxres = kernelsize_sigma / 2.0
 
     if HAS_CYGRID:
+        # Numerator: sum(kernel * value * weight) — pre-multiply so the kernel
+        # applies to the weighted values, not just the raw values.
+        gridded_values = values * weights if weights is not None else values
         gridder = cygrid.WcsGrid(wcs_header_dict)
         gridder.set_kernel(kernel_type, kernel_params, kernel_support, hpx_maxres)
-        gridder.grid(ras, decs, values)
-        grid_map = gridder.get_datacube().squeeze().astype(np.float64)
+        gridder.grid(ras, decs, gridded_values)
+        with np.errstate(invalid='ignore'):
+            grid_map = gridder.get_datacube().squeeze().astype(np.float64)
 
         # Always grid a coverage map to identify empty pixels (cygrid fills them with 0)
         gridder_cov = cygrid.WcsGrid(wcs_header_dict)
         gridder_cov.set_kernel(kernel_type, kernel_params, kernel_support, hpx_maxres)
         gridder_cov.grid(ras, decs, np.ones(len(ras), dtype=np.float64))
-        coverage = gridder_cov.get_datacube().squeeze()
+        with np.errstate(invalid='ignore'):
+            coverage = gridder_cov.get_datacube().squeeze()
 
         if weights is not None:
+            # Denominator: sum(kernel * weight)
             gridder_w = cygrid.WcsGrid(wcs_header_dict)
             gridder_w.set_kernel(kernel_type, kernel_params, kernel_support, hpx_maxres)
             gridder_w.grid(ras, decs, weights)
-            grid_weights = gridder_w.get_datacube().squeeze().astype(np.float64)
+            with np.errstate(invalid='ignore'):
+                grid_weights = gridder_w.get_datacube().squeeze().astype(np.float64)
             out = np.full_like(grid_map, np.nan)
             grid_map = np.divide(grid_map, grid_weights,
                                  where=grid_weights > 0,
@@ -543,7 +575,8 @@ def grid_to_map(ras: np.ndarray, decs: np.ndarray, values: np.ndarray,
         ra_mesh, dec_mesh = np.meshgrid(ra_grid, dec_grid)
         points = np.column_stack([ras, decs])
 
-        grid_map = griddata(points, values, (ra_mesh, dec_mesh),
+        gridded_values = values * weights if weights is not None else values
+        grid_map = griddata(points, gridded_values, (ra_mesh, dec_mesh),
                             method='linear').astype(np.float32)
         if weights is not None:
             grid_weights = griddata(points, weights, (ra_mesh, dec_mesh),
@@ -1107,10 +1140,11 @@ def create_integrated_map(hdul: fits.HDUList,
     return grid_map, wcs_header, fig
 
 
-def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header, 
+def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
                      output_file: str, beam_maj_deg: float, beam_min_deg: float = None,
                      beam_pa_deg: float = 0.0, overwrite: bool = True,
-                     spectral_params: Optional[Dict[str, Any]] = None) -> None:
+                     spectral_params: Optional[Dict[str, Any]] = None,
+                     coverage_map: Optional[np.ndarray] = None) -> None:
     """
     Save a gridded map to a FITS file with proper WCS and beam information.
     
@@ -1196,7 +1230,13 @@ def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
         
         # Add to HDU list
         hdul.append(spec_bintable)
-    
+
+    # Add coverage map as ImageHDU if provided
+    if coverage_map is not None:
+        cov_hdu = fits.ImageHDU(data=coverage_map.astype(np.float32), name='COVERAGE')
+        cov_hdu.header['COMMENT'] = 'Gridding coverage map: sum of kernel weights per pixel'
+        hdul.append(cov_hdu)
+
     # Write to file
     hdul.writeto(output_file, overwrite=overwrite)
     
@@ -1222,7 +1262,8 @@ _gridding_worker_state: dict = {}
 
 def _init_gridding_worker(ras, decs, wcs_header_dict,
                           naxis1, naxis2, beamsize_deg,
-                          ra_min, ra_max, dec_min, dec_max):
+                          ra_min, ra_max, dec_min, dec_max,
+                          kernel_fwhm_deg=None):
     """Pool initializer — stores shared geometry in each worker process once."""
     global _gridding_worker_state
     _gridding_worker_state = dict(
@@ -1232,6 +1273,7 @@ def _init_gridding_worker(ras, decs, wcs_header_dict,
         beamsize_deg=beamsize_deg,
         ra_min=ra_min, ra_max=ra_max,
         dec_min=dec_min, dec_max=dec_max,
+        kernel_fwhm_deg=kernel_fwhm_deg,
     )
 
 
@@ -1252,6 +1294,7 @@ def _grid_channel_worker(args):
         ra_min=s['ra_min'], ra_max=s['ra_max'],
         dec_min=s['dec_min'], dec_max=s['dec_max'],
         weights=w,
+        kernel_fwhm_deg=s.get('kernel_fwhm_deg'),
     )
     return ichannel, channel_map
 
@@ -1268,7 +1311,8 @@ def create_spectral_datacube(hdul: fits.HDUList,
                             telescop: str = "",
                             n_jobs: int = -1,
                             weight_column: Optional[str] = None,
-                            channel_weights: bool = False) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+                            channel_weights: bool = False,
+                            kernel_fwhm_arcsec: Optional[float] = None) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -1326,7 +1370,18 @@ def create_spectral_datacube(hdul: fits.HDUList,
     """
     if pixsize is None:
         pixsize = beamsize_deg / 3.0
-    
+
+    kernel_fwhm_deg = kernel_fwhm_arcsec / 3600.0 if kernel_fwhm_arcsec is not None else None
+
+    # Validate output path before doing any expensive work
+    if output_file:
+        output_parent = Path(output_file).parent
+        if not output_parent.exists():
+            raise FileNotFoundError(
+                f"Output directory does not exist: {output_parent}\n"
+                f"  Please create it first or correct the output path."
+            )
+
     # Extract data
     table = hdul[1].data
     spectra = table['SPECTRUM']  # Shape: (nobs, nvel)
@@ -1500,6 +1555,11 @@ def create_spectral_datacube(hdul: fits.HDUList,
     n_workers = os.cpu_count() if n_jobs == -1 else max(1, n_jobs)
     n_workers = min(n_workers, nvel)  # No point having more workers than channels
 
+    if kernel_fwhm_deg is not None:
+        print(f"Gridding kernel FWHM: {kernel_fwhm_arcsec:.1f}\" "
+              f"(beam: {beamsize_deg * 3600:.1f}\")")
+    else:
+        print(f"Gridding kernel FWHM: {beamsize_deg * 3600:.1f}\" (= beam size)")
     print(f"Creating datacube: {nvel} channels × {naxis2} × {naxis1} pixels "
           f"(n_jobs={n_workers})...")
 
@@ -1538,6 +1598,7 @@ def create_spectral_datacube(hdul: fits.HDUList,
                 ra_min=ra_min, ra_max=ra_max,
                 dec_min=dec_min, dec_max=dec_max,
                 weights=w,
+                kernel_fwhm_deg=kernel_fwhm_deg,
             )
     else:
         from multiprocessing import Pool
@@ -1550,6 +1611,7 @@ def create_spectral_datacube(hdul: fits.HDUList,
                 wcs_header_dict_ch,
                 naxis1, naxis2, beamsize_deg,
                 ra_min, ra_max, dec_min, dec_max,
+                kernel_fwhm_deg,
             ),
         ) as pool:
             n_done = 0
@@ -1562,7 +1624,24 @@ def create_spectral_datacube(hdul: fits.HDUList,
                     print(f"  {n_done}/{nvel} channels done...", end='\r')
 
     print(f"  {nvel}/{nvel} channels done.    ")
-    
+
+    # Compute 2D coverage map (sum of kernel weights per pixel, independent of channel)
+    coverage_map_2d = None
+    if HAS_CYGRID:
+        effective_fwhm = kernel_fwhm_deg if kernel_fwhm_deg is not None else beamsize_deg
+        _ks = effective_fwhm / 2.355
+        _cov_gridder = cygrid.WcsGrid(wcs_header_dict_ch)
+        _cov_gridder.set_kernel('gauss1d', (_ks,), 3.0 * _ks, _ks / 2.0)
+        _valid = np.isfinite(ras) & np.isfinite(decs)
+        _cov_gridder.grid(
+            np.array(ras[_valid], dtype=np.float64),
+            np.array(decs[_valid], dtype=np.float64),
+            np.ones(int(_valid.sum()), dtype=np.float64),
+        )
+        coverage_map_2d = _cov_gridder.get_datacube().squeeze().astype(np.float32)
+        print(f"  Coverage map: peak={coverage_map_2d.max():.3f}, "
+              f"pixels with coverage>0: {(coverage_map_2d > 0).sum()}")
+
     # Create WCS header for 3D cube (spectral, dec, ra)
     # Note: CDELT3 should be deltav (velocity spacing per channel in m/s)
     # CRVAL3 is the reference velocity in m/s
@@ -1643,7 +1722,8 @@ def create_spectral_datacube(hdul: fits.HDUList,
             'veldef': veldef,
         }
         save_map_to_fits(datacube, wcs_header, output_file, beam_maj_deg=beamsize_deg,
-                        spectral_params=spectral_params)
+                        spectral_params=spectral_params,
+                        coverage_map=coverage_map_2d)
 
     return datacube, wcs_header, fig
 
@@ -1669,6 +1749,14 @@ def collapse_cube(
     fits_output: Optional[str] = None,
     plot_output: Optional[str] = None,
     overwrite: bool = True,
+    colormap: str = 'inferno',
+    coverage_threshold: float = 0.3,
+    mask_ra: Optional[float] = None,
+    mask_dec: Optional[float] = None,
+    mask_radius_arcmin: Optional[float] = None,
+    suppress_negative: bool = False,
+    hex_plot: bool = False,
+    contour: bool = False,
 ) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
@@ -1774,8 +1862,61 @@ def collapse_cube(
     deltav_kms = abs(cdelt3) / 1e3
     collapsed = np.nansum(cube[chan_mask, :, :], axis=0) * deltav_kms
 
+    # ------------------------------------------------------------------
+    # 4b. Build display mask (NaN = not shown in plot; FITS always unmasked)
+    # ------------------------------------------------------------------
+    display_mask = np.zeros((ny, nx), dtype=bool)  # True = masked out
+
+    # --- Coverage-based edge masking ---
+    # Try to load the COVERAGE extension saved by create_spectral_datacube.
+    coverage_map = None
+    if coverage_threshold > 0:
+        try:
+            with fits.open(cube_fits) as _hdul:
+                if 'COVERAGE' in [h.name for h in _hdul]:
+                    coverage_map = _hdul['COVERAGE'].data.astype(float)
+        except Exception:
+            pass
+
+        if coverage_map is not None:
+            peak_cov = coverage_map.max()
+            if peak_cov > 0:
+                edge_mask = coverage_map < coverage_threshold * peak_cov
+                display_mask |= edge_mask
+                print(f"  Coverage masking: {edge_mask.sum()} pixels below "
+                      f"{coverage_threshold*100:.0f}% of peak coverage masked")
+        else:
+            print("  Note: no COVERAGE extension found in cube — "
+                  "re-run create_datacube to enable coverage masking")
+
+    # --- Circular aperture mask (blank everything outside the circle) ---
+    if mask_radius_arcmin is not None:
+        pixel_scale_deg = abs(float(header.get('CDELT2', 1.0)))
+        radius_pix = (mask_radius_arcmin / 60.0) / pixel_scale_deg
+        if mask_ra is not None and mask_dec is not None:
+            from astropy.wcs import WCS as _WCS
+            from astropy.coordinates import SkyCoord
+            import astropy.units as _u
+            _wcs2d = WCS(header).dropaxis(2)
+            _sky = SkyCoord(ra=mask_ra * _u.deg, dec=mask_dec * _u.deg)
+            cx_m, cy_m = _wcs2d.world_to_pixel(_sky)
+            cx_m, cy_m = float(cx_m), float(cy_m)
+        else:
+            cx_m, cy_m = nx / 2.0, ny / 2.0
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        outside_circle = (xx - cx_m) ** 2 + (yy - cy_m) ** 2 > radius_pix ** 2
+        display_mask |= outside_circle
+        print(f"  Circular mask: blanking outside r={mask_radius_arcmin:.1f}′ "
+              f"(centre pixel {cx_m:.1f}, {cy_m:.1f})")
+
+    collapsed_display = collapsed.copy()
+    collapsed_display[display_mask] = np.nan
+    n_masked = int(display_mask.sum())
+    if n_masked > 0:
+        print(f"  Total masked pixels in display: {n_masked}")
+
     print(f"  Collapsed map: {ny} × {nx} pixels, "
-          f"range [{np.nanmin(collapsed):.2f}, {np.nanmax(collapsed):.2f}] K km/s")
+          f"range [{np.nanmin(collapsed_display):.2f}, {np.nanmax(collapsed_display):.2f}] K km/s")
 
     # ------------------------------------------------------------------
     # 5. Build 2D WCS header (drop spectral axis)
@@ -1846,7 +1987,7 @@ def collapse_cube(
         y1 = min(ny,  cy + zoom_pix // 2)
         x0 = max(0, cx - zoom_pix // 2)
         x1 = min(nx,  cx + zoom_pix // 2)
-        zoomed    = collapsed[y0:y1, x0:x1]
+        zoomed    = collapsed_display[y0:y1, x0:x1]
         zoom_spec = np.nanmean(cube[:, y0:y1, x0:x1], axis=(1, 2))
     else:
         y0 = y1 = x0 = x1 = None
@@ -1930,12 +2071,11 @@ def collapse_cube(
     if not has_region:
         ax_spec_reg.set_visible(False)
 
-    def _imshow_map(ax, data, title, wcs_proj=None, cmap='inferno'):
-        vmin_p = np.nanpercentile(data, 2)
-        vmax_p = np.nanpercentile(data, 98)
-        im = ax.imshow(data, origin='lower', cmap=cmap,
-                       vmin=vmin_p, vmax=vmax_p, interpolation='nearest')
-        ax.set_title(title, fontsize=10)
+    # Beam size in pixels for hex grid spacing (beam/2)
+    _bmaj_deg = float(header.get('BMAJ', beamsize_deg_for_hex := pixel_scale_deg * 3.0))
+    _hex_spacing_pix = (_bmaj_deg / 2.0) / pixel_scale_deg  # beam/2 in pixels
+
+    def _ax_labels(ax, wcs_proj):
         if wcs_proj is not None:
             ax.coords[0].set_axislabel('RA')
             ax.coords[1].set_axislabel('Dec')
@@ -1944,7 +2084,75 @@ def collapse_cube(
         else:
             ax.set_xlabel('RA pixel')
             ax.set_ylabel('Dec pixel')
+
+    def _vminmax(data):
+        vmin_p = 0.0 if suppress_negative else np.nanpercentile(data, 2)
+        vmax_p = np.nanpercentile(data, 98)
+        return vmin_p, vmax_p
+
+    def _imshow_map(ax, data, title, wcs_proj=None, cmap=colormap):
+        vmin_p, vmax_p = _vminmax(data)
+        im = ax.imshow(data, origin='lower', cmap=cmap,
+                       vmin=vmin_p, vmax=vmax_p, interpolation='nearest')
+        ax.set_title(title, fontsize=10)
+        _ax_labels(ax, wcs_proj)
         fig.colorbar(im, ax=ax, label='K km/s', fraction=0.046, pad=0.04)
+
+    _hex_scatters = []  # (scatter, spacing_pix, ax) — sizes updated after tight_layout
+
+    def _hexplot_map(ax, data, title, wcs_proj=None, cmap=colormap):
+        from scipy.ndimage import map_coordinates
+        _ny, _nx = data.shape
+        spacing = _hex_spacing_pix
+        row_spacing = spacing * np.sqrt(3) / 2.0
+        xs, ys = [], []
+        row = 0
+        y = 0.0
+        while y <= _ny - 1:
+            offset = (spacing / 2.0) if row % 2 else 0.0
+            x = offset
+            while x <= _nx - 1:
+                xs.append(x)
+                ys.append(y)
+                x += spacing
+            y += row_spacing
+            row += 1
+        xs = np.array(xs, dtype=float)
+        ys = np.array(ys, dtype=float)
+        vals = map_coordinates(data, [ys, xs], order=1, prefilter=False, cval=np.nan)
+        finite = np.isfinite(vals)
+        xs, ys, vals = xs[finite], ys[finite], vals[finite]
+        vmin_p, vmax_p = _vminmax(vals)
+        ax.set_xlim(-0.5, _nx - 0.5)
+        ax.set_ylim(-0.5, _ny - 0.5)
+        tf = ax.get_transform('pixel') if wcs_proj is not None else ax.transData
+        sc = ax.scatter(xs, ys, c=vals, marker='h', s=1, cmap=cmap,
+                        vmin=vmin_p, vmax=vmax_p,
+                        linewidths=0, transform=tf)
+        _hex_scatters.append((sc, spacing, ax))
+        ax.set_title(title, fontsize=10)
+        _ax_labels(ax, wcs_proj)
+        fig.colorbar(sc, ax=ax, label='K km/s', fraction=0.046, pad=0.04)
+
+    def _contour_map(ax, data, title, wcs_proj=None, cmap=colormap):
+        vmin_p, vmax_p = _vminmax(data)
+        levels = np.linspace(vmin_p, vmax_p, 10)
+        # Replace NaN with vmin so contour doesn't choke on masked edges
+        data_filled = np.where(np.isfinite(data), data, vmin_p)
+        tf = ax.get_transform('pixel') if wcs_proj is not None else ax.transData
+        cs = ax.contour(data_filled, levels=levels, cmap=cmap,
+                        origin='lower', transform=tf)
+        ax.set_title(title, fontsize=10)
+        _ax_labels(ax, wcs_proj)
+        fig.colorbar(cs, ax=ax, label='K km/s', fraction=0.046, pad=0.04)
+
+    def _plot_map(ax, data, title, wcs_proj=None, cmap=colormap):
+        if hex_plot:
+            _hexplot_map(ax, data, title, wcs_proj, cmap)
+        elif contour:
+            _contour_map(ax, data, title, wcs_proj, cmap)
+        else:
+            _imshow_map(ax, data, title, wcs_proj, cmap)
 
     def _plot_spec(ax, vel, spec, title, color='steelblue'):
         ax.plot(vel, spec, color=color, linewidth=1.0)
@@ -1958,7 +2166,7 @@ def collapse_cube(
             ax.legend(fontsize=8)
 
     # Full map
-    _imshow_map(ax_full, collapsed, title_base, wcs_proj=wcs2d_obj)
+    _plot_map(ax_full, collapsed_display, title_base, wcs_proj=wcs2d_obj)
 
     # Zoom box on full map + zoom panel
     if has_zoom:
@@ -1967,9 +2175,9 @@ def collapse_cube(
             (x0 - 0.5, y0 - 0.5), x1 - x0, y1 - y0,
             linewidth=1.5, edgecolor='white', facecolor='none',
             linestyle='--', transform=pix_tf_full))
-        _imshow_map(ax_zoom, zoomed,
-                    f"Zoom centre  {zoom_size_arcmin:.1f}′ × {zoom_size_arcmin:.1f}′",
-                    wcs_proj=wcs2d_zoom)
+        _plot_map(ax_zoom, zoomed,
+                  f"Zoom centre  {zoom_size_arcmin:.1f}′ × {zoom_size_arcmin:.1f}′",
+                  wcs_proj=wcs2d_zoom)
 
     # Circle overlay on full map (and zoom map if active)
     if has_region:
@@ -1998,6 +2206,22 @@ def collapse_cube(
                    f"Mean spectrum — {reg_label}", color='tomato')
 
     fig.tight_layout()
+
+    # Update hex marker sizes now that axes have their final dimensions
+    if _hex_scatters:
+        fig.canvas.draw()
+        for sc, spacing, ax in _hex_scatters:
+            bbox = ax.get_window_extent()
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            px_per_data = min(
+                bbox.width  / max(abs(xlim[1] - xlim[0]), 1),
+                bbox.height / max(abs(ylim[1] - ylim[0]), 1),
+            )
+            pts_per_data = px_per_data * 72 / fig.dpi
+            hex_r_pt = spacing * pts_per_data / np.sqrt(3)
+            s = max(1.0, (3 * np.sqrt(3) / 2) * hex_r_pt ** 2)
+            sc.set_sizes([s] * len(sc.get_offsets()))
 
     if plot_output:
         fig.savefig(plot_output, dpi=150, bbox_inches='tight')

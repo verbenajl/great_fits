@@ -149,6 +149,7 @@ def load_spectra_by_mission(fits_file: str, mission_params: dict = None) -> Dict
                 sky_indices = np.where(mask)[0]
                 logger.info(f"    └─ (no OBJECT filter, using all {n_spectra} spectra)")
             
+
             # Get date from first spectrum (YYYYMMDD format)
             if 'DATE-OBS' in mission_spectra.dtype.names:
                 date_obs = str(mission_spectra['DATE-OBS'][0])
@@ -501,7 +502,7 @@ def main_cli():
         "--mission-id",
         type=str,
         default=None,
-        help="Limit decomposition to this MISSION_ID (e.g. 2016-05-18_GR_F298). "
+        help="Limit decomposition to MISSION_IDs containing this substring (e.g. F373). "
              "Can be combined with --telescope."
     )
     parser.add_argument(
@@ -510,6 +511,15 @@ def main_cli():
         default=None,
         help="Limit decomposition to this TELESCOP value (e.g. LFAH_PX00_S). "
              "Can be combined with --mission-id."
+    )
+    parser.add_argument(
+        "--filter-flight",
+        type=str,
+        nargs='+',
+        default=None,
+        dest='filter_flight',
+        help="Exclude all entries whose MISSION_ID contains these strings "
+             "(space-separated, e.g. F528 F299)."
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -634,13 +644,34 @@ def main_cli():
             logger.error("No MISSION_ID data found in FITS file")
             sys.exit(1)
 
+        # Flight filter: remove all entries whose MISSION_ID contains any of the given strings
+        if args.filter_flight:
+            kept = {}
+            removed_missions = set()
+            for k, v in mission_data.items():
+                mid = v['mission_id']
+                if any(f in mid for f in args.filter_flight):
+                    removed_missions.add(mid)
+                else:
+                    kept[k] = v
+            for mid in sorted(removed_missions):
+                logger.info(f"  Removed flight: {mid}")
+            logger.info(
+                f"Flight filter {args.filter_flight}: removed {len(mission_data) - len(kept)} "
+                f"combinations ({len(mission_data)} → {len(kept)})"
+            )
+            mission_data = kept
+            if not mission_data:
+                logger.error("No data remaining after --filter-flight")
+                sys.exit(1)
+
         # Filter to a single mission_id / telescope if requested
         if args.mission_id or args.telescope:
             before = len(mission_data)
             mission_data_full = mission_data  # keep for error reporting
             mission_data = {
                 k: v for k, v in mission_data.items()
-                if (args.mission_id is None or v['mission_id'] == args.mission_id)
+                if (args.mission_id is None or args.mission_id in v['mission_id'])
                 and (args.telescope is None or v['telescop'] == args.telescope)
             }
             if not mission_data:

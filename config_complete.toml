@@ -9,6 +9,7 @@ object="M51CENTER"
 [filters]
 blank_fraction = 0.20
 #remove_aor_id = "04_0116_0010609"
+remove_flight = "F528"
 
 [reduction]
 baseline=1

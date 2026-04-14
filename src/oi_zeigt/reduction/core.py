@@ -629,7 +629,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
                         filter_zero_spectra: bool = False,
                         param_filters: Optional[list] = None,
                         spectrum_peak_threshold: Optional[float] = None,
-                        filter_tau: bool = False) -> Tuple[Path, Path]:
+                        filter_tau: bool = False,
+                        filter_flights: Optional[list] = None) -> Tuple[Path, Path]:
     """
     Filter FITS data by object and NaN content, with optional column value removal and zero-spectrum filtering.
     
@@ -854,6 +855,28 @@ def filter_and_save_fits(hdul: fits.HDUList,
         data     = data[keep_mask]
         orig_idx = orig_idx[keep_mask]
 
+    # Apply flight filter: remove all rows whose MISSION_ID contains any of the given strings
+    flight_removed_data = np.array([])
+    flight_removed_missions = []
+    flight_removed_count = 0
+    if filter_flights:
+        if 'MISSION_ID' not in data.dtype.names:
+            raise ValueError("MISSION_ID column not found in FITS data — cannot use --filter-flight")
+        mid_col = np.array([
+            s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+            for s in data['MISSION_ID']
+        ])
+        keep_mask = np.ones(len(data), dtype=bool)
+        for flight in filter_flights:
+            flight_mask = np.array([flight in mid for mid in mid_col])
+            matched = sorted(set(mid_col[flight_mask].tolist()))
+            flight_removed_missions.extend(matched)
+            keep_mask &= ~flight_mask
+        flight_removed_data = data[~keep_mask]
+        flight_removed_count = int(np.sum(~keep_mask))
+        data     = data[keep_mask]
+        orig_idx = orig_idx[keep_mask]
+
     # Always separate target object from calibration rows first.
     # param_filters are ONLY applied to science (target) rows — never to
     # TSYS, TAU_SIG, SKYCHOPDIFF or any other calibration source.
@@ -967,6 +990,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
         removed_count = len(removed_data)
         if len(removed_data) > 0:
             all_rejected = np.concatenate([all_rejected, removed_data])
+        if flight_removed_count > 0:
+            all_rejected = np.concatenate([all_rejected, flight_removed_data]) if len(all_rejected) > 0 else flight_removed_data
         del removed_data, combined, combined_orig_idx, other_data, other_orig_idx, target_data, target_orig_idx
     else:
         # NaN filtering applied only to target object (default behavior)
@@ -979,6 +1004,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
         removed_count = len(removed_data)
         if len(removed_data) > 0:
             target_rejected = np.concatenate([target_rejected, removed_data])
+        if flight_removed_count > 0:
+            target_rejected = np.concatenate([target_rejected, flight_removed_data]) if len(target_rejected) > 0 else flight_removed_data
         del removed_data
         clean_combined      = np.concatenate([other_data, target_clean]) if len(other_data) > 0 else target_clean
         clean_combined_orig = np.concatenate([other_orig_idx, target_clean_orig]) if len(other_data) > 0 else target_clean_orig
@@ -1076,6 +1103,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
         'rejected_nan': nan_rejected_count,
         'rejected_zero': zero_rejected_count,
         'rejected_removed': removed_count,
+        'rejected_flights': flight_removed_count,
+        'flight_removed_missions': flight_removed_missions,
         'rejected_param': param_rejected_count,
         'param_filter_details': param_filter_details,
         'rejected_peaks': peaks_rejected_count,

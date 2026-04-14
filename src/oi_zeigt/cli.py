@@ -1429,12 +1429,21 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     help="Reject science spectra linked (via TAU_SIG_INDEX) to a TAU_SIG spectrum "
          "with any channel outside [0.001, 1.0]. Also removes the bad TAU_SIG rows."
 )
+@click.option(
+    "--filter-flight",
+    "filter_flight",
+    type=str,
+    multiple=True,
+    help="Remove all rows whose MISSION_ID contains this string (e.g. F528). "
+         "Can be specified multiple times to remove several flights."
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
                 nan_threshold: float, output_clean: Optional[str],
                 output_rejected: Optional[str], remove: Optional[str],
                 remove_values: tuple, apply_only_to_object: bool, filter_zero: bool,
                 filter_below: tuple, filter_above: tuple,
-                spectrum_peak_threshold: Optional[float], filter_tau: bool):
+                spectrum_peak_threshold: Optional[float], filter_tau: bool,
+                filter_flight: tuple):
     """
     Filter FITS data by object, NaN content, all-zero spectra, and/or column values.
     
@@ -1591,6 +1600,8 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             click.echo(f"Spectrum peak filter: reject science spectra with any |channel| > {spectrum_peak_threshold}")
         if filter_tau:
             click.echo("TAU filter: reject science spectra linked to TAU_SIG with channels outside [0.001, 1.0]")
+        if filter_flight:
+            click.echo(f"Flight filter: removing all rows with MISSION_ID containing: {', '.join(filter_flight)}")
 
         # Filter and save
         clean_path, rejected_path, stats = filter_and_save_fits(
@@ -1606,6 +1617,7 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             param_filters=param_filters if param_filters else None,
             spectrum_peak_threshold=spectrum_peak_threshold,
             filter_tau=filter_tau,
+            filter_flights=list(filter_flight) if filter_flight else None,
         )
         
         # Get statistics before closing
@@ -1643,6 +1655,10 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             click.echo(f"    - All-zero spectra: {stats['rejected_zero']}")
         if stats['rejected_removed'] > 0:
             click.echo(f"    - Removed by --remove criteria: {stats['rejected_removed']}")
+        if stats.get('rejected_flights', 0) > 0:
+            click.echo(f"    - Removed by --filter-flight: {stats['rejected_flights']} rows")
+            for mid in stats.get('flight_removed_missions', []):
+                click.echo(f"        {mid}")
         if stats['rejected_param'] > 0:
             click.echo(f"    - Removed by --filter-below/--filter-above: {stats['rejected_param']} total")
             for col, direction, value, n in stats.get('param_filter_details', []):
@@ -3325,6 +3341,9 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
               help='Beam size in degrees for gridding kernel. If not specified, reads from config [gridding].beamsize_arcsec.')
 @click.option('--pixsize', type=float, default=None,
               help='Map pixel size in degrees. If not specified, uses beamsize/3 or config [gridding].pixel_size_arcsec.')
+@click.option('--pixel-size-arcsec', type=float, default=None,
+              help='Map pixel size in arcseconds (e.g. --pixel-size-arcsec 4.7). '
+                   'Overrides --pixsize and config. Default is beamsize/3 ≈ 4.7″ for a 14.1″ beam.')
 @click.option('--output', type=click.Path(), default=None,
               help='Output FITS file path. If not specified, uses "datacube" from config.toml or ./datacube.fits.')
 @click.option('--plot', type=click.Path(), default=None,
@@ -3335,7 +3354,11 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
               help='Weight spectra by exp(-(RMSRATIOB-1)²/(2×0.5²)) during gridding.')
 @click.option('--weight-channels', is_flag=True, default=False,
               help='Weight each channel by exp(-tau)/T_sys from TSYS/TAU_SIG calibration spectra.')
-def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, output, plot, n_jobs, weight_spectra, weight_channels):
+@click.option('--kernel-fwhm', type=float, default=None,
+              help='Gridding kernel FWHM in arcseconds. If not specified, uses the beam size. '
+                   'Use a value smaller than the beam to minimize resolution degradation '
+                   '(e.g., --kernel-fwhm 4.7 or --kernel-fwhm 7.0 for a 14″ beam).')
+def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, pixel_size_arcsec, output, plot, n_jobs, weight_spectra, weight_channels, kernel_fwhm):
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -3374,10 +3397,12 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         cfg = get_config(config_path) if config_path else {}
 
         # Get beamsize and pixsize from config if not provided on CLI
+        # --pixel-size-arcsec takes priority over --pixsize (degrees)
+        effective_pixsize = pixel_size_arcsec / 3600.0 if pixel_size_arcsec is not None else pixsize
         beamsize_deg, pixsize_deg = get_gridding_params_from_config(
             config_path=config_path,
             beamsize_deg=beamsize,
-            pixsize_deg=pixsize
+            pixsize_deg=effective_pixsize
         )
 
         # Determine FITS file to process
@@ -3446,6 +3471,7 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
             n_jobs=n_jobs,
             weight_column=eff_weight_column,
             channel_weights=weight_channels,
+            kernel_fwhm_arcsec=kernel_fwhm,
         )
 
         click.echo(f"\n✓ Spectral datacube created")
@@ -3674,6 +3700,13 @@ def combine_fits(input, output, single_hdu):
     help="Filter to specific SCAN number (e.g., 13686) for faster testing"
 )
 @click.option(
+    "--aor-id",
+    "aor_id",
+    type=str,
+    default=None,
+    help="Keep only spectra whose AOR_ID contains one of these substrings (comma-separated)."
+)
+@click.option(
     "--fill-telluric-with-noise",
     "fill_noise",
     is_flag=True,
@@ -3687,9 +3720,17 @@ def combine_fits(input, output, single_hdu):
     default=False,
     help="Apply drop rules from mission_id_parameters.yml (telescope/scan exclusions per mission)."
 )
+@click.option(
+    "--filter-flight",
+    "filter_flight",
+    type=str,
+    multiple=True,
+    help="Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated."
+)
 def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional[str],
                    pca_source: Optional[str], object: Optional[str], mission_id: Optional[str],
-                   scan: Optional[int], fill_noise: bool, filter_missions: bool):
+                   scan: Optional[int], aor_id: Optional[str], fill_noise: bool,
+                   filter_missions: bool, filter_flight: tuple):
     """
     Prepare FITS data for PCA analysis.
     
@@ -3734,8 +3775,10 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
             object_filter=object,
             mission_id=mission_id,
             scan=scan,
+            aor_id=aor_id,
             fill_noise=fill_noise,
             filter_missions=filter_missions,
+            filter_flight=list(filter_flight) if filter_flight else None,
         )
         
         click.echo("\n" + "="*70)
@@ -3766,11 +3809,15 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
               help='Use prepared_for_pca from config instead of pcad.')
 @click.option('--reduced', is_flag=True, default=False,
               help='Use reduced_fits from config instead of pcad.')
+@click.option('--fits', 'fits_input', type=click.Path(exists=True), default=None,
+              help='Path to input FITS file. Overrides --pcad/--clean/--prepared/--reduced and config.')
 @click.option('--output', type=click.Path(), default=None,
               help='Output FITS file path. Defaults to output.post_processed_fits from config.')
 @click.option('--refill-telluric-noise', 'refill_telluric', is_flag=True, default=False,
               help='Refill telluric line channels with Gaussian noise at the post-PCA noise level.')
-def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill_telluric):
+@click.option('--filter-flight', 'filter_flight', type=str, multiple=True,
+              help='Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated.')
+def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, output, refill_telluric, filter_flight):
     """
     Post-process spectra: compute per-spectrum RMS outside the line window.
 
@@ -3800,7 +3847,10 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill
         object_filter = cfg.get('parameters', {}).get('object', None)
 
         # --- Determine input file ---
-        if clean:
+        if fits_input:
+            fits_path = fits_input
+            label = 'custom'
+        elif clean:
             fits_path = output_cfg.get('clean_fits')
             if not fits_path:
                 click.echo(click.style("Error: output.clean_fits not in config", fg='red'), err=True)
@@ -3858,6 +3908,19 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill
             raise ValueError("No SPECTRUM column found in FITS file")
 
         data = matrix_hdu.data
+
+        if filter_flight and 'MISSION_ID' in data.dtype.names:
+            mid_col = np.array([
+                s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                for s in data['MISSION_ID']
+            ])
+            keep_mask = np.array([not any(f in mid for f in filter_flight) for mid in mid_col])
+            removed_missions = sorted(set(mid_col[~keep_mask].tolist()))
+            for mid in removed_missions:
+                click.echo(f"  Removed flight: {mid}")
+            click.echo(f"Flight filter: removed {int(np.sum(~keep_mask))} rows ({len(data)} → {int(np.sum(keep_mask))})")
+            data = data[keep_mask]
+
         n_spectra = len(data)
 
         velocity_axis_ms = _create_velocity_axis(
@@ -4131,11 +4194,45 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, output, refill
               help='Save collapsed 2D map as FITS to this path.')
 @click.option('--no-show', is_flag=True, default=False,
               help='Do not open an interactive plot window.')
+@click.option('--colormap', default='inferno', show_default=True,
+              help=(
+                  'Matplotlib colormap for the intensity map. '
+                  'Sequential: inferno, viridis, plasma, magma, cividis, hot, afmhot, gist_heat, YlOrRd, Blues, Greens. '
+                  'Diverging: RdBu_r, seismic, bwr, coolwarm, PiYG. '
+                  'Perceptual: cubehelix, turbo. '
+                  'Classic: jet, rainbow, gray. '
+                  'Append "_r" to any name to reverse it (e.g. viridis_r).'
+              ))
+@click.option('--coverage-threshold', type=float, default=0.3, show_default=True,
+              help='Mask edge pixels whose gridding coverage (kernel weight sum) is below this '
+                   'fraction of the peak coverage in the map. Requires a COVERAGE extension in '
+                   'the cube FITS file (written automatically by create_datacube). '
+                   '0 = no coverage masking.')
+@click.option('--mask-ra', type=str, default=None,
+              help='RA centre of circular display mask (hh:mm:ss or degrees). '
+                   'Defaults to map centre when --mask-radius is given without this option.')
+@click.option('--mask-dec', type=str, default=None,
+              help='Dec centre of circular display mask (dd:mm:ss or degrees). '
+                   'Defaults to map centre when --mask-radius is given without this option.')
+@click.option('--mask-radius', type=float, default=None,
+              help='Radius in arcminutes of the circular display mask. '
+                   'Pixels outside this circle are set to NaN in the plot.')
+@click.option('--suppress-negative', is_flag=True, default=False,
+              help='Set vmin=0 in the colour scale, clipping negative (noise) values to the '
+                   'bottom. Gives physically correct scaling for moment-0 maps where signal '
+                   'is always positive.')
+@click.option('--hex-plot', is_flag=True, default=False,
+              help='Display the map as a hexagonal scatter plot sampled on a beam/2 hex grid, '
+                   'similar to PyStructure.')
+@click.option('--contour', is_flag=True, default=False,
+              help='Display the map as contour lines instead of a filled image.')
 def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
                       zoom_x, zoom_y, zoom_ra, zoom_dec,
                       region_x, region_y, region_ra, region_dec,
                       region_radius_arcmin, use_wcs,
-                      plot, fits_output, no_show):
+                      plot, fits_output, no_show, colormap,
+                      coverage_threshold, mask_ra, mask_dec, mask_radius,
+                      suppress_negative, hex_plot, contour):
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
 
@@ -4171,10 +4268,12 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
     try:
         from oi_zeigt.mapping.gridding import collapse_cube
 
-        zoom_ra   = _parse_angle(zoom_ra,   is_ra=True)
-        zoom_dec  = _parse_angle(zoom_dec,  is_ra=False)
+        zoom_ra    = _parse_angle(zoom_ra,   is_ra=True)
+        zoom_dec   = _parse_angle(zoom_dec,  is_ra=False)
         region_ra  = _parse_angle(region_ra,  is_ra=True)
         region_dec = _parse_angle(region_dec, is_ra=False)
+        mask_ra_deg  = _parse_angle(mask_ra,  is_ra=True)
+        mask_dec_deg = _parse_angle(mask_dec, is_ra=False)
 
         click.echo(f"Collapsing cube: {cube_fits}")
         if velocity_range:
@@ -4211,6 +4310,14 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             use_wcs=use_wcs,
             fits_output=fits_output,
             plot_output=plot,
+            colormap=colormap,
+            coverage_threshold=coverage_threshold,
+            mask_ra=mask_ra_deg,
+            mask_dec=mask_dec_deg,
+            mask_radius_arcmin=mask_radius,
+            suppress_negative=suppress_negative,
+            hex_plot=hex_plot,
+            contour=contour,
         )
 
         click.echo(f"\n✓ Collapsed map: {collapsed.shape[1]} × {collapsed.shape[0]} pixels")
@@ -4416,6 +4523,68 @@ def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, out
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+@click.command()
+@click.option('--fits', 'fits_path', type=click.Path(exists=True), default=None,
+              help='Path to FITS file to inspect.')
+@click.option('--config', type=click.Path(exists=True), default=None,
+              help='Config file (uses output.pcad_fits if --fits not given).')
+def print_pca_parameters(fits_path, config):
+    """Print unique PCAPARAM values found in a FITS file."""
+    if fits_path is None and config is None:
+        click.echo("Error: provide --fits or --config.", err=True)
+        sys.exit(1)
+
+    if fits_path is None:
+        cfg = get_config(config)
+        fits_path = cfg.get('output', {}).get('pcad_fits')
+        if not fits_path:
+            click.echo("Error: config has no output.pcad_fits.", err=True)
+            sys.exit(1)
+        if not Path(fits_path).exists():
+            click.echo(f"Error: file not found: {fits_path}", err=True)
+            sys.exit(1)
+
+    click.echo(f"Reading: {fits_path}")
+    with fits.open(fits_path, memmap=True) as hdul:
+        data = None
+        for hdu in hdul:
+            if hasattr(hdu, 'data') and hdu.data is not None and hasattr(hdu.data, 'dtype'):
+                if 'PCAPARAM' in hdu.data.dtype.names:
+                    data = hdu.data
+                    break
+        if data is None:
+            click.echo("No PCAPARAM column found in this file.")
+            return
+
+    def _s(v):
+        return v.decode('utf-8').strip() if isinstance(v, bytes) else str(v).strip()
+
+    raw = np.array([_s(v) for v in data['PCAPARAM']])
+    unique_vals, counts = np.unique(raw, return_counts=True)
+
+    click.echo(f"\nFound {len(unique_vals)} unique PCAPARAM value(s) across {len(raw)} spectra:\n")
+
+    param_labels = {
+        'vc': 'variance cutoff',
+        'nr': 'noise ratio cutoff',
+        'sk': 'smoothing kernel size',
+        'cc': 'cut coefficients',
+        'gnr': 'global noise ratio cutoff',
+        'lk': 'line kernel size',
+        'lstsq': 'least squares',
+    }
+
+    for val, count in zip(unique_vals, counts):
+        click.echo(f"  [{count} spectra]  {val}")
+        tokens = val.split()
+        for token in tokens:
+            if '=' in token:
+                k, v = token.split('=', 1)
+                label = param_labels.get(k, k)
+                click.echo(f"    {k:4s}  ({label}) = {v}")
+        click.echo()
 
 
 if __name__ == "__main__":

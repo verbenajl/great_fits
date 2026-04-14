@@ -1299,9 +1299,10 @@ class PCACorrector:
                          object_filter=None, overwrite=False, generate_plots=False,
                          output_dir='output/pca_corrected', config_window=None,
                          detect_science_lines=True, scan_filter=None, subscan_filter=None,
-                         telescope_filter=None, mission_id_filter=None, mission_decompositions=None,
+                         telescope_filter=None, mission_id_filter=None, aor_id_filter=None,
+                         mission_decompositions=None,
                          n_jobs=1, global_noise_ratio_cutoff=None,
-                         cut_coefficients=0):
+                         cut_coefficients=0, flight_filter=None):
         """
         Correct all spectra in a FITS file.
         
@@ -1365,58 +1366,82 @@ class PCACorrector:
             logger.info(f"✓ Loaded {n_spectra} spectra from {spectrum_col}")
             
             # Filter by object if requested
+            def _obj_str(s):
+                v = s.decode('utf-8').strip() if isinstance(s, bytes) else str(s).strip()
+                return v.strip("'")
             if object_filter:
-                mask = np.array([object_filter.strip() in s.strip() for s in data['OBJECT']])
+                obj_filter = object_filter.strip()
+                mask = np.array([obj_filter in _obj_str(s) for s in data['OBJECT']])
                 indices = np.where(mask)[0]
                 logger.info(f"  Filtering to {len(indices)} spectra containing '{object_filter}'")
             else:
                 indices = np.arange(n_spectra)
             
+            # Flight filter: exclude spectra whose MISSION_ID contains any of the given strings
+            if flight_filter and 'MISSION_ID' in data.dtype.names:
+                def _ts(x):
+                    return x.decode().strip() if isinstance(x, bytes) else str(x).strip()
+                mids = np.array([_ts(data['MISSION_ID'][i]) for i in indices])
+                keep = np.array([not any(f in mid for f in flight_filter) for mid in mids])
+                removed_missions = sorted(set(mids[~keep].tolist()))
+                indices = indices[keep]
+                for mid in removed_missions:
+                    logger.info(f"  Removed flight: {mid}")
+                logger.info(f"  After flight filter: {len(indices)} spectra remaining")
+
+            def to_string(x):
+                if isinstance(x, bytes):
+                    return x.decode('utf-8').strip()
+                return str(x).strip()
+
             # Additional filtering for scan/subscan/telescope (for testing)
             if scan_filter is not None:
                 mask = data['SCAN'][indices] == scan_filter
                 indices = indices[mask]
                 logger.info(f"  Filtering to {len(indices)} spectra with SCAN={scan_filter}")
-            
+
             if subscan_filter is not None:
                 mask = data['SUBSCAN'][indices] == subscan_filter
                 indices = indices[mask]
                 logger.info(f"  Filtering to {len(indices)} spectra with SUBSCAN={subscan_filter}")
-            
+
             if telescope_filter is not None:
-                def to_string(x):
-                    if isinstance(x, bytes):
-                        return x.decode('utf-8').strip()
-                    return str(x).strip()
-                
                 telescopes = np.array([to_string(data['TELESCOP'][i]) for i in indices])
                 mask = telescopes == telescope_filter.strip()
                 indices = indices[mask]
                 logger.info(f"  Filtering to {len(indices)} spectra with TELESCOP='{telescope_filter}'")
-            
+
             if mission_id_filter is not None:
-                def to_string(x):
-                    if isinstance(x, bytes):
-                        return x.decode('utf-8').strip()
-                    return str(x).strip()
-                
                 mission_ids_filtered = np.array([to_string(data['MISSION_ID'][i]) for i in indices])
-                mask = mission_ids_filtered == mission_id_filter.strip()
+                f = mission_id_filter.strip()
+                mask = np.array([f in mid for mid in mission_ids_filtered])
                 indices = indices[mask]
-                logger.info(f"  Filtering to {len(indices)} spectra with MISSION_ID='{mission_id_filter}'")
+                logger.info(f"  Filtering to {len(indices)} spectra with MISSION_ID containing '{f}'")
                 
                 # Debug: show what mission_ids are in the filtered data
                 if len(indices) > 0:
                     filtered_mission_ids = np.unique(mission_ids_filtered[mask])
                     logger.info(f"  Actual mission_ids in filtered data: {filtered_mission_ids}")
                     if mission_decompositions:
-                        logger.info(f"  Available decompositions: {list(mission_decompositions.keys())[:3]}... ({len(mission_decompositions)} total)")
+                        relevant_keys = [k for k in mission_decompositions.keys()
+                                         if (isinstance(k, tuple) and k[0] in filtered_mission_ids)
+                                         or (isinstance(k, str) and k in filtered_mission_ids)]
+                        logger.info(f"  Relevant decompositions ({len(relevant_keys)} of {len(mission_decompositions)} total): {relevant_keys}")
                 else:
                     logger.warning(f"  WARNING: No spectra found with MISSION_ID='{mission_id_filter}'")
                     # Show what mission_ids ARE available
                     unique_mission_ids = np.unique(mission_ids_filtered)
                     logger.info(f"  Available mission_ids in data: {unique_mission_ids}")
             
+            if aor_id_filter is not None and 'AOR_ID' in data.dtype.names:
+                terms = [t.strip() for t in aor_id_filter.split(',') if t.strip()]
+                aor_ids_arr = np.array([to_string(data['AOR_ID'][i]) for i in indices])
+                mask = np.array([any(t in aor for t in terms) for aor in aor_ids_arr])
+                indices = indices[mask]
+                logger.info(f"  Filtering to {len(indices)} spectra with AOR_ID matching {terms}")
+                if len(indices) == 0:
+                    logger.warning(f"  WARNING: No spectra found with AOR_ID matching {terms}")
+
             # CRITICAL: Filter out spectra with all zeros or negligible signal
             # These spectra cannot be corrected anyway and contaminate line detection
             logger.info("Filtering out spectra with negligible signal...")
@@ -1518,6 +1543,7 @@ class PCACorrector:
                 'total': len(indices),
                 'corrected': 0,
                 'failed': 0,
+                'no_decomp': 0,
                 'components_used': [],
                 'lines_detected': False
             }
@@ -1538,7 +1564,28 @@ class PCACorrector:
             # Log if we're using per-mission decompositions
             if mission_decompositions:
                 logger.info(f"Using per-mission decompositions ({len(mission_decompositions)} available)")
-                logger.info(f"  Sample keys: {list(mission_decompositions.keys())[:3]}")
+                # Show which decomposition is matched per (mission_id, telescope) group
+                def _s(x):
+                    return x.decode().strip() if isinstance(x, bytes) else str(x).strip()
+                groups = {}
+                for idx in indices:
+                    mid = _s(data['MISSION_ID'][idx])
+                    tele = _s(data['TELESCOP'][idx])
+                    groups[(mid, tele)] = groups.get((mid, tele), 0) + 1
+                for (mid, tele), count in sorted(groups.items()):
+                    matched_key = None
+                    if (mid, tele) in mission_decompositions:
+                        matched_key = (mid, tele)
+                    elif len(tele) > 4 and tele[:4] in ('LFAH', 'LFAI', 'LFAV', 'LFBI', 'LFBH', 'PRISM'):
+                        base_key = (mid, tele[:4])
+                        if base_key in mission_decompositions:
+                            matched_key = base_key
+                    if matched_key is None and mid in mission_decompositions:
+                        matched_key = mid
+                    if matched_key is not None:
+                        logger.info(f"  {mid} / {tele} ({count} spectra) -> {matched_key}")
+                    else:
+                        logger.warning(f"  {mid} / {tele} ({count} spectra) -> NO decomposition found!")
             else:
                 logger.info("Using single default decomposition for all spectra")
             
@@ -1550,8 +1597,11 @@ class PCACorrector:
                     mission_id_s = data['MISSION_ID'][idx].strip() if mission_decompositions else None
                     telescope_s = data['TELESCOP'][idx].strip() if mission_decompositions else None
                     bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
-                    gcf = ~bad_channels
-                    phase1_args.append((idx, spectrum, gcf, gcf.copy(), mission_id_s, telescope_s))
+                    gcs = ~bad_channels
+                    gcf = gcs.copy()
+                    if telluric_line_mask is not None:
+                        gcf = gcf & ~telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
+                    phase1_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s))
                 from multiprocessing import Pool
                 chunk = max(1, len(phase1_args) // (n_workers * 4))
                 with Pool(processes=n_workers, initializer=_init_pca_worker,
@@ -1567,6 +1617,7 @@ class PCACorrector:
                             correction_details[idx_r] = {'n_components_used': 0, 'skipped': True,
                                                          'reason': 'no_decomposition'}
                             stats['failed'] += 1
+                            stats['no_decomp'] += 1
                         elif status in ('skip_bad_channels', 'error'):
                             correction_details[idx_r] = {'n_components_used': 0, 'skipped': True}
                         else:
@@ -1584,21 +1635,24 @@ class PCACorrector:
                             spec_telescope = data['TELESCOP'][idx].strip()
                             decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
                             if decomp is None:
-                                if spec_idx < 3:  # Log only first 3 misses
-                                    logger.warning(f"Spectrum {idx}: No decomposition found for {spec_mission_id}/{spec_telescope} - keeping original (uncorrected)")
                                 # Keep original spectrum uncorrected instead of skipping
                                 prelim_corrected_spectra[idx] = spectrum
                                 correction_details[idx] = {'n_components_used': 0, 'skipped': True, 'reason': 'no_decomposition'}
                                 stats['failed'] += 1
+                                stats['no_decomp'] += 1
                                 continue
                             saved_components = self.components
                             saved_variance_ratio = self.explained_variance_ratio
                             self.components = decomp.components
                             self.explained_variance_ratio = decomp.explained_variance_ratio
 
-                        # Check for bad channels only (no line mask yet)
+                        # Check for bad channels only (no science line mask yet)
                         bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
-                        good_channels_for_fitting = ~bad_channels
+                        good_channels_for_subtraction = ~bad_channels
+                        good_channels_for_fitting = good_channels_for_subtraction.copy()
+                        if telluric_line_mask is not None:
+                            good_channels_for_fitting = good_channels_for_fitting & \
+                                ~telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
 
                         if not np.any(good_channels_for_fitting):
                             correction_details[idx] = {'n_components_used': 0, 'skipped': True}
@@ -1607,11 +1661,11 @@ class PCACorrector:
                                 self.explained_variance_ratio = saved_variance_ratio
                             continue
 
-                        # First pass: correct without line mask
+                        # First pass: correct without science line mask (telluric already excluded)
                         corrected, details = self.apply_correction(
                             spectrum,
                             good_channels=good_channels_for_fitting,
-                            good_channels_for_subtraction=good_channels_for_fitting,
+                            good_channels_for_subtraction=good_channels_for_subtraction,
                             cutoff_variance=cutoff_variance,
                             cutoff_noise_ratio=cutoff_noise_ratio,
                             verbose=False,
@@ -1717,15 +1771,18 @@ class PCACorrector:
                             mission_id_s = data['MISSION_ID'][idx].strip() if mission_decompositions else None
                             telescope_s  = data['TELESCOP'][idx].strip()   if mission_decompositions else None
                             bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
-                            gcf = ~bad_channels
-                            gcs = gcf & ~detected_lines_mask[spec_idx]
+                            gcs = ~bad_channels & ~detected_lines_mask[spec_idx]
+                            gcf = gcs.copy()
+                            if telluric_line_mask is not None:
+                                gcf = gcf & ~telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
                             recorr_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s))
                         chunk = max(1, len(recorr_args) // (n_workers * 4))
                         with Pool(processes=n_workers, initializer=_init_pca_worker,
                                   initargs=(mission_decompositions, self.components,
                                             self.explained_variance_ratio,
                                             cutoff_variance, cutoff_noise_ratio,
-                                            self.smoothing_kernel_size)) as pool:
+                                            self.smoothing_kernel_size,
+                                            self.use_lstsq, cut_coefficients)) as pool:
                             for idx_r, corrected_r, details_r in pool.imap_unordered(
                                     _pca_spectrum_worker, recorr_args, chunksize=chunk):
                                 if corrected_r is not None and details_r is not None \
@@ -1749,8 +1806,11 @@ class PCACorrector:
                                     self.explained_variance_ratio = decomp.explained_variance_ratio
 
                                 bad_channels = np.isnan(spectrum) | np.isinf(spectrum) | (spectrum == 0)
-                                good_channels_for_fitting = ~bad_channels
-                                gcs = good_channels_for_fitting & ~detected_lines_mask[spec_idx]
+                                gcs = ~bad_channels & ~detected_lines_mask[spec_idx]
+                                good_channels_for_fitting = gcs.copy()
+                                if telluric_line_mask is not None:
+                                    good_channels_for_fitting = good_channels_for_fitting & \
+                                        ~telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
 
                                 if not np.any(good_channels_for_fitting):
                                     if mission_decompositions:
@@ -1888,6 +1948,7 @@ class PCACorrector:
                             corrected_spectra[idx_r] = data[spectrum_col][idx_r]
                             correction_details[idx_r] = {'n_components_used': 0, 'skipped': True}
                             stats['failed'] += 1
+                            stats['no_decomp'] += 1
                         elif status in ('skip_bad_channels', 'error'):
                             corrected_spectra[idx_r] = corrected_r
                             correction_details[idx_r] = {'n_components_used': 0, 'skipped': True}
@@ -1910,9 +1971,9 @@ class PCACorrector:
                             spec_telescope = data['TELESCOP'][idx].strip()
                             decomp = self.get_decomposition_for_mission(spec_mission_id, spec_telescope, mission_decompositions)
                             if decomp is None:
-                                logger.debug(f"Spectrum {idx}: no decomposition for {spec_mission_id}/{spec_telescope}, keeping original (uncorrected)")
                                 corrected_spectra[idx] = spectrum
                                 stats['failed'] += 1
+                                stats['no_decomp'] += 1
                                 continue
                             # Temporarily swap components for this spectrum
                             saved_components = self.components
@@ -1997,7 +2058,7 @@ class PCACorrector:
             if object_filter:
                 # Get indices of calibration objects to preserve
                 calibration_mask = np.array([
-                    s.strip() in ('TSYS', 'TAU_SIG') 
+                    _obj_str(s) in ('TSYS', 'TAU_SIG')
                     for s in data['OBJECT']
                 ])
                 calibration_indices = np.where(calibration_mask)[0]
@@ -2118,8 +2179,11 @@ class PCACorrector:
             logger.info(f"✓ Saved corrected spectra to {output_fits}")
             logger.info(f"  Total: {stats['total']} spectra processed")
             logger.info(f"  Corrected: {stats['corrected']} spectra")
-            if stats['failed'] > 0:
-                logger.info(f"  Kept uncorrected: {stats['failed']} spectra (no decomposition or other issues)")
+            if stats['no_decomp'] > 0:
+                logger.warning(f"  WARNING: {stats['no_decomp']} spectra kept uncorrected — no decomposition found for their mission/telescope group")
+            other_failed = stats['failed'] - stats['no_decomp']
+            if other_failed > 0:
+                logger.info(f"  Kept uncorrected: {other_failed} spectra (bad channels or errors)")
             if stats['components_used']:
                 logger.info(f"  Components used: {np.mean(stats['components_used']):.1f} ± "
                            f"{np.std(stats['components_used']):.1f}")
@@ -2627,10 +2691,12 @@ class PCACorrector:
             bad_channels_any = np.any(bad_channel_mask, axis=0)
             masked_science_spectra[:, bad_channels_any] = 0
             
-            # 2. Apply TELLURIC CHANNELS uniformly (vertical lines - same for all spectra)
+            # 2. Apply TELLURIC CHANNELS for this group only (not union across all missions)
             if telluric_line_mask is not None:
-                # Get channels that are masked in ANY spectrum (uniform across all)
-                telluric_masked_channels = np.any(telluric_line_mask, axis=0)
+                group_telluric = telluric_line_mask[
+                    np.array(group_indices_in_filtered)[usable_indices_in_group[:n_display]]
+                ]
+                telluric_masked_channels = np.any(group_telluric, axis=0)
                 masked_science_spectra[:, telluric_masked_channels] = 0
             
             # 3. Apply DETECTED LINE CHANNELS PER-SPECTRUM (different for each row)
@@ -3069,7 +3135,23 @@ Examples:
         '--mission-id',
         type=str,
         default=None,
-        help='Only process spectra from this MISSION_ID (e.g., 2016-05-18_GR_F298)'
+        help='Only process spectra from this MISSION_ID (substring match, e.g. F373)'
+    )
+    parser.add_argument(
+        '--aor-id',
+        type=str,
+        default=None,
+        help='Only process spectra whose AOR_ID contains one of these substrings '
+             '(comma-separated, e.g. 04_0116,04_0117)'
+    )
+    parser.add_argument(
+        '--filter-flight',
+        type=str,
+        nargs='+',
+        default=None,
+        dest='filter_flight',
+        help='Exclude all spectra whose MISSION_ID contains these strings '
+             '(space-separated, e.g. F528 F299).'
     )
     
     # Output options (plot-dir default will be set from config)
@@ -3449,6 +3531,8 @@ Examples:
             subscan_filter=args.subscan,
             telescope_filter=args.telescope,
             mission_id_filter=args.mission_id,
+            aor_id_filter=args.aor_id,
+            flight_filter=args.filter_flight,
             mission_decompositions=mission_decompositions_to_use,
             n_jobs=args.n_jobs
         )
