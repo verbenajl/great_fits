@@ -1437,13 +1437,39 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     help="Remove all rows whose MISSION_ID contains this string (e.g. F528). "
          "Can be specified multiple times to remove several flights."
 )
+@click.option(
+    "--filter-object-exact",
+    "filter_object_exact",
+    type=str,
+    default=None,
+    help="Keep only rows whose OBJECT exactly matches one of these comma-separated values "
+         "(e.g. --filter-object-exact M82,SKYDIFF)."
+)
+@click.option(
+    "--filter-out-object-exact",
+    "filter_out_object_exact",
+    type=str,
+    default=None,
+    help="Remove all rows whose OBJECT exactly matches one of these comma-separated values "
+         "(e.g. --filter-out-object-exact SKYCHOPDIFF,TSYS)."
+)
+@click.option(
+    "--exclude-obsmode",
+    "exclude_obsmode",
+    type=str,
+    default=None,
+    help="Remove all rows whose OBSMODE exactly matches one of these comma-separated values "
+         "(e.g. --exclude-obsmode BSAB,OTFSWB). TSYS and TAU_SIG rows are always kept."
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
                 nan_threshold: float, output_clean: Optional[str],
                 output_rejected: Optional[str], remove: Optional[str],
                 remove_values: tuple, apply_only_to_object: bool, filter_zero: bool,
                 filter_below: tuple, filter_above: tuple,
                 spectrum_peak_threshold: Optional[float], filter_tau: bool,
-                filter_flight: tuple):
+                filter_flight: tuple, filter_object_exact: Optional[str],
+                filter_out_object_exact: Optional[str],
+                exclude_obsmode: Optional[str]):
     """
     Filter FITS data by object, NaN content, all-zero spectra, and/or column values.
     
@@ -1603,6 +1629,18 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         if filter_flight:
             click.echo(f"Flight filter: removing all rows with MISSION_ID containing: {', '.join(filter_flight)}")
 
+        obj_exact_list = [s.strip() for s in filter_object_exact.split(',')] if filter_object_exact else None
+        obj_out_exact_list = [s.strip() for s in filter_out_object_exact.split(',')] if filter_out_object_exact else None
+
+        if obj_exact_list:
+            click.echo(f"Object exact keep filter: keeping only OBJECT in: {', '.join(obj_exact_list)}")
+        if obj_out_exact_list:
+            click.echo(f"Object exact remove filter: removing rows with OBJECT in: {', '.join(obj_out_exact_list)}")
+
+        exclude_obsmode_list = [s.strip() for s in exclude_obsmode.split(',')] if exclude_obsmode else None
+        if exclude_obsmode_list:
+            click.echo(f"OBSMODE exclusion filter: removing rows with OBSMODE in: {', '.join(exclude_obsmode_list)}")
+
         # Filter and save
         clean_path, rejected_path, stats = filter_and_save_fits(
             hdul,
@@ -1618,6 +1656,9 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             spectrum_peak_threshold=spectrum_peak_threshold,
             filter_tau=filter_tau,
             filter_flights=list(filter_flight) if filter_flight else None,
+            filter_object_exact=obj_exact_list,
+            filter_out_object_exact=obj_out_exact_list,
+            exclude_obsmode=exclude_obsmode_list,
         )
         
         # Get statistics before closing
@@ -2059,7 +2100,8 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
         smooth_from_config = reduction_cfg.get('smooth', None)
         decimate_from_config = reduction_cfg.get('decimate', False)
 
-        effective_smooth = smooth if smooth is not None else (int(smooth_from_config) if smooth_from_config is not None else None)
+        _smooth_config_val = int(smooth_from_config) if smooth_from_config is not None else None
+        effective_smooth = smooth if smooth is not None else (_smooth_config_val if _smooth_config_val and _smooth_config_val > 1 else None)
         effective_decimate = decimate or bool(decimate_from_config)
 
         if effective_smooth is not None:
@@ -3667,7 +3709,7 @@ def combine_fits(input, output, single_hdu):
     "--fits",
     type=click.Path(exists=False),
     default=None,
-    help="Input FITS file to prepare (default: output.reduced_fits from config.toml)"
+    help="Input FITS file to prepare. If not given, uses output.reduced_fits from config.toml."
 )
 @click.option(
     "--output",
@@ -3738,10 +3780,10 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
     then fills telluric line regions with Gaussian noise.
     
     Uses configuration from config.toml by default:
-    - Input: output.reduced_fits
-    - Output: output.prepared_for_pca
-    - PCA source: pca.pca_source
-    - Object filter: parameters.object
+    - Input:       output.reduced_fits  (override with --fits)
+    - Output:      output.prepared_for_pca  (override with --output)
+    - PCA source:  pca.pca_source  (override with --pca-source, e.g. SKYCHOPDIFF, SKYDIFF)
+    - Object filter: parameters.object  (override with --object)
     
     Examples:
     

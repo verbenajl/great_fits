@@ -630,7 +630,10 @@ def filter_and_save_fits(hdul: fits.HDUList,
                         param_filters: Optional[list] = None,
                         spectrum_peak_threshold: Optional[float] = None,
                         filter_tau: bool = False,
-                        filter_flights: Optional[list] = None) -> Tuple[Path, Path]:
+                        filter_flights: Optional[list] = None,
+                        filter_object_exact: Optional[list] = None,
+                        filter_out_object_exact: Optional[list] = None,
+                        exclude_obsmode: Optional[list] = None) -> Tuple[Path, Path]:
     """
     Filter FITS data by object and NaN content, with optional column value removal and zero-spectrum filtering.
     
@@ -877,6 +880,73 @@ def filter_and_save_fits(hdul: fits.HDUList,
         data     = data[keep_mask]
         orig_idx = orig_idx[keep_mask]
 
+    # Apply OBSMODE exclusion filter: remove rows whose OBSMODE exactly matches any of the given strings.
+    # Calibration rows (TSYS, TAU_SIG) are always kept regardless.
+    obsmode_removed_data = np.array([])
+    obsmode_removed_count = 0
+    if exclude_obsmode:
+        if 'OBSMODE' not in data.dtype.names:
+            import warnings
+            warnings.warn("--exclude-obsmode: OBSMODE column not found in FITS data — skipping.")
+        else:
+            obs_col = np.array([
+                s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                for s in data['OBSMODE']
+            ])
+            obj_col_obs = np.array([
+                s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                for s in data['OBJECT']
+            ]) if 'OBJECT' in data.dtype.names else np.full(len(data), '', dtype='U20')
+            cal_mask = np.isin(obj_col_obs, ['TSYS', 'TAU_SIG'])
+            remove_mask = np.isin(obs_col, list(exclude_obsmode)) & ~cal_mask
+            obsmode_removed_data = data[remove_mask]
+            obsmode_removed_count = int(np.sum(remove_mask))
+            data     = data[~remove_mask]
+            orig_idx = orig_idx[~remove_mask]
+            if obsmode_removed_count:
+                removed_modes = sorted(set(obs_col[remove_mask].tolist()))
+                print(f"OBSMODE exclusion: removed {obsmode_removed_count} rows with OBSMODE in {removed_modes}")
+
+    # Calibration OBJECT values that must never be removed by object filters
+    _PROTECTED = {'SKYCHOPDIFF', 'SKYDIFF', 'SKY-DIFF', 'TAU_SIG', 'TSYS'}
+
+    # Apply exact object keep filter: keep only rows whose OBJECT exactly matches one of the given strings.
+    # Calibration rows are always kept regardless.
+    if filter_object_exact:
+        if 'OBJECT' not in data.dtype.names:
+            raise ValueError("OBJECT column not found in FITS data — cannot use --filter-object-exact")
+        obj_exact = np.array([
+            s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+            for s in data['OBJECT']
+        ])
+        keep_mask = np.zeros(len(data), dtype=bool)
+        for name in filter_object_exact:
+            keep_mask |= (obj_exact == name)
+        # Always keep calibration rows
+        keep_mask |= np.isin(obj_exact, list(_PROTECTED))
+        data     = data[keep_mask]
+        orig_idx = orig_idx[keep_mask]
+
+    # Apply exact object remove filter: remove rows whose OBJECT exactly matches one of the given strings.
+    # Calibration rows are always kept regardless.
+    if filter_out_object_exact:
+        if 'OBJECT' not in data.dtype.names:
+            raise ValueError("OBJECT column not found in FITS data — cannot use --filter-out-object-exact")
+        obj_exact = np.array([
+            s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+            for s in data['OBJECT']
+        ])
+        keep_mask = np.ones(len(data), dtype=bool)
+        for name in filter_out_object_exact:
+            # Only remove if not a protected calibration type
+            if name in _PROTECTED:
+                import warnings
+                warnings.warn(f"--filter-out-object-exact: '{name}' is a protected calibration type and will not be removed.")
+            else:
+                keep_mask &= (obj_exact != name)
+        data     = data[keep_mask]
+        orig_idx = orig_idx[keep_mask]
+
     # Always separate target object from calibration rows first.
     # param_filters are ONLY applied to science (target) rows — never to
     # TSYS, TAU_SIG, SKYCHOPDIFF or any other calibration source.
@@ -992,6 +1062,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
             all_rejected = np.concatenate([all_rejected, removed_data])
         if flight_removed_count > 0:
             all_rejected = np.concatenate([all_rejected, flight_removed_data]) if len(all_rejected) > 0 else flight_removed_data
+        if obsmode_removed_count > 0:
+            all_rejected = np.concatenate([all_rejected, obsmode_removed_data]) if len(all_rejected) > 0 else obsmode_removed_data
         del removed_data, combined, combined_orig_idx, other_data, other_orig_idx, target_data, target_orig_idx
     else:
         # NaN filtering applied only to target object (default behavior)
@@ -1006,6 +1078,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
             target_rejected = np.concatenate([target_rejected, removed_data])
         if flight_removed_count > 0:
             target_rejected = np.concatenate([target_rejected, flight_removed_data]) if len(target_rejected) > 0 else flight_removed_data
+        if obsmode_removed_count > 0:
+            target_rejected = np.concatenate([target_rejected, obsmode_removed_data]) if len(target_rejected) > 0 else obsmode_removed_data
         del removed_data
         clean_combined      = np.concatenate([other_data, target_clean]) if len(other_data) > 0 else target_clean
         clean_combined_orig = np.concatenate([other_orig_idx, target_clean_orig]) if len(other_data) > 0 else target_clean_orig
@@ -2077,7 +2151,7 @@ def reduce_spectra_from_config(config_path: Optional[Union[str, Path]] = None,
         # Example: window=[450, 500] → 450,000 to 500,000 m/s
         if 'baseline' in reduction_config and reduction_config['baseline'] is not None:
             baseline_order = reduction_config['baseline']
-            baseline_window = reduction_config.get('window', None)
+            baseline_window = reduction_config.get('line_window', reduction_config.get('window', None))
             methods['baseline'] = {'order': baseline_order}
             if baseline_window is not None:
                 # Store as-is; will be converted to channel indices in reduce_spectra
@@ -2101,8 +2175,9 @@ def reduce_spectra_from_config(config_path: Optional[Union[str, Path]] = None,
         
         # Parse smooth parameters if present
         if 'smooth' in reduction_config and reduction_config['smooth'] is not None:
-            smooth_window = reduction_config['smooth']
-            methods['smooth'] = {'window_size': smooth_window}
+            smooth_window = int(reduction_config['smooth'])
+            if smooth_window > 1:
+                methods['smooth'] = {'window_size': smooth_window}
         
         # Parse unblank parameters if present
         if 'unblank' in reduction_config and reduction_config['unblank'] is not None:

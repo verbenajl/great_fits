@@ -217,9 +217,11 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             for s in data['OBJECT']])
         mission_ids = np.array([_to_str(s) for s in data['MISSION_ID']])
         
-        # Keep spectra where OBJECT equals either pca_source or object_filter
-        # Also include TSYS and TAU_SIG rows
-        combined_mask = (objects == pca_source) | (objects == object_filter) | \
+        # Keep spectra where OBJECT equals pca_source (exact) or contains object_filter
+        # as a substring (to catch e.g. "M82" and "M82_P290" when object_filter="M82").
+        # Also always include TSYS and TAU_SIG rows.
+        combined_mask = (objects == pca_source) | \
+                       np.array([object_filter in o for o in objects]) | \
                        (objects == 'TSYS') | (objects == 'TAU_SIG')
         
         # Apply mission_id filter if specified (substring match: F373 matches 2017-02-10_GR_F373)
@@ -400,7 +402,7 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         else:
             logger.info("Skipping telluric noise filling (--fill-telluric-with-noise not set)")
         
-        # Create index columns for linking M51CENTER to TSYS and TAU_SIG
+        # Create index columns for linking science spectra to TSYS and TAU_SIG
         logger.info("Creating TSYS and TAU_SIG index columns...")
         
         # Initialize index columns with -1 (indicating no match)
@@ -444,16 +446,16 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         
         logger.info(f"Found {len(tsys_lookup)} TSYS groups and {len(tau_sig_lookup)} TAU_SIG groups")
         
-        # Link M51CENTER spectra to TSYS and TAU_SIG
+        # Link science spectra to TSYS and TAU_SIG
         n_tsys_linked = 0
         n_tsys_fallback = 0
         n_tau_sig_linked = 0
         n_tau_sig_fallback = 0
-        
+
         for idx in range(len(filtered_data)):
-            if filtered_objects[idx] == object_filter:  # M51CENTER
+            if object_filter in filtered_objects[idx]:  # any science source matching object_filter
                 key = (filtered_mission_ids[idx], filtered_data['SCAN'][idx])
-                m51_subscan = filtered_data['SUBSCAN'][idx]
+                sci_subscan = filtered_data['SUBSCAN'][idx]
                 m51_timestamp = None
                 
                 if time_col:
@@ -468,13 +470,13 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                     tsys_entries = tsys_lookup[key]
                     
                     # First try: exact pattern match (TSYS subscan = M51CENTER subscan - 1)
-                    pattern_matches = [entry for entry in tsys_entries if entry[0] == m51_subscan - 1]
+                    pattern_matches = [entry for entry in tsys_entries if entry[0] == sci_subscan - 1]
                     
                     if pattern_matches:
                         # Use the first pattern match
                         tsys_indices[idx] = pattern_matches[0][1]
                         n_tsys_linked += 1
-                        logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TSYS idx={pattern_matches[0][1]} subscan={pattern_matches[0][0]} (pattern match)")
+                        logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TSYS idx={pattern_matches[0][1]} subscan={pattern_matches[0][0]} (pattern match)")
                     else:
                         # Fallback: use nearest TSYS by time if available, else use first TSYS
                         if m51_timestamp is not None and any(entry[2] is not None for entry in tsys_entries):
@@ -483,12 +485,12 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             nearest = min(valid_entries, key=lambda e: abs(e[2] - m51_timestamp))
                             tsys_indices[idx] = nearest[1]
                             n_tsys_fallback += 1
-                            logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TSYS idx={nearest[1]} subscan={nearest[0]} (temporal fallback)")
+                            logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TSYS idx={nearest[1]} subscan={nearest[0]} (temporal fallback)")
                         else:
                             # Last resort: use first TSYS in group
                             tsys_indices[idx] = tsys_entries[0][1]
                             n_tsys_fallback += 1
-                            logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TSYS idx={tsys_entries[0][1]} subscan={tsys_entries[0][0]} (first match fallback)")
+                            logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TSYS idx={tsys_entries[0][1]} subscan={tsys_entries[0][0]} (first match fallback)")
                 
                 # Link to TAU_SIG using pattern-aware matching
                 if key in tau_sig_lookup and len(tau_sig_lookup[key]) > 0:
@@ -496,13 +498,13 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                     tau_sig_entries = tau_sig_lookup[key]
                     
                     # First try: exact pattern match (TAU_SIG subscan = M51CENTER subscan - 1)
-                    pattern_matches = [entry for entry in tau_sig_entries if entry[0] == m51_subscan - 1]
+                    pattern_matches = [entry for entry in tau_sig_entries if entry[0] == sci_subscan - 1]
                     
                     if pattern_matches:
                         # Use the first pattern match
                         tau_sig_indices[idx] = pattern_matches[0][1]
                         n_tau_sig_linked += 1
-                        logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TAU_SIG idx={pattern_matches[0][1]} subscan={pattern_matches[0][0]} (pattern match)")
+                        logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TAU_SIG idx={pattern_matches[0][1]} subscan={pattern_matches[0][0]} (pattern match)")
                     else:
                         # Fallback: use nearest TAU_SIG by time if available, else use first TAU_SIG
                         if m51_timestamp is not None and any(entry[2] is not None for entry in tau_sig_entries):
@@ -511,18 +513,18 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             nearest = min(valid_entries, key=lambda e: abs(e[2] - m51_timestamp))
                             tau_sig_indices[idx] = nearest[1]
                             n_tau_sig_fallback += 1
-                            logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TAU_SIG idx={nearest[1]} subscan={nearest[0]} (temporal fallback)")
+                            logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TAU_SIG idx={nearest[1]} subscan={nearest[0]} (temporal fallback)")
                         else:
                             # Last resort: use first TAU_SIG in group
                             tau_sig_indices[idx] = tau_sig_entries[0][1]
                             n_tau_sig_fallback += 1
-                            logger.debug(f"M51CENTER idx={idx} subscan={m51_subscan} -> TAU_SIG idx={tau_sig_entries[0][1]} subscan={tau_sig_entries[0][0]} (first match fallback)")
+                            logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TAU_SIG idx={tau_sig_entries[0][1]} subscan={tau_sig_entries[0][0]} (first match fallback)")
         
-        m51_total = np.sum(filtered_objects == object_filter)
-        logger.info(f"Linked {n_tsys_linked}/{m51_total} M51CENTER spectra to TSYS (pattern-aware)")
-        logger.info(f"Linked {n_tsys_fallback}/{m51_total} M51CENTER spectra to TSYS (fallback)")
-        logger.info(f"Linked {n_tau_sig_linked}/{m51_total} M51CENTER spectra to TAU_SIG (pattern-aware)")
-        logger.info(f"Linked {n_tau_sig_fallback}/{m51_total} M51CENTER spectra to TAU_SIG (fallback)")
+        sci_total = int(np.sum([object_filter in o for o in filtered_objects]))
+        logger.info(f"Linked {n_tsys_linked}/{sci_total} science spectra to TSYS (pattern-aware)")
+        logger.info(f"Linked {n_tsys_fallback}/{sci_total} science spectra to TSYS (fallback)")
+        logger.info(f"Linked {n_tau_sig_linked}/{sci_total} science spectra to TAU_SIG (pattern-aware)")
+        logger.info(f"Linked {n_tau_sig_fallback}/{sci_total} science spectra to TAU_SIG (fallback)")
         
         # Add the index columns to filtered_data by extending the table
         # Build column list from filtered data arrays

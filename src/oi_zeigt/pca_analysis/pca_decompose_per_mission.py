@@ -47,7 +47,8 @@ except ImportError:
     sys.exit(1)
 
 
-def load_spectra_by_mission(fits_file: str, mission_params: dict = None) -> Dict[str, Dict]:
+def load_spectra_by_mission(fits_file: str, mission_params: dict = None,
+                            pca_source: str = 'SKYCHOPDIFF') -> Dict[str, Dict]:
     """
     Load spectra from FITS file, grouped by MISSION_ID and TELESCOP.
 
@@ -134,16 +135,16 @@ def load_spectra_by_mission(fits_file: str, mission_params: dict = None) -> Dict
             
             logger.info(f"  {mission_id}/{telescop}: {n_spectra} spectra")
             
-            # Filter for SKYCHOPDIFF if OBJECT column exists
+            # Filter for pca_source OBJECT value if OBJECT column exists
             if 'OBJECT' in data.dtype.names:
                 objects = np.array([str(x).strip() if isinstance(x, bytes) else str(x).strip()
                                    for x in mission_spectra['OBJECT']])
-                sky_mask = objects == 'SKYCHOPDIFF'
+                sky_mask = objects == pca_source
                 sky_spectra = mission_spectra[sky_mask]['SPECTRUM']
-                # Get the original indices of SKYCHOPDIFF spectra in the full data array
+                # Get the original indices in the full data array
                 mission_indices = np.where(mask)[0]
                 sky_indices = mission_indices[sky_mask]
-                logger.info(f"    └─ SKYCHOPDIFF: {np.sum(sky_mask)} spectra")
+                logger.info(f"    └─ {pca_source}: {np.sum(sky_mask)} spectra")
             else:
                 sky_spectra = mission_spectra['SPECTRUM']
                 sky_indices = np.where(mask)[0]
@@ -195,7 +196,7 @@ def load_spectra_by_mission(fits_file: str, mission_params: dict = None) -> Dict
                 'metadata': {
                     'n_spectra': len(sky_spectra),
                     'n_channels': sky_spectra[0].shape[0] if len(sky_spectra) > 0 else 0,
-                    'source': 'SKYCHOPDIFF' if 'OBJECT' in data.dtype.names else 'all',
+                    'source': pca_source if 'OBJECT' in data.dtype.names else 'all',
                 }
             }
         
@@ -221,15 +222,19 @@ def preprocess_spectra(spectra: np.ndarray,
         Preprocessed spectra with valid channels and NaNs filled.
     velocity_axis : np.ndarray or None
         Velocity axis trimmed to the valid channel range, or None if not given.
+    first_valid : int
+        Index of the first valid channel in the original spectra array.
+    last_valid : int
+        Index of the last valid channel in the original spectra array.
     """
     # Filter out spectra that are mostly NaN (>50% NaN)
     nan_fraction_per_spectrum = np.sum(np.isnan(spectra), axis=1) / spectra.shape[1]
-    good_spectra_mask = nan_fraction_per_spectrum < 0.5
+    good_spectra_mask = nan_fraction_per_spectrum < 0.20
     original_count = len(spectra)
     spectra = spectra[good_spectra_mask]
     removed_count = original_count - len(spectra)
     if removed_count > 0:
-        logger.info(f"Filtered out {removed_count} spectra with >50% NaN values")
+        logger.info(f"Filtered out {removed_count} spectra with >20% NaN values")
     
     if len(spectra) == 0:
         logger.error("No spectra remain after NaN filtering!")
@@ -242,14 +247,15 @@ def preprocess_spectra(spectra: np.ndarray,
         raise ValueError("All channels are NaN in all spectra")
     
     original_n_channels = spectra.shape[1]
-    first_valid = np.where(valid_channels)[0][0]
-    last_valid = np.where(valid_channels)[0][-1]
+    first_valid = int(np.where(valid_channels)[0][0])
+    last_valid = int(np.where(valid_channels)[0][-1])
     spectra = spectra[:, first_valid:last_valid+1]
     if velocity_axis is not None and len(velocity_axis) == original_n_channels:
         velocity_axis = velocity_axis[first_valid:last_valid + 1]
 
     n_valid_channels = last_valid - first_valid + 1
-    logger.info(f"Trimmed to {n_valid_channels} valid channels (out of {original_n_channels} original)")
+    logger.info(f"Trimmed to {n_valid_channels} valid channels (out of {original_n_channels} original), "
+                f"channel offset: [{first_valid}, {last_valid}]")
     
     # Fill remaining NaNs with per-channel mean
     n_nans_filled = 0
@@ -276,7 +282,7 @@ def preprocess_spectra(spectra: np.ndarray,
     # Final safety check: replace any inf or -inf
     spectra = np.nan_to_num(spectra, nan=0.0, posinf=0.0, neginf=0.0)
 
-    return spectra, velocity_axis
+    return spectra, velocity_axis, first_valid, last_valid
 
 
 def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarray,
@@ -284,7 +290,8 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
                               velocity_axis: np.ndarray = None,
                               line_window_kms: tuple = None,
                               spectrum_indices: np.ndarray = None,
-                              smoothing_kernel_size: int = None) -> DecompositionResult:
+                              smoothing_kernel_size: int = None,
+                              pca_source: str = 'SKYCHOPDIFF') -> DecompositionResult:
     """
     Perform PCA decomposition on spectra from a single mission/telescope combination.
     
@@ -328,7 +335,7 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
     
     # Preprocess — also trims velocity_axis to match valid channel range
     logger.info(f"Preprocessing spectra...")
-    spectra, velocity_axis = preprocess_spectra(spectra, velocity_axis)
+    spectra, velocity_axis, channel_first, channel_last = preprocess_spectra(spectra, velocity_axis)
     logger.info(f"After preprocessing: {spectra.shape}")
     
     # Baseline-subtract each SKYCHOPDIFF spectrum before decomposition,
@@ -405,7 +412,9 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
         metadata={
             'n_reference_spectra': len(spectra),
             'n_channels': spectra.shape[1],
-            'source': 'SKYCHOPDIFF',
+            'channel_first': channel_first,
+            'channel_last': channel_last,
+            'source': pca_source,
             'mission_id': mission_id,
             'velocity_axis_kms': velocity_axis,
         },
@@ -424,10 +433,11 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
     return result
 
 
-def save_results(result: DecompositionResult, mission_id: str, telescop: str) -> Path:
+def save_results(result: DecompositionResult, mission_id: str, telescop: str,
+                 output_dir: Path = None) -> Path:
     """
     Save decomposition result to pickle file.
-    
+
     Parameters
     ----------
     result : DecompositionResult
@@ -436,13 +446,16 @@ def save_results(result: DecompositionResult, mission_id: str, telescop: str) ->
         Mission identifier for filename (includes date like 2017-02-01_...)
     telescop : str
         Telescope identifier for filename
-    
+    output_dir : Path, optional
+        Directory to write output files. Defaults to output/pca_components.
+
     Returns
     -------
     Path
         Path to saved pickle file
     """
-    output_dir = Path("output/pca_components")
+    if output_dir is None:
+        output_dir = Path("output/pca_components")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Replace special characters in telescope name for filesystem safety
@@ -546,6 +559,11 @@ def main_cli():
         logger.info(f"Loading configuration from {args.config}")
         config = get_config(args.config)
         
+        # Resolve components_dir: config [output][components_dir] > default
+        output_config = config.get('output', {})
+        components_dir = Path(output_config.get('components_dir', 'output/pca_components'))
+        logger.info(f"✓ Components directory = {components_dir}")
+
         # Resolve n_components: CLI > config [pca][n_components] > default 5
         pca_config = config.get('pca', {})
         if args.n_components is not None:
@@ -596,7 +614,9 @@ def main_cli():
             sys.exit(1)
         
         # Load spectra by mission
-        mission_data = load_spectra_by_mission(fits_file)
+        pca_source = pca_config.get('pca_source', 'SKYCHOPDIFF')
+        logger.info(f"✓ PCA source = {pca_source} (from config [pca][pca_source])" if pca_config.get('pca_source') else f"✓ PCA source = {pca_source} (default)")
+        mission_data = load_spectra_by_mission(fits_file, pca_source=pca_source)
         
         # Extract velocity axis from FITS file
         velocity_axis = None
@@ -702,10 +722,10 @@ def main_cli():
                 f"mission_id={args.mission_id!r}  telescope={args.telescope!r}"
             )
 
-        # Check for missions with no SKYCHOPDIFF spectra
+        # Check for missions with no pca_source spectra
         missions_no_sky = [m for m, d in mission_data.items() if d['metadata']['n_spectra'] == 0]
         if missions_no_sky:
-            logger.warning(f"Missions with NO SKYCHOPDIFF spectra: {', '.join(str(m) for m in missions_no_sky)}")
+            logger.warning(f"Missions with NO {pca_source} spectra: {', '.join(str(m) for m in missions_no_sky)}")
 
         logger.info(f"\n{'='*80}")
         logger.info(f"PROCESSING {len(mission_data)} MISSION/TELESCOPE COMBINATIONS")
@@ -733,7 +753,8 @@ def main_cli():
                 velocity_axis=velocity_axis,
                 line_window_kms=mission_line_windows.get(mission_id),
                 spectrum_indices=spectrum_indices,
-                smoothing_kernel_size=pca_config.get('smoothing_kernel_size')
+                smoothing_kernel_size=pca_config.get('smoothing_kernel_size'),
+                pca_source=pca_source,
             )
             
             if result is None:
@@ -742,7 +763,7 @@ def main_cli():
             results[key] = result
             
             # Save
-            output_file = save_results(result, mission_id, telescop)
+            output_file = save_results(result, mission_id, telescop, output_dir=components_dir)
             output_files.append(output_file)
         
         # Summary
@@ -762,8 +783,6 @@ def main_cli():
                 import matplotlib
                 # Use non-interactive backend
                 matplotlib.use('Agg')
-                
-                output_dir = Path("output/pca_components")
                 
                 for key in sorted(results.keys()):
                     result = results[key]
@@ -815,7 +834,7 @@ def main_cli():
                             
                             # Safe telescope name for filename
                             safe_telescop = telescop.replace('/', '_').replace(' ', '_')
-                            components_path = output_dir / f"pca_components_{mission_id}_{safe_telescop}.png"
+                            components_path = components_dir / f"pca_components_{mission_id}_{safe_telescop}.png"
                             plt.savefig(components_path, dpi=150, bbox_inches='tight')
                             plt.close(fig)
                             logger.info(f"✓ Saved component plots to {components_path}")
@@ -847,7 +866,7 @@ def main_cli():
                             ax2.set_ylim(0, 105)
                             
                             plt.tight_layout()
-                            variance_path = output_dir / f"pca_variance_{mission_id}_{safe_telescop}.png"
+                            variance_path = components_dir / f"pca_variance_{mission_id}_{safe_telescop}.png"
                             plt.savefig(variance_path, dpi=150, bbox_inches='tight')
                             plt.close(fig2)
                             logger.info(f"✓ Saved variance plots to {variance_path}")

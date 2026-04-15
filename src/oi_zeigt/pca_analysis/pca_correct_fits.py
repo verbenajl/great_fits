@@ -111,8 +111,15 @@ def find_science_lines(spectra, kernel_size=51, cutoff_std=2.0, smoothing_kernel
         n_channels_in_window = np.sum(velocity_mask)
         logger.debug(f"  Velocity window: {v_min}-{v_max} km/s, {n_channels_in_window}/{n_channels} channels in window")
     
-    # Use FULL spectra for detection (don't mask before OpenCV processing)
-    spectra_for_detection = spectra
+    # Pre-zero channels outside the velocity window before OpenCV processing.
+    # This ensures the mean+sigma threshold is computed from the window region
+    # only, not inflated by baseline noise across the full band.
+    if not np.all(velocity_mask):
+        spectra_for_detection = spectra.copy()
+        spectra_for_detection[:, ~velocity_mask] = 0.0
+        logger.debug(f"  Pre-zeroed {np.sum(~velocity_mask)} channels outside velocity window")
+    else:
+        spectra_for_detection = spectra
     
     # CRITICAL: Reject spectra with zero or negligible signal
     # Calculate spectrum amplitude for each row
@@ -722,20 +729,48 @@ def _pca_spectrum_worker(args):
                 return idx, None, None  # signal: no decomposition
             components = decomp.components
             variance_ratio = decomp.explained_variance_ratio
+            metadata = getattr(decomp, 'metadata', {}) or {}
         else:
             components = s['default_components']
             variance_ratio = s['default_variance_ratio']
+            metadata = {}
 
         if not np.any(gcf):
             return idx, spectrum.copy(), {'status': 'skip_bad_channels',
                                           'n_components_used': 0, 'skipped': True}
 
-        corrected, details = _pca_apply_correction(
-            spectrum, components, variance_ratio, gcf, gcs,
+        # If the components were trimmed during decomposition, slice the
+        # spectrum (and good-channel masks) to the same channel range before
+        # applying the correction, then embed the result back.
+        ch_first = metadata.get('channel_first', None)
+        ch_last = metadata.get('channel_last', None)
+        n_comp_channels = components.shape[1]
+
+        if ch_first is not None and ch_last is not None:
+            spec_slice = spectrum[ch_first:ch_last + 1]
+            gcf_slice = gcf[ch_first:ch_last + 1]
+            gcs_slice = gcs[ch_first:ch_last + 1]
+        elif n_comp_channels < len(spectrum):
+            # Fallback: assume components start at channel 0
+            spec_slice = spectrum[:n_comp_channels]
+            gcf_slice = gcf[:n_comp_channels]
+            gcs_slice = gcs[:n_comp_channels]
+            ch_first, ch_last = 0, n_comp_channels - 1
+        else:
+            spec_slice, gcf_slice, gcs_slice = spectrum, gcf, gcs
+            ch_first, ch_last = 0, len(spectrum) - 1
+
+        corrected_slice, details = _pca_apply_correction(
+            spec_slice, components, variance_ratio, gcf_slice, gcs_slice,
             s['cutoff_variance'], s['cutoff_noise_ratio'], s['smoothing_kernel_size'],
             use_lstsq=s.get('use_lstsq', False),
             cut_coefficients=s.get('cut_coefficients', 0),
         )
+
+        # Embed corrected slice back into a full-length copy of the spectrum
+        corrected = spectrum.copy()
+        corrected[ch_first:ch_last + 1] = corrected_slice
+
         details['status'] = 'ok'
         return idx, corrected, details
     except Exception as e:
@@ -750,10 +785,10 @@ class PCACorrector:
                  n_components=None,
                  line_kernel_size=51, line_cutoff_std=2.0,
                  smoothing_kernel_size=None, line_window_velocities=None,
-                 use_lstsq=False):
+                 use_lstsq=False, force_line_window=False):
         """
         Initialize PCA corrector with decomposition results.
-        
+
         Parameters
         ----------
         decomposition_pkl : str
@@ -768,6 +803,9 @@ class PCACorrector:
             Smoothing kernel size for line detection refinement
         line_window_velocities : tuple, optional
             (v_min, v_max) velocity range in km/s to constrain line detection
+        force_line_window : bool
+            If True and detection finds nothing, mask the configured velocity
+            window directly (hard fallback). Default: False.
         """
         self.config = config or {}
         self.line_kernel_size = line_kernel_size
@@ -775,6 +813,7 @@ class PCACorrector:
         self.smoothing_kernel_size = smoothing_kernel_size
         self.line_window_velocities = line_window_velocities
         self.use_lstsq = use_lstsq
+        self.force_line_window = force_line_window
         
         self.decomposition = self._load_decomposition(decomposition_pkl)
         self.pca = self.decomposition.pca if hasattr(self.decomposition, 'pca') else None
@@ -1495,19 +1534,18 @@ class PCACorrector:
             scans = np.array([to_string(x) for x in data['SCAN'][indices]])
             subscans = np.array([to_string(x) for x in data['SUBSCAN'][indices]])
             
-            # Get unique mission/telescope/scan/subscan combinations (needed for iterative line detection)
+            # Get unique mission/telescope/scan combinations for line detection.
+            # Grouping by scan (not subscan) pools more spectra per group, which
+            # gives a stronger 2D signal and improves OpenCV line detection.
             unique_groups = np.unique(
-                np.column_stack((mission_ids, telescopes, scans, subscans)),
-                axis=0
-            )
-            
-            # Also get unique mission/telescope/scan combinations for plotting
-            unique_groups_for_plotting = np.unique(
                 np.column_stack((mission_ids, telescopes, scans)),
                 axis=0
             )
-            
-            logger.info(f"  Found {len(unique_groups)} unique mission/telescope/scan/subscan combinations (for line detection)")
+
+            # Also get unique mission/telescope/scan combinations for plotting
+            unique_groups_for_plotting = unique_groups
+
+            logger.info(f"  Found {len(unique_groups)} unique mission/telescope/scan combinations (for line detection)")
             if generate_plots:
                 logger.info(f"  Will generate {len(unique_groups_for_plotting)} plots (one per mission/telescope/scan)")
             logger.info(f"  Total spectra to process: {len(indices)}")
@@ -1711,30 +1749,29 @@ class PCACorrector:
             for iteration in range(3):
                 logger.info(f"  Iteration {iteration + 1}/3 of line detection")
                 
-                for mission_id_group, telescope_group, scan_id, subscan_id in unique_groups:
-                    # Find spectra matching this mission/telescope/scan/subscan combination
+                for mission_id_group, telescope_group, scan_id in unique_groups:
+                    # Find spectra matching this mission/telescope/scan combination.
+                    # Grouping by scan (all subscans together) pools more spectra,
+                    # giving a stronger 2D signal for OpenCV line detection.
                     group_mask = (
                         (mission_ids == mission_id_group) &
                         (telescopes == telescope_group) &
-                        (scans == scan_id) &
-                        (subscans == subscan_id)
+                        (scans == scan_id)
                     )
                     group_indices = np.where(group_mask)[0]
                     if len(group_indices) == 0:
                         continue
-                    
+
                     # Get CORRECTED spectra from first pass for line detection
                     group_corrected_spectra = prelim_corrected_spectra[indices[group_indices]]
-                    
+
                     try:
                         # Detect lines in the corrected spectra
                         line_window_kms = None
                         if hasattr(self, 'line_window_velocities') and self.line_window_velocities:
                             line_window_kms = tuple(self.line_window_velocities)
-                        
-                        # Match legacy behaviour: raise cutoff_std to 3 on the
-                        # final iteration (pca_correct.py line 1252-1253).
-                        this_cutoff_std = 3 if iteration == 2 else self.line_cutoff_std
+
+                        this_cutoff_std = self.line_cutoff_std
                         group_threshold = find_science_lines(
                             group_corrected_spectra,
                             kernel_size=self.line_kernel_size,
@@ -1743,22 +1780,43 @@ class PCACorrector:
                             velocity_axis_kms=velocity_axis_kms,
                             velocity_window_kms=line_window_kms
                         )
-                        
+
                         if group_threshold is not None:
                             # Save threshold for visualization (only on last iteration)
                             if iteration == 2:
-                                group_key = (mission_id_group, telescope_group, scan_id, subscan_id)
+                                group_key = (mission_id_group, telescope_group, scan_id)
                                 group_thresholds[group_key] = group_threshold
-                            
+
                             # Apply detected lines to mask
                             for group_spectrum_position, global_spectrum_idx in enumerate(group_indices):
                                 line_mask = group_threshold[group_spectrum_position]
                                 if np.any(line_mask):
                                     local_idx = np.where(indices == global_spectrum_idx)[0][0]
                                     detected_lines_mask[local_idx] = line_mask
-                    
+                        elif (self.force_line_window
+                              and line_window_kms is not None
+                              and velocity_axis_kms is not None):
+                            # --force-line-window fallback: no line detected by OpenCV —
+                            # mask the configured velocity window directly so those
+                            # channels are excluded from the PCA coefficient fit.
+                            v_min_fb, v_max_fb = line_window_kms
+                            fallback_channel_mask = (
+                                (velocity_axis_kms >= v_min_fb) & (velocity_axis_kms <= v_max_fb)
+                            )
+                            if np.any(fallback_channel_mask):
+                                logger.debug(
+                                    f"  No line detected for {mission_id_group}/{telescope_group}/"
+                                    f"scan{scan_id} — "
+                                    f"applying --force-line-window fallback "
+                                    f"({v_min_fb:.0f}–{v_max_fb:.0f} km/s, "
+                                    f"{np.sum(fallback_channel_mask)} channels)"
+                                )
+                                for global_spectrum_idx in group_indices:
+                                    local_idx = np.where(indices == global_spectrum_idx)[0][0]
+                                    detected_lines_mask[local_idx] |= fallback_channel_mask
+
                     except Exception as e:
-                        logger.debug(f"Line detection failed for {mission_id_group}/{telescope_group}/scan{scan_id}/subscan{subscan_id}: {e}")
+                        logger.debug(f"Line detection failed for {mission_id_group}/{telescope_group}/scan{scan_id}: {e}")
                 
                 # If last iteration, skip re-correction
                 if iteration < 2:
@@ -1846,12 +1904,11 @@ class PCACorrector:
                 logger.info("STEP 2.5: KDE noise ratio fitting per group")
                 Path(output_dir).mkdir(parents=True, exist_ok=True)
                 for group_row in unique_groups:
-                    mission_id_group, telescope_group, scan_id, subscan_id = group_row
+                    mission_id_group, telescope_group, scan_id = group_row
                     group_mask = (
                         (mission_ids == mission_id_group) &
                         (telescopes == telescope_group) &
-                        (scans == scan_id) &
-                        (subscans == subscan_id)
+                        (scans == scan_id)
                     )
                     group_local_indices = np.where(group_mask)[0]
                     if len(group_local_indices) == 0:
@@ -1889,7 +1946,7 @@ class PCACorrector:
                         component_cutoffs = _derive_component_cutoffs(
                             kde_params, global_noise_ratio_cutoff, cutoff_noise_ratio)
                         group_label = (f"{mission_id_group}_{telescope_group}"
-                                       f"_scan{scan_id}_sub{subscan_id}")
+                                       f"_scan{scan_id}")
                         logger.info(f"  {group_label}: per-component cutoffs = {component_cutoffs}")
 
                         if generate_plots:
@@ -2012,19 +2069,44 @@ class PCACorrector:
                                 self.explained_variance_ratio = saved_variance_ratio
                             continue
 
-                        # Final correction with detected lines excluded from fitting
-                        corrected, details = _pca_apply_correction(
-                            np.array(spectrum, dtype=float),
+                        # Final correction with detected lines excluded from fitting.
+                        # If components were trimmed during decomposition, slice the
+                        # spectrum to the component channel range and embed back.
+                        _meta = getattr(self, 'metadata', {}) or {}
+                        _ch_first = _meta.get('channel_first', None)
+                        _ch_last = _meta.get('channel_last', None)
+                        _n_comp_ch = self.components.shape[1]
+                        _spec_full = np.array(spectrum, dtype=float)
+
+                        if _ch_first is not None and _ch_last is not None:
+                            _spec_in = _spec_full[_ch_first:_ch_last + 1]
+                            _gcf_in = good_channels_for_fitting[_ch_first:_ch_last + 1]
+                            _gcs_in = good_channels_for_subtraction[_ch_first:_ch_last + 1]
+                        elif _n_comp_ch < len(_spec_full):
+                            _ch_first, _ch_last = 0, _n_comp_ch - 1
+                            _spec_in = _spec_full[:_n_comp_ch]
+                            _gcf_in = good_channels_for_fitting[:_n_comp_ch]
+                            _gcs_in = good_channels_for_subtraction[:_n_comp_ch]
+                        else:
+                            _spec_in = _spec_full
+                            _gcf_in = good_channels_for_fitting
+                            _gcs_in = good_channels_for_subtraction
+                            _ch_first, _ch_last = 0, len(_spec_full) - 1
+
+                        corrected_slice, details = _pca_apply_correction(
+                            _spec_in,
                             self.components,
                             self.explained_variance_ratio,
-                            good_channels_for_fitting,
-                            good_channels_for_subtraction,
+                            _gcf_in,
+                            _gcs_in,
                             cutoff_variance,
                             cutoff_noise_ratio,
                             self.smoothing_kernel_size,
                             use_lstsq=self.use_lstsq,
                             cut_coefficients=cut_coefficients,
                         )
+                        corrected = _spec_full.copy()
+                        corrected[_ch_first:_ch_last + 1] = corrected_slice
 
                         corrected_spectra[idx] = corrected
                         correction_details[idx] = details
@@ -2036,7 +2118,7 @@ class PCACorrector:
                         # Log first few spectra to track what's happening
                         if spec_idx < 3:
                             logger.info(f"Spectrum {idx}: {details['n_components_used']} components used, "
-                                      f"correction_avg={np.mean(np.abs(corrected - spectrum)):.4e}")
+                                      f"correction_avg={np.nanmean(np.abs(corrected - spectrum)):.4e}")
 
                         if mission_decompositions:
                             self.components = saved_components
@@ -2236,35 +2318,43 @@ class PCACorrector:
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Generating diagnostic plots...")
         
-        # Load SKYCHOPDIFF reference spectra from the same input FITS file for waterfall plots
+        # Load reference (pca_source) spectra from the same input FITS file for waterfall plots
+        # Use pca_source from decomposition metadata; fall back to 'SKYCHOPDIFF'
+        _pca_source_label = 'SKYCHOPDIFF'
+        if mission_decompositions:
+            _first = next(iter(mission_decompositions.values()), None)
+            if _first is not None:
+                _meta = getattr(_first, 'metadata', {}) or {}
+                _pca_source_label = _meta.get('source', 'SKYCHOPDIFF')
+                if _pca_source_label == 'pca_source':  # sentinel from old pickles
+                    _pca_source_label = 'SKYCHOPDIFF'
+
         skychopdiff_spectra = {}
         if mission_decompositions and input_fits:
             try:
                 from astropy.io import fits as pyfits
                 with pyfits.open(input_fits) as hdul:
-                    # Load all SKYCHOPDIFF spectra and their metadata
                     hdu = hdul[1]
                     all_data = hdu.data
-                    all_object = np.array([s.strip() for s in all_data['OBJECT']])
-                    all_mission = np.array([s.strip() for s in all_data['MISSION_ID']])
-                    all_telescope = np.array([s.strip() for s in all_data['TELESCOP']])
-                    
-                    # Filter to only SKYCHOPDIFF spectra
-                    sky_mask = all_object == 'SKYCHOPDIFF'
+                    all_object    = np.array([s.decode().strip() if isinstance(s, bytes) else str(s).strip() for s in all_data['OBJECT']])
+                    all_mission   = np.array([s.decode().strip() if isinstance(s, bytes) else str(s).strip() for s in all_data['MISSION_ID']])
+                    all_telescope = np.array([s.decode().strip() if isinstance(s, bytes) else str(s).strip() for s in all_data['TELESCOP']])
+
+                    # Filter to pca_source spectra
+                    sky_mask = all_object == _pca_source_label
                     sky_spectra = all_data['SPECTRUM'][sky_mask]
                     sky_mission = all_mission[sky_mask]
                     sky_telescope = all_telescope[sky_mask]
-                    
+
                     # Group by mission/telescope
                     for key in mission_decompositions.keys():
-                        # key is (mission_id, telescope)
                         mission_str, telescope_str = key
                         combo_mask = (sky_mission == mission_str) & (sky_telescope == telescope_str)
                         if np.any(combo_mask):
                             skychopdiff_spectra[key] = sky_spectra[combo_mask]
-                            logger.info(f"Loaded {len(sky_spectra[combo_mask])} SKYCHOPDIFF spectra for {mission_str}/{telescope_str}")
+                            logger.info(f"Loaded {len(sky_spectra[combo_mask])} {_pca_source_label} spectra for {mission_str}/{telescope_str}")
             except Exception as e:
-                logger.warning(f"Failed to load SKYCHOPDIFF spectra for plotting: {e}")
+                logger.warning(f"Failed to load {_pca_source_label} spectra for plotting: {e}")
         
         # Debug logging for masks
         logger.info(f"_generate_plots called with science_line_mask: {science_line_mask is not None}, telluric_line_mask: {telluric_line_mask is not None}")
@@ -2444,7 +2534,7 @@ class PCACorrector:
             mission_telescope_key = (mission_id, telescope)
             if mission_telescope_key in skychopdiff_spectra:
                 to_display = skychopdiff_spectra[mission_telescope_key]
-                waterfall_title = f'SKYCHOPDIFF Spectra - {mission_id}/{telescope}\n({len(to_display)} spectra used for decomposition)'
+                waterfall_title = f'{_pca_source_label} Spectra - {mission_id}/{telescope}\n({len(to_display)} spectra used for decomposition)'
             else:
                 # Fallback: show all spectra from current scan
                 to_display = original_spectra_subset
@@ -2488,18 +2578,16 @@ class PCACorrector:
                 telescope_str = to_string(telescope)
                 mission_str = to_string(mission_id)
                 
-                # Consolidate thresholds across ALL subscans for this (mission, telescope, scan) group
-                # group_thresholds keys are: (mission_id, telescope, scan, subscan)
-                # We want to collect all thresholds that match (mission, telescope, scan)
+                # Look up the threshold for this (mission, telescope, scan) group
                 found_thresholds = []
                 for group_key, thresh in group_thresholds.items():
-                    group_mission_id, group_telescope, group_scan, group_subscan = group_key
-                    # Match on mission, scan, and telescope
+                    group_mission_id, group_telescope, group_scan = group_key
+                    # Match on mission, telescope, and scan
                     # Convert group values to strings too to handle np.str_ and bytes
-                    if (to_string(group_mission_id) == mission_str and 
-                        to_string(group_scan) == scan_str and 
+                    if (to_string(group_mission_id) == mission_str and
+                        to_string(group_scan) == scan_str and
                         to_string(group_telescope) == telescope_str):
-                        found_thresholds.append((group_subscan, thresh))
+                        found_thresholds.append((group_scan, thresh))
                 
                 # If we found thresholds, vertically stack them (accumulating across subscans)
                 if found_thresholds:
@@ -2856,8 +2944,20 @@ class PCACorrector:
                 ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=1.5, alpha=0.8, label='Orig', zorder=1)
                 ax_ex_comp.plot(x_axis, corrected_ex, color='green', lw=1.5, alpha=0.8, label='Corr', zorder=2)
                 
-                scaled_comp = coeffs[comp_idx] * self.components[comp_idx]
-                ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')
+                scaled_comp_raw = coeffs[comp_idx] * self.components[comp_idx]
+                # Embed trimmed component back into full channel range for plotting
+                _plot_meta = getattr(self, 'metadata', {}) or {}
+                _cf = _plot_meta.get('channel_first', None)
+                _cl = _plot_meta.get('channel_last', None)
+                if _cf is not None and _cl is not None and len(scaled_comp_raw) == _cl - _cf + 1 and len(x_axis) > _cl:
+                    scaled_comp = np.zeros(len(x_axis))
+                    scaled_comp[_cf:_cl + 1] = scaled_comp_raw
+                else:
+                    scaled_comp = scaled_comp_raw
+                if len(scaled_comp) == len(x_axis):
+                    ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')
+                else:
+                    ax_ex_comp.plot(scaled_comp, 'b-', lw=1, label='Comp')
                 
                 info = comp_info.get(comp_idx, {})
                 used = info.get('used', False)
@@ -3104,6 +3204,13 @@ Examples:
         help='Smoothing kernel size for line detection refinement (optional)'
     )
     parser.add_argument(
+        '--force-line-window',
+        action='store_true',
+        default=False,
+        help='If OpenCV detects no line, fall back to masking the configured '
+             'line_window channels directly (prevents line from entering the PCA fit).'
+    )
+    parser.add_argument(
         '--config-window',
         type=float,
         nargs=2,
@@ -3193,6 +3300,7 @@ Examples:
     
     # Load config to get defaults
     config_plot_dir = 'output/pca_corrected'  # Fallback default
+    config_components_dir = './output/pca_components'  # Fallback default
     config_input_file = None
     config_object = None
     config_output_file = None
@@ -3214,6 +3322,7 @@ Examples:
             config = ConfigLoader(args.config)
             output_config = config.get('output', {})
             config_plot_dir = output_config.get('pca_plots_dir', 'output/pca_corrected')
+            config_components_dir = output_config.get('components_dir', './output/pca_components')
             # Try prepared_for_pca first, then fall back to reduced_fits
             config_input_file = output_config.get('prepared_for_pca') or output_config.get('reduced_fits')
             config_output_file = output_config.get('pcad_fits')
@@ -3359,12 +3468,13 @@ Examples:
         decomposition_file = args.decomposition
         logger.info(f"✓ Decomposition = {decomposition_file} (from command line)")
     else:
-        # Look for per-mission decomposition files in default location
-        decomp_dir = Path("./output/pca_components")
+        # Look for per-mission decomposition files in config components_dir
+        decomp_dir = Path(config_components_dir)
+        logger.info(f"✓ Components directory = {decomp_dir} (from config [output][components_dir])")
         if decomp_dir.exists():
             # Try to load per-mission decompositions
             mission_decompositions = PCACorrector.load_decompositions_from_dir(decomp_dir)
-            
+
             if mission_decompositions:
                 logger.info(f"✓ Loaded {len(mission_decompositions)} per-mission decompositions")
             else:
@@ -3373,18 +3483,19 @@ Examples:
                 decomp_files = sorted(glob.glob(str(decomp_dir / "decomposition_*_components.pkl")))
                 if decomp_files:
                     decomposition_file = decomp_files[-1]  # Use most recent
-                    logger.info(f"✓ Decomposition = {decomposition_file} (from ./output/pca_components)")
+                    logger.info(f"✓ Decomposition = {decomposition_file} (from {decomp_dir})")
                 else:
-                    logger.error("No decomposition files found in ./output/pca_components/")
+                    logger.error(f"No decomposition files found in {decomp_dir}/")
                     logger.error("Specify via:")
                     logger.error("  1. Command line: pca_correct --decomposition /path/to/decomposition.pkl ...")
-                    logger.error("  2. Place decomposition files in ./output/pca_components/decomposition_*.pkl")
+                    logger.error(f"  2. Place decomposition files in {decomp_dir}/decomposition_*.pkl")
+                    logger.error(f"  3. Set [output][components_dir] in config.toml")
                     sys.exit(1)
         else:
-            logger.error("No decomposition file specified and default location not found")
+            logger.error(f"Components directory not found: {decomp_dir}")
             logger.error("Specify via:")
             logger.error("  1. Command line: pca_correct --decomposition /path/to/decomposition.pkl ...")
-            logger.error("  2. Place decomposition files in ./output/pca_components/decomposition_*.pkl")
+            logger.error(f"  2. Set [output][components_dir] in config.toml")
             sys.exit(1)
     
     # Determine output file: explicit CLI arg > config [output][pcad_fits]
@@ -3455,6 +3566,8 @@ Examples:
         # Get line_window from [reduction] section (already extracted above)
         line_window_velocities = tuple(config_line_window) if config_line_window else None
 
+        force_line_window = args.force_line_window
+
         if decomposition_file:
             # Use single decomposition file
             corrector = PCACorrector(
@@ -3465,6 +3578,7 @@ Examples:
                 smoothing_kernel_size=smoothing_kernel,
                 line_window_velocities=line_window_velocities,
                 use_lstsq=use_lstsq,
+                force_line_window=force_line_window,
             )
             mission_decompositions_to_use = None
         else:
@@ -3495,6 +3609,7 @@ Examples:
                     smoothing_kernel_size=smoothing_kernel,
                     line_window_velocities=line_window_velocities,
                     use_lstsq=use_lstsq,
+                    force_line_window=force_line_window,
                 )
             finally:
                 # Clean up temp file
