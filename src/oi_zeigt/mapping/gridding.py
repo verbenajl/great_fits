@@ -52,26 +52,29 @@ def get_gridding_params_from_config(config_path: Optional[str] = None,
     pixsize_deg : float
         Pixel size in degrees (calculated as beamsize/3 if not specified)
     """
-    from oi_zeigt.basic_io import get_config
-    
-    # Load config
-    cfg = get_config(config_path)
-    gridding_cfg = cfg.get('gridding', {})
-    
+    gridding_cfg = {}
+    if beamsize_deg is None or pixsize_deg is None:
+        # Only load config when we actually need a value from it
+        try:
+            from oi_zeigt.basic_io import get_config
+            cfg = get_config(config_path)
+            gridding_cfg = cfg.get('gridding', {})
+        except Exception:
+            pass  # No config available — fall back to hard defaults below
+
     # Get beamsize from config (in arcseconds) or use provided value
     if beamsize_deg is None:
         beamsize_arcsec = gridding_cfg.get('beamsize_arcsec', 15.0)  # Default 15 arcsec
         beamsize_deg = beamsize_arcsec / 3600.0  # Convert arcseconds to degrees
-    
+
     # Get pixel size from config (in arcseconds) or calculate it
     if pixsize_deg is None:
         pixsize_arcsec = gridding_cfg.get('pixel_size_arcsec', None)
         if pixsize_arcsec is None or pixsize_arcsec == 0:
-            # Calculate as beamsize / 3 (good for Nyquist sampling)
             pixsize_deg = beamsize_deg / 3.0
         else:
-            pixsize_deg = pixsize_arcsec / 3600.0  # Convert arcseconds to degrees
-    
+            pixsize_deg = pixsize_arcsec / 3600.0
+
     return beamsize_deg, pixsize_deg
 
 
@@ -1000,7 +1003,7 @@ def create_integrated_map(hdul: fits.HDUList,
                     tau_spec  = tau_spec[ch_min:ch_max]
                 w_ch = np.where(
                     np.isfinite(tsys_spec) & np.isfinite(tau_spec) & (tsys_spec > 0),
-                    np.exp(-tau_spec) / tsys_spec,
+                    (np.exp(-tau_spec) / tsys_spec) ** 2,
                     np.nan,
                 )
                 w_sum = np.nansum(w_ch)
@@ -1144,7 +1147,9 @@ def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
                      output_file: str, beam_maj_deg: float, beam_min_deg: float = None,
                      beam_pa_deg: float = 0.0, overwrite: bool = True,
                      spectral_params: Optional[Dict[str, Any]] = None,
-                     coverage_map: Optional[np.ndarray] = None) -> None:
+                     coverage_map: Optional[np.ndarray] = None,
+                     weight_map: Optional[np.ndarray] = None,
+                     weight_column: Optional[str] = None) -> None:
     """
     Save a gridded map to a FITS file with proper WCS and beam information.
     
@@ -1236,6 +1241,15 @@ def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
         cov_hdu = fits.ImageHDU(data=coverage_map.astype(np.float32), name='COVERAGE')
         cov_hdu.header['COMMENT'] = 'Gridding coverage map: sum of kernel weights per pixel'
         hdul.append(cov_hdu)
+
+    # Add weight map as ImageHDU if provided
+    if weight_map is not None:
+        wm_hdu = fits.ImageHDU(data=weight_map.astype(np.float32), name='WEIGHT_MAP')
+        col_label = weight_column if weight_column else 'user-supplied'
+        wm_hdu.header['WGTCOL'] = (col_label, 'Source column for per-spectrum weights')
+        wm_hdu.header['COMMENT'] = ('Kernel-weighted sum of per-spectrum weights per pixel. '
+                                    'Proportional to the denominator of the weighted average.')
+        hdul.append(wm_hdu)
 
     # Write to file
     hdul.writeto(output_file, overwrite=overwrite)
@@ -1505,14 +1519,27 @@ def create_spectral_datacube(hdul: fits.HDUList,
         if col not in table.names:
             raise ValueError(f"Weight column '{col}' not found in FITS file")
         wvals = np.asarray(table[col], dtype=np.float64)
-        if object_filter and 'OBJECT' in table.names:
+        if has_object_col:
+            wvals = wvals[science_mask]
+        if object_filter and has_object_col:
             wvals = wvals[mask]
-        sigma = 0.5
-        spectrum_weights = np.where(
-            np.isfinite(wvals),
-            np.exp(-((wvals - 1.0) ** 2) / (2 * sigma ** 2)),
-            0.0,
-        )
+        if 'RMSRATIO' in col.upper():
+            # Gaussian transform centred at 1.0: peak weight for ideal spectra,
+            # decaying for noisier ones (RMSRATIO > 1).
+            sigma = 0.5
+            spectrum_weights = np.where(
+                np.isfinite(wvals),
+                np.exp(-((wvals - 1.0) ** 2) / (2 * sigma ** 2)),
+                0.0,
+            )
+        else:
+            # Generic column: inverse-variance weighting (w = 1/value²).
+            # Non-finite, zero, or negative values get weight 0.
+            spectrum_weights = np.where(
+                np.isfinite(wvals) & (wvals > 0),
+                1.0 / (wvals ** 2),
+                0.0,
+            )
 
     # channel_weight_matrix: per-spectrum per-channel (shape: nobs, nvel), or None
     # Unlike create_integrated_map (which collapses to scalar), we keep the full
@@ -1529,7 +1556,10 @@ def create_spectral_datacube(hdul: fits.HDUList,
             all_spectra_raw = table['SPECTRUM']
             tsys_idx = np.asarray(table['TSYS_INDEX'])
             tau_idx  = np.asarray(table['TAU_SIG_INDEX'])
-            if object_filter and 'OBJECT' in table.names:
+            if has_object_col:
+                tsys_idx = tsys_idx[science_mask]
+                tau_idx  = tau_idx[science_mask]
+            if object_filter and has_object_col:
                 tsys_idx = tsys_idx[mask]
                 tau_idx  = tau_idx[mask]
             channel_weight_matrix = np.ones((nobs, nvel), dtype=np.float64)
@@ -1542,7 +1572,7 @@ def create_spectral_datacube(hdul: fits.HDUList,
                 tau_spec  = np.asarray(all_spectra_raw[ai], dtype=np.float64)
                 w_ch = np.where(
                     np.isfinite(tsys_spec) & np.isfinite(tau_spec) & (tsys_spec > 0),
-                    np.exp(-tau_spec) / tsys_spec,
+                    (np.exp(-tau_spec) / tsys_spec) ** 2,
                     np.nan,
                 )
                 finite_mask = np.isfinite(w_ch)
@@ -1661,6 +1691,27 @@ def create_spectral_datacube(hdul: fits.HDUList,
         print(f"  Coverage map: peak={coverage_map_2d.max():.3f}, "
               f"pixels with coverage>0: {(coverage_map_2d > 0).sum()}")
 
+    # Compute 2D weight map: grid spectrum_weights with the same kernel so each
+    # pixel shows the kernel-weighted sum of spectrum weights (denominator of the
+    # weighted average).  Only computed when per-spectrum weights are present.
+    weight_map_2d = None
+    if HAS_CYGRID and spectrum_weights is not None:
+        _weff = kernel_fwhm_deg if kernel_fwhm_deg is not None else beamsize_deg
+        _wks = _weff / 2.355
+        _wm_gridder = cygrid.WcsGrid(wcs_header_dict_ch)
+        _wm_gridder.set_kernel('gauss1d', (_wks,), 3.0 * _wks, _wks / 2.0)
+        _valid_w = np.isfinite(ras) & np.isfinite(decs)
+        _wm_gridder.grid(
+            np.array(ras[_valid_w], dtype=np.float64),
+            np.array(decs[_valid_w], dtype=np.float64),
+            np.array(spectrum_weights[_valid_w], dtype=np.float64),
+        )
+        weight_map_2d = _wm_gridder.get_datacube().squeeze().astype(np.float32)
+        if coverage_map_2d is not None:
+            weight_map_2d[coverage_map_2d <= 0] = np.nan
+        print(f"  Weight map ({weight_column}): peak={np.nanmax(weight_map_2d):.4f}, "
+              f"pixels with weight>0: {np.isfinite(weight_map_2d).sum()}")
+
     # Create WCS header for 3D cube (spectral, dec, ra)
     # Note: CDELT3 should be deltav (velocity spacing per channel in m/s)
     # CRVAL3 is the reference velocity in m/s
@@ -1742,7 +1793,9 @@ def create_spectral_datacube(hdul: fits.HDUList,
         }
         save_map_to_fits(datacube, wcs_header, output_file, beam_maj_deg=beamsize_deg,
                         spectral_params=spectral_params,
-                        coverage_map=coverage_map_2d)
+                        coverage_map=coverage_map_2d,
+                        weight_map=weight_map_2d,
+                        weight_column=weight_column)
 
     return datacube, wcs_header, fig
 

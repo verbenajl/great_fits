@@ -1336,6 +1336,7 @@ class PCACorrector:
     def correct_fits_file(self, input_fits, output_fits, cutoff_variance=None,
                          cutoff_noise_ratio=None, hdu_index=1, spectrum_col='SPECTRUM',
                          object_filter=None, overwrite=False, generate_plots=False,
+                         generate_kde_plots=True,
                          output_dir='output/pca_corrected', config_window=None,
                          detect_science_lines=True, scan_filter=None, subscan_filter=None,
                          telescope_filter=None, mission_id_filter=None, aor_id_filter=None,
@@ -1749,7 +1750,8 @@ class PCACorrector:
             
             detected_lines_mask = np.zeros((len(indices), len(velocity_axis_kms)), dtype=bool)
             group_thresholds = {}
-            
+            kde_data = {}  # {(mission_id, telescope, scan): (kde_params, component_cutoffs)}
+
             # Detect lines from each group's corrected spectra (3 iterations like original)
             for iteration in range(3):
                 logger.info(f"  Iteration {iteration + 1}/3 of line detection")
@@ -1967,14 +1969,8 @@ class PCACorrector:
                                        f"_scan{scan_id}")
                         logger.info(f"  {group_label}: per-component cutoffs = {component_cutoffs}")
 
-                        if generate_plots:
-                            kde_plot_path = (Path(output_dir) /
-                                             f"pca_correction_{group_label}_kdeplot.png")
-                            try:
-                                _plot_kde_noise_ratios(
-                                    kde_params, component_cutoffs, kde_plot_path, group_label)
-                            except Exception as e:
-                                logger.warning(f"  KDE plot failed for {group_label}: {e}")
+                        kde_data[(mission_id_group, telescope_group, scan_id)] = (
+                            kde_params, component_cutoffs)
 
                         for local_idx in group_local_indices:
                             per_spectrum_cutoffs[local_idx] = component_cutoffs
@@ -2313,13 +2309,15 @@ class PCACorrector:
                                    input_fits=input_fits,
                                    group_thresholds=group_thresholds,
                                    global_indices=indices,
-                                   mission_decompositions=mission_decompositions)
+                                   mission_decompositions=mission_decompositions,
+                                   kde_data=kde_data if generate_kde_plots else {})
             
             return stats
     
     def _generate_plots(self, data, original_spectra, corrected_spectra, correction_details,
                        velocity_axis, mission_id, output_dir, science_line_mask=None, telluric_line_mask=None,
-                       input_fits=None, group_thresholds=None, global_indices=None, mission_decompositions=None):
+                       input_fits=None, group_thresholds=None, global_indices=None, mission_decompositions=None,
+                       kde_data=None):
         """
         Generate diagnostic plots matching pca_correct.py structure.
         
@@ -3011,10 +3009,23 @@ class PCACorrector:
                         fontsize=12, fontweight='bold')
             
             # Save plot - one plot per (mission_id, telescope, scan) group
-            plot_file = os.path.join(output_dir, 
+            plot_file = os.path.join(output_dir,
                                     f'pca_correction_{mission_id}_scan{scan}_{telescope}.png')
             fig.savefig(plot_file, dpi=100, bbox_inches='tight')
             plt.close(fig)
+
+            # KDE noise ratio plot for this group (if available)
+            if kde_data:
+                group_kde = kde_data.get((mission_id, telescope, scan))
+                if group_kde is not None:
+                    kde_params_g, component_cutoffs_g = group_kde
+                    group_label = f"{mission_id}_{telescope}_scan{scan}"
+                    kde_plot_path = Path(output_dir) / f"pca_correction_{group_label}_kdeplot.png"
+                    try:
+                        _plot_kde_noise_ratios(
+                            kde_params_g, component_cutoffs_g, kde_plot_path, group_label)
+                    except Exception as e:
+                        logger.warning(f"  KDE plot failed for {group_label}: {e}")
         
         logger.info(f"✓ Generated {total_plots} diagnostic plots")
 
@@ -3284,6 +3295,11 @@ Examples:
         '--plot',
         action='store_true',
         help='Generate diagnostic plots per scan/telescope'
+    )
+    parser.add_argument(
+        '--no-kde-plots',
+        action='store_true',
+        help='Skip KDE noise ratio plots even when --plot and --global-noise-ratio-cutoff are set'
     )
     parser.add_argument(
         '--plot-dir',
@@ -3657,6 +3673,7 @@ Examples:
             object_filter=object_filter,
             overwrite=not args.no_overwrite,
             generate_plots=args.plot,
+            generate_kde_plots=not args.no_kde_plots,
             output_dir=args.plot_dir,
             config_window=config_line_window if config_line_window else (tuple(args.config_window) if args.config_window else None),
             detect_science_lines=args.detect_science_lines,

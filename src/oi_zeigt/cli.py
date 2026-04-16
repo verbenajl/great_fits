@@ -2192,207 +2192,173 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
 
 
 @click.command()
-@click.option('--config', type=click.Path(exists=True), 
+@click.option('--config', type=click.Path(exists=True),
               help='Path to config.toml file.')
+@click.option('--fits', 'fits_input', type=click.Path(exists=True), default=None,
+              help='Input FITS file to average.')
 @click.option('--reduced', is_flag=True, default=False,
-              help='Use reduced_data.fits instead of the input data.')
+              help='Use reduced_data.fits from config [output].reduced_fits.')
 @click.option('--output', type=click.Path(), default=None,
-              help='Output FITS file path for averaged spectra.')
+              help='Output FITS file path for the averaged spectrum. If not given, no file is written.')
 @click.option('--object', type=str, multiple=True, default=None,
-              help='Object(s) to average (e.g., "M51CENTER" or "S-H_FIT"). Can be specified multiple times. If specified, only these objects are averaged and shown together. Defaults to "object" from config.toml if not specified.')
-@click.option('--group-by', type=str, default=None,
-              help='Column to group by before averaging. If not specified, defaults to "OBJECT" from config or "OBJECT" column.')
+              help='Object substring to include (e.g. "M51CENTER"). Can be repeated. '
+                   'Defaults to [parameters].object from config if not specified.')
 @click.option('--no-group', is_flag=True, default=False,
-              help='Disable grouping and compute a single global average.')
+              help='Ignore OBJECT grouping and average all selected spectra into one.')
 @click.option('--plot', type=click.Path(), default=None,
-              help='Output path for plot (e.g., average_plot.png). If not specified, plot is shown but not saved.')
-def average_cmd(config, reduced, output, object, group_by, no_group, plot):
+              help='Save plot to this path. If not specified, plot is shown interactively.')
+def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
     """
-    Average spectra from a FITS file, grouped by object by default.
-    
-    Reads input file from config.toml [input].fits_file by default, or uses
-    [output].reduced_fits if --reduced flag is specified.
-    
-    By default, computes per-object averages (grouped by OBJECT column).
-    Use --object to average only specific object(s) - can be used multiple times.
-    Use --no-group to compute a single global average instead.
-    
-    Object name defaults to [parameters].object from config.toml if not specified.
-    
-    Outputs:
-    - Averaged FITS file with SPECTRUM, STD, COUNT, and RMS columns
-    - Plot showing averaged spectra (always displayed, optionally saved)
-    
+    Average spectra from a FITS file and optionally plot the result.
+
+    Input priority: --fits > --reduced > config [input].fits_file.
+    By default spectra are grouped by OBJECT; use --no-group for a single global average.
+    Object filter defaults to [parameters].object from config if --object is not given.
+
+    No output file is written unless --output is given.
+
     Examples:
-        average --config config.toml
-        average --config config.toml --output my_average.fits
-        average --config config.toml --reduced
-        average --config config.toml --reduced --plot avg.png
-        average --config config.toml --object M51CENTER
-        average --config config.toml --object M51CENTER --object S-H_FIT
-        average --config config.toml --no-group
+        average --fits postpd.fits --plot avg.png
+        average --fits postpd.fits --object M51CENTER --output avg.fits
+        average --config config.toml --reduced --no-group --plot avg.png
     """
+    import matplotlib.pyplot as plt
     try:
-        # Load config
+        from .reduction.core import average_spectra, average_spectra_from_config
+        from .reduction.core import _extract_spectral_params, _create_velocity_axis
+    except ImportError:
+        from oi_zeigt.reduction.core import average_spectra, average_spectra_from_config
+        from oi_zeigt.reduction.core import _extract_spectral_params, _create_velocity_axis
+
+    try:
         config_path = config if config else None
         cfg = get_config(config_path) if config_path else {}
-        
-        # Determine FITS file to process
-        hdul = None
-        if reduced:
-            # Use reduced_data.fits from config
-            output_cfg = cfg.get('output', {})
-            reduced_fits_path = output_cfg.get('reduced_fits', None)
+
+        # --- Load FITS ---
+        if fits_input:
+            hdul = read_fits(fits_input)
+        elif reduced:
+            reduced_fits_path = cfg.get('output', {}).get('reduced_fits')
             if not reduced_fits_path:
-                click.echo(click.style("Error: --reduced flag specified but [output].reduced_fits not defined in config", fg="red"), err=True)
+                click.echo(click.style("Error: --reduced specified but [output].reduced_fits not in config", fg='red'), err=True)
                 sys.exit(1)
             hdul = read_fits(reduced_fits_path)
         else:
-            # Use input file from config (default behavior)
-            pass  # Let average_spectra_from_config handle reading when hdul is None
-        
-        # Determine object(s) to process
-        if not object:
-            # Try to get from config
-            parameters_cfg = cfg.get('parameters', {})
-            obj_from_config = parameters_cfg.get('object', None)
-            if obj_from_config:
-                object = (obj_from_config,)  # Convert to tuple for consistency
-        
-        # If specific object(s) requested, override grouping settings
-        if object:
-            group_by_col = 'OBJECT' if len(object) > 1 else None
-        else:
-            # Determine grouping column
-            if no_group:
-                group_by_col = None
-            elif group_by:
-                # User explicitly specified
-                group_by_col = group_by
+            hdul = read_fits_from_config(config_path)
+
+        # --- Object filter ---
+        object_filter = list(object) if object else []
+        if not object_filter:
+            obj_from_cfg = cfg.get('parameters', {}).get('object')
+            if obj_from_cfg:
+                object_filter = [obj_from_cfg]
+
+        if object_filter:
+            matrix_hdu = next(
+                (hdu for hdu in hdul
+                 if hasattr(hdu, 'data') and hdu.data is not None
+                 and 'SPECTRUM' in hdu.data.dtype.names),
+                None
+            )
+            if matrix_hdu is None:
+                click.echo(click.style("Error: no SPECTRUM column found in FITS file", fg='red'), err=True)
+                sys.exit(1)
+            data_raw = matrix_hdu.data
+            obj_col = data_raw['OBJECT'] if 'OBJECT' in data_raw.dtype.names else None
+            if obj_col is None:
+                click.echo(click.style("Warning: OBJECT column not found, ignoring --object filter", fg='yellow'), err=True)
             else:
-                # Default to OBJECT, optionally override from config
-                reduction_cfg = cfg.get('reduction', {})
-                group_by_col = reduction_cfg.get('group_by', 'OBJECT')
-        
-        # If specific object(s) is requested, filter the FITS data first
-        if object:
-            if hdul is None:
-                if reduced:
-                    output_cfg = cfg.get('output', {})
-                    reduced_fits_path = output_cfg.get('reduced_fits', None)
-                    hdul = fits.open(reduced_fits_path)
-                else:
-                    hdul = read_fits_from_config(config_path)
-            
-            # Filter to only the specified objects
-            matrix_hdu = None
-            for idx, hdu in enumerate(hdul):
-                if hasattr(hdu, 'data') and hdu.data is not None:
-                    if 'SPECTRUM' in hdu.data.dtype.names and 'OBJECT' in hdu.data.dtype.names:
-                        matrix_hdu = hdu
-                        matrix_hdu_index = idx
-                        break
-            
-            if matrix_hdu is not None:
-                data = matrix_hdu.data
-                obj_col = data['OBJECT']
-                # Find matching objects for ALL requested object filters (case-insensitive substring match)
-                # A spectrum matches if it matches ANY of the requested objects
-                object_mask = np.zeros(len(obj_col), dtype=bool)
-                for requested_obj in object:
-                    obj_matches = np.array([
-                        requested_obj.upper() in (obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()).upper()
-                        for obj in obj_col
+                mask = np.zeros(len(obj_col), dtype=bool)
+                for req in object_filter:
+                    mask |= np.array([
+                        req.upper() in (o.decode().strip() if isinstance(o, bytes) else str(o).strip()).upper()
+                        for o in obj_col
                     ])
-                    object_mask |= obj_matches
-                
-                if not np.any(object_mask):
-                    obj_str = ", ".join(object)
-                    click.echo(click.style(f"Error: No objects containing '{obj_str}' found in FITS file", fg="red"), err=True)
+                if not np.any(mask):
+                    click.echo(click.style(f"Error: no spectra matching {object_filter} found", fg='red'), err=True)
                     sys.exit(1)
-                
-                # Create filtered FITS
-                filtered_data = data[object_mask]
-                new_table = fits.BinTableHDU(filtered_data)
-                new_table.name = matrix_hdu.name
-                # Copy header
-                for key in matrix_hdu.header:
-                    if key not in ['NAXIS1', 'NAXIS2', 'TFIELDS'] and key != '':
+                new_tbl = fits.BinTableHDU(data_raw[mask])
+                new_tbl.name = matrix_hdu.name
+                for k in matrix_hdu.header:
+                    if k not in ('NAXIS1', 'NAXIS2', 'TFIELDS', ''):
                         try:
-                            new_table.header[key] = matrix_hdu.header[key]
+                            new_tbl.header[k] = matrix_hdu.header[k]
                         except (ValueError, KeyError):
                             pass
-                
-                filtered_hdul = fits.HDUList([hdul[0].copy(), new_table])
-                hdul = filtered_hdul
-        
-        # Apply averaging
-        output_path = average_spectra_from_config(
-            config_path=config_path,
-            hdul=hdul,
-            output_fits=output,
-            group_by=group_by_col,
-            overwrite=True
-        )
-        
-        click.echo(f"\n✓ Averaging complete.")
-        click.echo(f"  Output FITS: {output_path}")
-        if group_by_col:
-            click.echo(f"  Grouped by: {group_by_col}")
+                hdul = fits.HDUList([hdul[0].copy(), new_tbl])
+                click.echo(f"Object filter: {object_filter} → {int(mask.sum())} spectra")
+
+        group_by_col = None if no_group else 'OBJECT'
+
+        # --- Average ---
+        avg_results = average_spectra(hdul, group_by=group_by_col)
+        click.echo(f"\n✓ Averaging complete — grouped by: {'OBJECT' if group_by_col else 'none (global)'}")
+
+        # --- Build velocity axis if possible ---
+        try:
+            sp = _extract_spectral_params(hdul)
+            vel_ms = _create_velocity_axis(sp['velo_ref'], sp['deltav'], sp['crpix1_spec'], sp['nchans'])
+            xaxis = vel_ms / 1000.0
+            xlabel = 'Velocity (km/s)'
+        except Exception:
+            xaxis = None
+            xlabel = 'Channel'
+
+        # --- Plot ---
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        if isinstance(avg_results, dict) and 'avg_spectrum' in avg_results:
+            # Single global average
+            sp_arr = avg_results['avg_spectrum']
+            std_arr = avg_results['std_spectrum']
+            x = xaxis if xaxis is not None else np.arange(len(sp_arr))
+            ax.plot(x, sp_arr, linewidth=1.5, color='steelblue', label=f"Average (N={avg_results['count']})")
+            ax.legend(fontsize=9)
+            click.echo(f"  N spectra averaged: {avg_results['count']}")
+            click.echo(f"  Mean RMS: {avg_results['rms']:.4f} K")
         else:
-            click.echo(f"  Global average (no grouping)")
-        click.echo()
-        
-        # Generate and display plot
-        from astropy.io import fits as fits_module
-        import matplotlib.pyplot as plt
-        
-        hdul_avg = fits_module.open(output_path)
-        data = hdul_avg[1].data
-        
-        fig, ax = plt.subplots(figsize=(12, 6))
-        
-        if 'OBJECT' in data.dtype.names:
-            # Multiple averaged spectra (grouped)
-            for i, obj in enumerate(data['OBJECT']):
-                obj_name = obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()
-                spectrum = data['SPECTRUM'][i]
-                ax.plot(spectrum, label=obj_name, alpha=0.7, linewidth=1)
-            ax.legend(loc='best', fontsize=9)
-            ax.set_title('Averaged Spectra (Grouped)')
-        else:
-            # Single averaged spectrum
-            spectrum = data['SPECTRUM'][0]
-            ax.plot(spectrum, label='Average', linewidth=1.5)
-            ax.fill_between(np.arange(len(spectrum)), 
-                           spectrum - data['STD'][0],
-                           spectrum + data['STD'][0],
-                           alpha=0.3, label='±1σ')
-            ax.legend(loc='best')
-            ax.set_title('Averaged Spectrum')
-        
-        ax.set_xlabel('Channel')
-        ax.set_ylabel('Flux')
+            # Per-group averages
+            for group_name, gdata in sorted(avg_results.items()):
+                sp_arr = gdata['avg_spectrum']
+                x = xaxis if xaxis is not None else np.arange(len(sp_arr))
+                ax.plot(x, sp_arr, linewidth=1.2, alpha=0.85,
+                        label=f"{group_name} (N={gdata['count']})")
+                click.echo(f"  {group_name}: N={gdata['count']}, RMS={gdata['rms']:.4f} K")
+            ax.legend(fontsize=8, loc='best')
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel('T$_A^*$ (K)')
+        ax.axhline(0, color='k', linewidth=0.5, linestyle='--')
         ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        # Save plot if requested
+        ax.set_title('Averaged spectrum' + (f' — {", ".join(object_filter)}' if object_filter else ''))
+        fig.tight_layout()
+
         if plot:
-            plt.savefig(plot, dpi=150)
+            fig.savefig(plot, dpi=150)
             click.echo(f"  Plot saved: {plot}")
-        
-        # Always show the plot
-        plt.show()
-        plt.close()
-        
+        else:
+            plt.show()
+        plt.close(fig)
+
+        # --- Write output only if requested ---
+        if output:
+            average_spectra_from_config(
+                config_path=config_path,
+                hdul=hdul,
+                output_fits=output,
+                group_by=group_by_col,
+                overwrite=True,
+            )
+            click.echo(f"  Output FITS: {output}")
+
     except FileNotFoundError as e:
-        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        click.echo(click.style(f"Error: {e}", fg='red'), err=True)
         sys.exit(1)
     except ValueError as e:
-        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        click.echo(click.style(f"Error: {e}", fg='red'), err=True)
         sys.exit(1)
     except Exception as e:
-        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        click.echo(click.style(f"Unexpected error: {e}", fg='red'), err=True)
         import traceback
         traceback.print_exc()
         sys.exit(1)
@@ -3393,9 +3359,10 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
 @click.option('--object', type=str, default=None,
               help='Filter by object name. If not specified, uses "object" from config.toml if available.')
 @click.option('--beamsize', type=float, default=None,
-              help='Beam size in degrees for gridding kernel. If not specified, reads from config [gridding].beamsize_arcsec.')
+              help='Beam size in arcseconds for gridding kernel (e.g. --beamsize 14.1). '
+                   'If not specified, reads from config [gridding].beamsize_arcsec.')
 @click.option('--pixsize', type=float, default=None,
-              help='Map pixel size in degrees. If not specified, uses beamsize/3 or config [gridding].pixel_size_arcsec.')
+              help='Map pixel size in arcseconds. If not specified, uses beamsize/3 or config [gridding].pixel_size_arcsec.')
 @click.option('--pixel-size-arcsec', type=float, default=None,
               help='Map pixel size in arcseconds (e.g. --pixel-size-arcsec 4.7). '
                    'Overrides --pixsize and config. Default is beamsize/3 ≈ 4.7″ for a 14.1″ beam.')
@@ -3405,15 +3372,22 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
               help='Output path for diagnostic plot (e.g., datacube_slices.png). If not specified, plot is shown but not saved.')
 @click.option('--n-jobs', type=int, default=-1,
               help='Number of parallel workers for channel gridding. -1 = all CPUs (default), 1 = sequential.')
-@click.option('--weight-spectra', is_flag=True, default=False,
-              help='Weight spectra by exp(-(RMSRATIOB-1)²/(2×0.5²)) during gridding.')
+@click.option('--weight-spectra', type=str, default=None, metavar='COLUMN',
+              help='Column name to use for per-spectrum weighting during gridding '
+                   '(e.g. --weight-spectra RMSRATIOB or --weight-spectra RMS_BASELINE_2). '
+                   'For RMSRATIO* columns a Gaussian transform exp(-(v-1)²/0.5²) is applied; '
+                   'for all other columns the raw values are used directly as weights. '
+                   'A WEIGHT_MAP extension is written to the output FITS file.')
 @click.option('--weight-channels', is_flag=True, default=False,
               help='Weight each channel by exp(-tau)/T_sys from TSYS/TAU_SIG calibration spectra.')
 @click.option('--kernel-fwhm', type=float, default=None,
               help='Gridding kernel FWHM in arcseconds. If not specified, uses the beam size. '
                    'Use a value smaller than the beam to minimize resolution degradation '
                    '(e.g., --kernel-fwhm 4.7 or --kernel-fwhm 7.0 for a 14″ beam).')
-def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, pixel_size_arcsec, output, plot, n_jobs, weight_spectra, weight_channels, kernel_fwhm):
+@click.option('--telescop', type=str, default=None,
+              help='Telescope name written to the FITS header. '
+                   'If not specified, reads from config [gridding].telescop (default: IRAM-30M).')
+def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, pixel_size_arcsec, output, plot, n_jobs, weight_spectra, weight_channels, kernel_fwhm, telescop):
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -3438,11 +3412,13 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
     Examples:
         create_datacube --config config.toml
         create_datacube --config config.toml --fits postpcarmsr_1.3.fits --object M51
-        create_datacube --config config.toml --pcad --object M51 --weight-spectra --weight-channels
+        create_datacube --config config.toml --pcad --object M51 --weight-spectra RMSRATIOB --weight-channels
+        create_datacube --config config.toml --fits postprocessed.fits --weight-spectra RMS_BASELINE_2
         create_datacube --config config.toml --prepared --object M51
         create_datacube --config config.toml --reduced --object M51
         create_datacube --config config.toml --output my_datacube.fits --plot slices.png
-        create_datacube --config config.toml --beamsize 0.3 --pixsize 0.05
+        create_datacube --config config.toml --beamsize 14.1 --pixsize 4.7
+        create_datacube --fits postpd.fits --beamsize 14.1 --object M51CENTER --telescop IRAM-30M --output cube.fits
     """
     try:
         from oi_zeigt.mapping.gridding import get_gridding_params_from_config
@@ -3452,11 +3428,18 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         cfg = get_config(config_path) if config_path else {}
 
         # Get beamsize and pixsize from config if not provided on CLI
-        # --pixel-size-arcsec takes priority over --pixsize (degrees)
-        effective_pixsize = pixel_size_arcsec / 3600.0 if pixel_size_arcsec is not None else pixsize
+        # Both --beamsize and --pixsize are in arcseconds; convert to degrees here.
+        # --pixel-size-arcsec is an explicit arcsec override for pixsize.
+        effective_beamsize = beamsize / 3600.0 if beamsize is not None else None
+        if pixel_size_arcsec is not None:
+            effective_pixsize = pixel_size_arcsec / 3600.0
+        elif pixsize is not None:
+            effective_pixsize = pixsize / 3600.0
+        else:
+            effective_pixsize = None
         beamsize_deg, pixsize_deg = get_gridding_params_from_config(
             config_path=config_path,
-            beamsize_deg=beamsize,
+            beamsize_deg=effective_beamsize,
             pixsize_deg=effective_pixsize
         )
 
@@ -3487,7 +3470,9 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
             click.echo(f"Reading FITS file: {fits_path}")
             hdul = fits.open(fits_path)
         else:
-            # Use input file from config
+            if not config_path:
+                click.echo(click.style("Error: no input file specified. Use --fits or --config.", fg='red'), err=True)
+                sys.exit(1)
             hdul = read_fits_from_config(config_path)
 
         # Determine object filter
@@ -3512,9 +3497,9 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         from oi_zeigt.mapping.gridding import create_spectral_datacube
 
         gridding_cfg = cfg.get('gridding', {})
-        telescop = gridding_cfg.get('telescop', '')
+        telescop = telescop if telescop is not None else gridding_cfg.get('telescop', 'IRAM-30M')
 
-        eff_weight_column = 'RMSRATIOB' if weight_spectra else None
+        eff_weight_column = weight_spectra  # None or column name string
 
         datacube, wcs_header, fig = create_spectral_datacube(
             hdul,
@@ -4002,6 +3987,7 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         spectra       = np.array(data['SPECTRUM'],  dtype=np.float64)
 
         # --- Optional baseline subtraction (before RMS computation) ---
+        rms_baseline_values = None
         if baseline_order is not None:
             from .reduction.core import _reduce_baseline
             # Only subtract from science rows
@@ -4027,6 +4013,19 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
             click.echo(f"Baseline order {baseline_order} applied to {n_bl} science spectra{win_str}")
             # Write back so the output table contains the baselined spectra
             data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
+
+            # Compute per-spectrum RMS outside the line window (same as reduce_spectra)
+            rms_baseline_values = np.full(len(spectra), np.nan, dtype=np.float32)
+            if bl_window is not None:
+                bl_outside = np.ones(spectra.shape[1], dtype=bool)
+                bl_outside[bl_window[0]:bl_window[1] + 1] = False
+            else:
+                bl_outside = np.ones(spectra.shape[1], dtype=bool)
+            for _i in sci_idx:
+                _ch = spectra[_i][bl_outside]
+                _nv = int(np.sum(~np.isnan(_ch)))
+                if _nv >= 2:
+                    rms_baseline_values[_i] = np.nanstd(_ch.astype(np.float64))
 
         tsys_vals     = np.array(data['TSYS'],      dtype=np.float64)   # K
         deltav_vals   = np.array(data['DELTAV'],    dtype=np.float64)   # m/s (actual channel width after decimation)
@@ -4208,6 +4207,14 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         table['RMS']             = rms_measured
         table['RMS_THEORETICAL'] = rms_theoretical
         table['RMSRATIOB']       = rms_ratio    # ratio of measured RMS to theoretical radiometer RMS
+
+        if baseline_order is not None:
+            col_name = 'RMS_BASELINE'
+            while col_name in table.colnames:
+                suffix = int(col_name.split('_')[-1]) + 1 if col_name != 'RMS_BASELINE' else 2
+                col_name = f'RMS_BASELINE_{suffix}'
+            table[col_name] = rms_baseline_values
+            click.echo(f"  Written {col_name}: per-spectrum RMS outside line window after baseline subtraction")
 
         # Preserve header and write output
         primary = hdul[0].copy()
