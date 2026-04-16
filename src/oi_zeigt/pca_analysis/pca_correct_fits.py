@@ -1388,6 +1388,11 @@ class PCACorrector:
         dict
             Correction statistics
         """
+        # Match original pyclass behaviour: noise_ratio_cutoff (nr) is only applied
+        # when global_noise_ratio_cutoff (gnr) is active.  When gnr is None/False/0,
+        # nr must be ignored so that components are not silently rejected.
+        effective_cutoff_noise_ratio = cutoff_noise_ratio if global_noise_ratio_cutoff else None
+
         logger.info(f"Opening {input_fits}...")
         with fits.open(input_fits) as hdul:
             hdu = hdul[hdu_index]
@@ -1645,7 +1650,7 @@ class PCACorrector:
                 with Pool(processes=n_workers, initializer=_init_pca_worker,
                           initargs=(mission_decompositions, self.components,
                                     self.explained_variance_ratio,
-                                    cutoff_variance, cutoff_noise_ratio,
+                                    cutoff_variance, effective_cutoff_noise_ratio,
                                     self.smoothing_kernel_size,
                                     self.use_lstsq, cut_coefficients)) as pool:
                     for idx_r, corrected_r, details_r in pool.imap_unordered(
@@ -1705,7 +1710,7 @@ class PCACorrector:
                             good_channels=good_channels_for_fitting,
                             good_channels_for_subtraction=good_channels_for_subtraction,
                             cutoff_variance=cutoff_variance,
-                            cutoff_noise_ratio=cutoff_noise_ratio,
+                            cutoff_noise_ratio=effective_cutoff_noise_ratio,
                             verbose=False,
                             smoothing_kernel_size=self.smoothing_kernel_size
                         )
@@ -1838,7 +1843,7 @@ class PCACorrector:
                         with Pool(processes=n_workers, initializer=_init_pca_worker,
                                   initargs=(mission_decompositions, self.components,
                                             self.explained_variance_ratio,
-                                            cutoff_variance, cutoff_noise_ratio,
+                                            cutoff_variance, effective_cutoff_noise_ratio,
                                             self.smoothing_kernel_size,
                                             self.use_lstsq, cut_coefficients)) as pool:
                             for idx_r, corrected_r, details_r in pool.imap_unordered(
@@ -1881,7 +1886,7 @@ class PCACorrector:
                                     good_channels=good_channels_for_fitting,
                                     good_channels_for_subtraction=gcs,
                                     cutoff_variance=cutoff_variance,
-                                    cutoff_noise_ratio=cutoff_noise_ratio,
+                                    cutoff_noise_ratio=effective_cutoff_noise_ratio,
                                     verbose=False,
                                     smoothing_kernel_size=self.smoothing_kernel_size
                                 )
@@ -1914,7 +1919,22 @@ class PCACorrector:
                     if len(group_local_indices) == 0:
                         continue
 
-                    # Collect spectra and channel masks for this group
+                    # Select components for this group first (needed for channel alignment)
+                    group_components = self.components
+                    if mission_decompositions:
+                        decomp_g = self.get_decomposition_for_mission(
+                            mission_id_group, telescope_group, mission_decompositions)
+                        if decomp_g is not None:
+                            group_components = decomp_g.components
+
+                    # Channel alignment: same logic as STEP 3 sequential path
+                    _n_comp_ch = group_components.shape[1]
+                    _meta = getattr(self, 'metadata', {}) or {}
+                    _ch_first = _meta.get('channel_first', None)
+                    _ch_last = _meta.get('channel_last', None)
+
+                    # Collect spectra and channel masks for this group,
+                    # slicing to component channel range to avoid shape mismatch
                     group_spectra = []
                     group_gcf = []
                     for local_idx in group_local_indices:
@@ -1926,16 +1946,14 @@ class PCACorrector:
                             gcf_g = gcf_g & ~detected_lines_mask[local_idx]
                         if telluric_line_mask is not None:
                             gcf_g = gcf_g & ~telluric_line_mask[min(local_idx, len(telluric_line_mask) - 1)]
+                        if _ch_first is not None and _ch_last is not None:
+                            spectrum_g = spectrum_g[_ch_first:_ch_last + 1]
+                            gcf_g = gcf_g[_ch_first:_ch_last + 1]
+                        elif _n_comp_ch < len(spectrum_g):
+                            spectrum_g = spectrum_g[:_n_comp_ch]
+                            gcf_g = gcf_g[:_n_comp_ch]
                         group_spectra.append(spectrum_g)
                         group_gcf.append(gcf_g)
-
-                    # Select components for this group
-                    group_components = self.components
-                    if mission_decompositions:
-                        decomp_g = self.get_decomposition_for_mission(
-                            mission_id_group, telescope_group, mission_decompositions)
-                        if decomp_g is not None:
-                            group_components = decomp_g.components
 
                     # Compute noise ratio matrix, fit KDE, derive cutoffs
                     nr_matrix = _compute_group_noise_ratios(
@@ -1995,7 +2013,7 @@ class PCACorrector:
                 with Pool(processes=n_workers, initializer=_init_pca_worker,
                           initargs=(mission_decompositions, self.components,
                                     self.explained_variance_ratio,
-                                    cutoff_variance, cutoff_noise_ratio,
+                                    cutoff_variance, effective_cutoff_noise_ratio,
                                     self.smoothing_kernel_size,
                                     self.use_lstsq, cut_coefficients)) as pool:
                     for idx_r, corrected_r, details_r in pool.imap_unordered(
@@ -2100,7 +2118,7 @@ class PCACorrector:
                             _gcf_in,
                             _gcs_in,
                             cutoff_variance,
-                            cutoff_noise_ratio,
+                            effective_cutoff_noise_ratio,
                             self.smoothing_kernel_size,
                             use_lstsq=self.use_lstsq,
                             cut_coefficients=cut_coefficients,
@@ -3188,14 +3206,14 @@ Examples:
     parser.add_argument(
         '--line-kernel-size',
         type=int,
-        default=51,
-        help='Kernel size for line detection (must be odd, default: 51)'
+        default=None,
+        help='Kernel size for line detection (must be odd, default: 51 or from config [pca].line_kernel_size)'
     )
     parser.add_argument(
         '--line-cutoff-std',
         type=float,
-        default=2.0,
-        help='Cutoff in sigma for line detection (default: 2.0)'
+        default=None,
+        help='Cutoff in sigma for line detection (default: 2.0 or from config [pca].line_cutoff_std)'
     )
     parser.add_argument(
         '--smoothing-kernel',
@@ -3352,7 +3370,7 @@ Examples:
                 config_use_lstsq = bool(ls_val)
 
             # Read cutoff parameters (can be False, float, or int)
-            cutoff_val = pca_config.get('cutoff', False)
+            cutoff_val = pca_config.get('variance_cutoff', pca_config.get('cutoff', False))
             if cutoff_val and cutoff_val is not False:
                 try:
                     config_variance_cutoff = float(cutoff_val)
@@ -3558,8 +3576,8 @@ Examples:
         global_noise_ratio_cutoff = (args.global_noise_ratio_cutoff
                                      if hasattr(args, 'global_noise_ratio_cutoff') and args.global_noise_ratio_cutoff is not None
                                      else config_global_noise_ratio_cutoff)
-        line_kernel_size = args.line_kernel_size if args.line_kernel_size != 51 else config_line_kernel_size
-        line_cutoff_std = args.line_cutoff_std if args.line_cutoff_std != 2.0 else config_line_cutoff_std
+        line_kernel_size = args.line_kernel_size if args.line_kernel_size is not None else config_line_kernel_size
+        line_cutoff_std = args.line_cutoff_std if args.line_cutoff_std is not None else config_line_cutoff_std
         smoothing_kernel = args.smoothing_kernel if args.smoothing_kernel is not None else config_smoothing_kernel
         cut_coefficients = args.cut_coefficients if args.cut_coefficients is not None else config_cut_coefficients
 

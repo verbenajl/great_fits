@@ -43,8 +43,7 @@ pca_source="SKYCHOPDIFF"
 # a kernel length of
 smoothing_kernel_size= 20
 rolling_noise_window = 11
-noise_cutoff = false
-cutoff = false
+variance_cutoff = false
 global_noise_ratio_cutoff = false
 noise_ratio_cutoff = false
 line_kernel_size = 51

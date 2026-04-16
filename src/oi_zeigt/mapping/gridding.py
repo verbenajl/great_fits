@@ -1390,27 +1390,46 @@ def create_spectral_datacube(hdul: fits.HDUList,
     ras, decs = _get_celestial_coords(hdul)
     
     nobs, nvel = spectra.shape
-    
-    # Filter by object if specified
+
+    def _obj_str(v):
+        return (v.decode().strip() if isinstance(v, bytes) else str(v).strip()).upper()
+
+    has_object_col = 'OBJECT' in table.names
+
+    # Always strip calibration rows (TSYS, TAU_SIG) — these are not sky positions
+    # and must never enter the gridder regardless of the object filter.
+    if has_object_col:
+        NON_SCIENCE = {'TSYS', 'TAU_SIG'}
+        science_mask = np.array([_obj_str(o) not in NON_SCIENCE for o in table['OBJECT']])
+        n_dropped = int(np.sum(~science_mask))
+        if n_dropped:
+            print(f"Excluded {n_dropped} calibration rows (TSYS / TAU_SIG)")
+        spectra  = spectra[science_mask]
+        ras      = ras[science_mask]
+        decs     = decs[science_mask]
+        remaining_objects = table['OBJECT'][science_mask]
+        nobs     = len(ras)
+    else:
+        remaining_objects = None
+
+    # Further filter by object name if requested
     if object_filter:
-        if 'OBJECT' in table.names:
-            # Use substring matching: object_filter should be contained in OBJECT field
-            objects = table['OBJECT']
+        if has_object_col:
             mask = np.array([
-                object_filter.upper() in (obj.decode().strip() if isinstance(obj, bytes) else str(obj).strip()).upper()
-                for obj in objects
+                object_filter.upper() in _obj_str(obj)
+                for obj in remaining_objects
             ])
             if not np.any(mask):
                 raise ValueError(f"No observations found matching object filter '{object_filter}'")
             spectra = spectra[mask]
-            ras = ras[mask]
-            decs = decs[mask]
-            nobs = len(ras)
+            ras     = ras[mask]
+            decs    = decs[mask]
+            nobs    = len(ras)
             print(f"Filtered to {nobs} observations matching '{object_filter}'")
         else:
-            warnings.warn("OBJECT column not found in FITS table - not filtering", UserWarning)
+            warnings.warn("OBJECT column not found in FITS table - not filtering by object", UserWarning)
     else:
-        print(f"Using all {nobs} observations")
+        print(f"Using {nobs} science observations (no object filter)")
     
     # Check if we have data
     if nobs == 0:
@@ -1757,6 +1776,7 @@ def collapse_cube(
     suppress_negative: bool = False,
     hex_plot: bool = False,
     contour: bool = False,
+    stretch: str = 'linear',
 ) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
@@ -2090,10 +2110,32 @@ def collapse_cube(
         vmax_p = np.nanpercentile(data, 98)
         return vmin_p, vmax_p
 
+    def _make_norm(vmin_p, vmax_p):
+        from matplotlib import colors as mcolors
+        if stretch == 'sqrt':
+            # shift so vmin maps to 0, then apply power 0.5
+            return mcolors.PowerNorm(gamma=0.5, vmin=vmin_p, vmax=vmax_p)
+        elif stretch == 'log':
+            safe_vmin = max(vmin_p, 1e-6 * vmax_p) if vmax_p > 0 else 1e-6
+            return mcolors.LogNorm(vmin=safe_vmin, vmax=vmax_p)
+        elif stretch == 'asinh':
+            # AsinhNorm available from matplotlib 3.2+; fall back to sqrt if missing
+            if hasattr(mcolors, 'AsinhNorm'):
+                linear_width = (vmax_p - vmin_p) * 0.1
+                return mcolors.AsinhNorm(linear_width=linear_width,
+                                         vmin=vmin_p, vmax=vmax_p)
+            else:
+                import warnings
+                warnings.warn("AsinhNorm requires matplotlib >= 3.2, falling back to sqrt")
+                return mcolors.PowerNorm(gamma=0.5, vmin=vmin_p, vmax=vmax_p)
+        else:  # linear
+            return mcolors.Normalize(vmin=vmin_p, vmax=vmax_p)
+
     def _imshow_map(ax, data, title, wcs_proj=None, cmap=colormap):
         vmin_p, vmax_p = _vminmax(data)
+        norm = _make_norm(vmin_p, vmax_p)
         im = ax.imshow(data, origin='lower', cmap=cmap,
-                       vmin=vmin_p, vmax=vmax_p, interpolation='nearest')
+                       norm=norm, interpolation='nearest')
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
         fig.colorbar(im, ax=ax, label='K km/s', fraction=0.046, pad=0.04)
@@ -2123,12 +2165,12 @@ def collapse_cube(
         finite = np.isfinite(vals)
         xs, ys, vals = xs[finite], ys[finite], vals[finite]
         vmin_p, vmax_p = _vminmax(vals)
+        norm = _make_norm(vmin_p, vmax_p)
         ax.set_xlim(-0.5, _nx - 0.5)
         ax.set_ylim(-0.5, _ny - 0.5)
         tf = ax.get_transform('pixel') if wcs_proj is not None else ax.transData
         sc = ax.scatter(xs, ys, c=vals, marker='h', s=1, cmap=cmap,
-                        vmin=vmin_p, vmax=vmax_p,
-                        linewidths=0, transform=tf)
+                        norm=norm, linewidths=0, transform=tf)
         _hex_scatters.append((sc, spacing, ax))
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)

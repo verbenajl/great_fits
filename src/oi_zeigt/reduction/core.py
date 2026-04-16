@@ -1962,7 +1962,13 @@ def reduce_spectra(hdul: fits.HDUList,
     # VELOCITY, DELTAV, and CRPIX1 via basic_io.reconstruct_velocity_axis().
     if rms_baseline_values is not None:
         from numpy.lib.recfunctions import append_fields
-        output_data = append_fields(output_data, 'RMS_BASELINE',
+        col_name = 'RMS_BASELINE'
+        if col_name in output_data.dtype.names:
+            i = 2
+            while f'RMS_BASELINE_{i}' in output_data.dtype.names:
+                i += 1
+            col_name = f'RMS_BASELINE_{i}'
+        output_data = append_fields(output_data, col_name,
                                     rms_baseline_values, dtypes=np.float32,
                                     usemask=False, asrecarray=True)
 

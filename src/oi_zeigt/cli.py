@@ -1987,36 +1987,41 @@ def apply_baseline(config, fits, order, window, output):
               help='Apply boxcar smoothing. Optional window size (default: 5). E.g. --smooth or --smooth 7.')
 @click.option('--decimate', is_flag=True, default=False,
               help='Decimate spectra by taking every Nth channel after smoothing, using the --smooth window size as the decimation factor.')
+@click.option('--extract', is_flag=True, default=False,
+              help='Extract velocity range from config [reduction].extract before baselining. Without this flag the spectrum length is left unchanged.')
 @click.option('--output', type=click.Path(), default=None,
               help='Output FITS file path.')
 def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, baseline_window,
-                       smooth, decimate, output):
+                       smooth, decimate, extract, output):
     """
     Perform spectral reduction with selected methods.
     
     Applies reduction methods in sequence:
     1. Unblank (--unblank): Fill NaN values using interpolation
-    2. Baseline subtraction (--baseline): Remove polynomial baseline
-    3. Smoothing (--smooth [N]): Apply boxcar smoothing with window N (default: 5).
-    4. Decimation (--decimate): Keep every Nth channel using the --smooth window size as N; VELOCITY_AXIS is updated accordingly.
+    2. Extract (--extract): Trim spectrum to velocity range from config [reduction].extract
+    3. Baseline subtraction (--baseline): Remove polynomial baseline
+    4. Smoothing (--smooth [N]): Apply boxcar smoothing with window N (default: 5).
+    5. Decimation (--decimate): Keep every Nth channel using the --smooth window size as N; VELOCITY_AXIS is updated accordingly.
 
-    More methods can be added in the future.
-    
+    --extract, --smooth, and --decimate must be given explicitly. They are NOT applied
+    automatically from config, so re-running reduce_spectra on an already-processed file
+    (e.g. to re-baseline) will not change the spectrum length or channel count.
+
     Input file:
     - By default: Uses [input].fits_file from config
     - With --fits: Uses specified FITS file
     - With --clean: Uses [output].clean_fits from config
-    
+
     If output path is not specified:
     - Uses config [output].reduced_fits if available
     - Falls back to 'reduced_data.fits' with a warning
-    
+
     Examples:
         reduce_spectra --config config.toml --baseline
-        reduce_spectra --config config.toml --clean --baseline
+        reduce_spectra --config config.toml --fits clean_1.fits --baseline --output clean_2.fits
+        reduce_spectra --config config.toml --extract --unblank --baseline --smooth --decimate
         reduce_spectra --config config.toml --unblank --baseline --baseline-order 2 --baseline-window 100 120
         reduce_spectra --fits clean_data.fits --unblank --baseline --smooth --output my_reduced.fits
-        reduce_spectra --config config.toml --smooth 7
     """
     try:
         # Load config
@@ -2044,19 +2049,27 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
         if unblank:
             methods['unblank'] = {}
         
-        # Add extraction from config if available
         reduction_cfg = cfg.get('reduction', {})
-        extract_cfg = reduction_cfg.get('extract', None)
-        if extract_cfg is not None:
+
+        # Extract velocity range only when --extract is explicitly requested.
+        # Without the flag the spectrum length is left unchanged, so re-running
+        # reduce_spectra on an already-processed file does not re-trim the channels.
+        if extract:
+            extract_cfg = reduction_cfg.get('extract', None)
+            if extract_cfg is None:
+                click.echo(click.style(
+                    "Error: --extract specified but [reduction].extract is not defined in config",
+                    fg='red'), err=True)
+                sys.exit(1)
             try:
                 if isinstance(extract_cfg, (list, tuple)) and len(extract_cfg) == 2:
-                    # Extract range from config is in km/s
                     extract_km_s = [float(extract_cfg[0]), float(extract_cfg[1])]
                     extract_m_s = [extract_km_s[0] * 1000.0, extract_km_s[1] * 1000.0]
                     methods['extract'] = extract_m_s
                     methods['extract_mode'] = 'velocity'
+                    click.echo(f"Extracting velocity range [{extract_cfg[0]}, {extract_cfg[1]}] km/s")
             except (ValueError, TypeError, IndexError):
-                pass
+                click.echo(click.style("Warning: could not parse [reduction].extract from config", fg='yellow'), err=True)
         
         # Check if baseline should be applied (either from --baseline flag or from config)
         baseline_from_config = reduction_cfg.get('baseline', None)
@@ -3857,26 +3870,32 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
               help='Output FITS file path. Defaults to output.post_processed_fits from config.')
 @click.option('--refill-telluric-noise', 'refill_telluric', is_flag=True, default=False,
               help='Refill telluric line channels with Gaussian noise at the post-PCA noise level.')
+@click.option('--baseline', 'baseline_order', type=int, default=None,
+              help='Apply polynomial baseline subtraction of this order to science spectra before '
+                   'computing RMS. The line window from config [reduction].line_window is excluded '
+                   'from the fit. If not given, no baseline is applied.')
 @click.option('--filter-flight', 'filter_flight', type=str, multiple=True,
               help='Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated.')
-def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, output, refill_telluric, filter_flight):
+def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, output, refill_telluric, baseline_order, filter_flight):
     """
-    Post-process spectra: compute per-spectrum RMS outside the line window.
+    Post-process spectra: optionally baseline-subtract, then compute per-spectrum RMS.
 
-    Reads spectra from the PCA-corrected file (default) or an alternative dataset,
-    computes the noise RMS in channels outside [reduction].line_window (km/s) from
-    config.toml, and writes the result as a new RMS column in the output FITS file.
-    The output has the same format as the input with the RMS column added (or replaced).
+    Reads spectra from the PCA-corrected file (default) or an alternative dataset.
+    Optionally applies a polynomial baseline subtraction (--baseline N) to science
+    spectra, excluding the line window from the fit.  Then computes the noise RMS in
+    channels outside [reduction].line_window (km/s) from config.toml, and writes the
+    result as RMS / RMS_THEORETICAL / RMSRATIOB columns in the output FITS file.
 
     Input priority (first matching flag wins):
-      --clean > --prepared > --reduced > --pcad (default)
+      --fits > --clean > --prepared > --reduced > --pcad (default)
 
     Examples:
         post_process_data --config config.toml
+        post_process_data --config config.toml --pcad --baseline 3
         post_process_data --config config.toml --reduced
         post_process_data --config config.toml --output my_post.fits
 
-    Use filter_data to filter spectra by RMSRATIOB after post-processing.
+    Use filter_fits to filter spectra by RMSRATIOB after post-processing.
     """
     try:
         from astropy.table import Table
@@ -3981,6 +4000,34 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         C_MS = 299792458.0  # speed of light in m/s
 
         spectra       = np.array(data['SPECTRUM'],  dtype=np.float64)
+
+        # --- Optional baseline subtraction (before RMS computation) ---
+        if baseline_order is not None:
+            from .reduction.core import _reduce_baseline
+            # Only subtract from science rows
+            NON_SCIENCE_BL = {'TSYS', 'TAU_SIG', 'SKYCHOPDIFF'}
+            if 'OBJECT' in data.dtype.names:
+                obj_strs_bl = np.array([
+                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                    for s in data['OBJECT']
+                ])
+                sci_bl_mask = np.array([o not in NON_SCIENCE_BL for o in obj_strs_bl])
+            else:
+                sci_bl_mask = np.ones(len(spectra), dtype=bool)
+            # Line window → channel exclusion range for the baseline fit
+            line_ch = np.where(~outside_mask)[0]
+            bl_window = (int(line_ch[0]), int(line_ch[-1])) if len(line_ch) > 0 else None
+            sci_idx = np.where(sci_bl_mask)[0]
+            _CHUNK = 1000
+            for _start in range(0, len(sci_idx), _CHUNK):
+                _idx = sci_idx[_start:_start + _CHUNK]
+                spectra[_idx] = _reduce_baseline(spectra[_idx], order=baseline_order, window=bl_window)
+            n_bl = int(np.sum(sci_bl_mask))
+            win_str = f" (excluding channels {bl_window[0]}–{bl_window[1]})" if bl_window else ""
+            click.echo(f"Baseline order {baseline_order} applied to {n_bl} science spectra{win_str}")
+            # Write back so the output table contains the baselined spectra
+            data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
+
         tsys_vals     = np.array(data['TSYS'],      dtype=np.float64)   # K
         deltav_vals   = np.array(data['DELTAV'],    dtype=np.float64)   # m/s (actual channel width after decimation)
         restfreq_vals = np.array(data['RESTFREQ'],  dtype=np.float64)   # Hz
@@ -4268,13 +4315,18 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                    'similar to PyStructure.')
 @click.option('--contour', is_flag=True, default=False,
               help='Display the map as contour lines instead of a filled image.')
+@click.option('--stretch', default='linear', show_default=True,
+              type=click.Choice(['linear', 'sqrt', 'asinh', 'log'], case_sensitive=False),
+              help='Colour stretch for the intensity map. '
+                   'sqrt/asinh compress bright regions and reveal faint detail. '
+                   'log is the most aggressive compression.')
 def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
                       zoom_x, zoom_y, zoom_ra, zoom_dec,
                       region_x, region_y, region_ra, region_dec,
                       region_radius_arcmin, use_wcs,
                       plot, fits_output, no_show, colormap,
                       coverage_threshold, mask_ra, mask_dec, mask_radius,
-                      suppress_negative, hex_plot, contour):
+                      suppress_negative, hex_plot, contour, stretch):
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
 
@@ -4360,6 +4412,7 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             suppress_negative=suppress_negative,
             hex_plot=hex_plot,
             contour=contour,
+            stretch=stretch,
         )
 
         click.echo(f"\n✓ Collapsed map: {collapsed.shape[1]} × {collapsed.shape[0]} pixels")
