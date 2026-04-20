@@ -2251,7 +2251,7 @@ def collapse_cube(
         import matplotlib
         cmap_obj = matplotlib.colormaps[cmap].copy() if isinstance(cmap, str) else cmap.copy()
         cmap_obj.set_bad('white')
-        iim = ax.imshow(data, origin='lower', cmap=cmap_obj,
+        im = ax.imshow(data, origin='lower', cmap=cmap_obj,
                        norm=norm, interpolation='nearest')
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
