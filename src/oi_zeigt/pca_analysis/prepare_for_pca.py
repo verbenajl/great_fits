@@ -9,7 +9,7 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import yaml
@@ -18,36 +18,45 @@ from astropy.io import fits
 logger = logging.getLogger(__name__)
 
 
-def load_mission_parameters(mission_id: str) -> dict:
+def _default_mission_params_file() -> Path:
+    """Return the bundled mission_id_parameters.yml path."""
+    return Path(__file__).parent / 'mission_id_parameters.yml'
+
+
+def load_mission_parameters(mission_id: str,
+                            yaml_file: Optional[Union[str, Path]] = None) -> dict:
     """
     Load mission-specific parameters from YAML file.
-    
+
     Parameters
     ----------
     mission_id : str
         Mission identifier
-    
+    yaml_file : str or Path, optional
+        Path to the mission parameters YAML file.  Defaults to the
+        ``mission_id_parameters.yml`` bundled with the package.
+
     Returns
     -------
     dict
         Mission parameters including telluric_line_center and telluric_line_width
     """
-    yaml_file = Path(__file__).parent / 'mission_id_parameters.yml'
-    
-    if not yaml_file.exists():
-        logger.warning(f"Mission parameters file not found: {yaml_file}")
+    yaml_path = Path(yaml_file) if yaml_file else _default_mission_params_file()
+
+    if not yaml_path.exists():
+        logger.warning(f"Mission parameters file not found: {yaml_path}")
         return {}
-    
+
     try:
-        with open(yaml_file, 'r') as f:
+        with open(yaml_path, 'r') as f:
             config = yaml.safe_load(f)
-        
+
         # Find matching mission ID (may be a substring)
         for key in config:
             if key and mission_id in key:
                 logger.debug(f"Found mission config for '{mission_id}': {key}")
                 return config[key] or {}
-        
+
         logger.warning(f"Mission '{mission_id}' not found in parameters file")
         return {}
     except Exception as e:
@@ -160,7 +169,8 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             aor_id: Optional[str] = None,
                             fill_noise: bool = False,
                             filter_missions: bool = False,
-                            filter_flight: Optional[list] = None) -> None:
+                            filter_flight: Optional[list] = None,
+                            mission_params_file: Optional[Union[str, Path]] = None) -> None:
     """
     Filter FITS file and optionally fill telluric lines with Gaussian noise.
 
@@ -276,7 +286,8 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         # Apply mission drop rules from mission_id_parameters.yml
         if filter_missions:
             import yaml as _yaml
-            mission_yml = Path(__file__).parent / 'mission_id_parameters.yml'
+            mission_yml = (Path(mission_params_file) if mission_params_file
+                           else _default_mission_params_file())
             if not mission_yml.exists():
                 logger.warning(f"--filter-missions requested but YAML not found: {mission_yml}")
             else:
@@ -358,7 +369,10 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
 
             # Pre-cache mission parameters — avoids re-parsing the YAML file for every spectrum
             unique_mission_ids = list(set(filtered_mission_ids))
-            mission_params_cache = {mid: load_mission_parameters(mid) for mid in unique_mission_ids}
+            mission_params_cache = {
+                mid: load_mission_parameters(mid, yaml_file=mission_params_file)
+                for mid in unique_mission_ids
+            }
             logger.info(f"  Cached parameters for {len(mission_params_cache)} unique mission IDs")
 
             # Build per-spectrum velocity axes as a plain numpy array for parallel workers
@@ -575,7 +589,8 @@ def prepare_for_pca(fits_file: Optional[str] = None,
                    aor_id: Optional[str] = None,
                    fill_noise: bool = False,
                    filter_missions: bool = False,
-                   filter_flight: Optional[list] = None) -> None:
+                   filter_flight: Optional[list] = None,
+                   mission_params_file: Optional[str] = None) -> None:
     """
     Main entry point for prepare_for_pca functionality.
     
@@ -647,6 +662,11 @@ def prepare_for_pca(fits_file: Optional[str] = None,
         if not object_filter:
             parameters_cfg = cfg.get('parameters', {})
             object_filter = parameters_cfg.get('object', 'M51CENTER')
+
+        # Get mission parameters file (optional)
+        if not mission_params_file:
+            pca_cfg = cfg.get('pca', {})
+            mission_params_file = pca_cfg.get('mission_parameters', None)
     
     # Validate required parameters
     if not fits_file:
@@ -666,7 +686,10 @@ def prepare_for_pca(fits_file: Optional[str] = None,
         logger.info(f"Scan filter: {scan}")
     
     # Process the file
+    if mission_params_file:
+        logger.info(f"Using mission parameters file: {mission_params_file}")
     fill_telluric_with_noise(fits_file, output_fits, pca_source, object_filter,
                             mission_id=mission_id, scan=scan, aor_id=aor_id,
                             fill_noise=fill_noise, filter_missions=filter_missions,
-                            filter_flight=filter_flight)
+                            filter_flight=filter_flight,
+                            mission_params_file=mission_params_file)

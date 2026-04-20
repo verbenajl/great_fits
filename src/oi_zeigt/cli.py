@@ -3767,10 +3767,17 @@ def combine_fits(input, output, single_hdu):
     multiple=True,
     help="Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated."
 )
+@click.option(
+    "--mission-parameters",
+    "mission_parameters",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to mission parameters YAML file (overrides pca.mission_parameters in config)."
+)
 def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional[str],
                    pca_source: Optional[str], object: Optional[str], mission_id: Optional[str],
                    scan: Optional[int], aor_id: Optional[str], fill_noise: bool,
-                   filter_missions: bool, filter_flight: tuple):
+                   filter_missions: bool, filter_flight: tuple, mission_parameters: Optional[str]):
     """
     Prepare FITS data for PCA analysis.
     
@@ -3819,6 +3826,7 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
             fill_noise=fill_noise,
             filter_missions=filter_missions,
             filter_flight=list(filter_flight) if filter_flight else None,
+            mission_params_file=mission_parameters,
         )
         
         click.echo("\n" + "="*70)
@@ -4290,7 +4298,7 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
               help='Save collapsed 2D map as FITS to this path.')
 @click.option('--no-show', is_flag=True, default=False,
               help='Do not open an interactive plot window.')
-@click.option('--colormap', default='inferno', show_default=True,
+@click.option('--colormap', default='rainbow', show_default=True,
               help=(
                   'Matplotlib colormap for the intensity map. '
                   'Sequential: inferno, viridis, plasma, magma, cividis, hot, afmhot, gist_heat, YlOrRd, Blues, Greens. '
@@ -4327,13 +4335,28 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
               help='Colour stretch for the intensity map. '
                    'sqrt/asinh compress bright regions and reveal faint detail. '
                    'log is the most aggressive compression.')
+@click.option('--output-noise-map', 'noise_map_output', type=click.Path(), default=None,
+              help='Save the per-pixel noise map (RMS from line-free channels) as a FITS file. '
+                   'Requires --velocity-range to identify line-free channels.')
+@click.option('--smooth', 'smooth_sigma', type=float, default=None, metavar='SIGMA',
+              help='Gaussian smooth the display map before plotting. '
+                   'SIGMA is the kernel standard deviation in pixels.')
+@click.option('--percentile-clip', type=(float, float), default=None, nargs=2,
+              metavar='LO HI',
+              help='Percentile range for the colour scale (default: 0 100, full data range). '
+                   'Example: --percentile-clip 2 98 to clip outliers.')
+@click.option('--snr-threshold', type=float, default=None, metavar='N',
+              help='Mask pixels whose integrated intensity SNR is below N. '
+                   'Requires --velocity-range to compute the noise map from line-free channels.')
 def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
                       zoom_x, zoom_y, zoom_ra, zoom_dec,
                       region_x, region_y, region_ra, region_dec,
                       region_radius_arcmin, use_wcs,
                       plot, fits_output, no_show, colormap,
                       coverage_threshold, mask_ra, mask_dec, mask_radius,
-                      suppress_negative, hex_plot, contour, stretch):
+                      suppress_negative, hex_plot, contour, stretch,
+                      noise_map_output, smooth_sigma, percentile_clip,
+                      snr_threshold):
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
 
@@ -4410,6 +4433,7 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             region_radius_arcmin=region_radius_arcmin,
             use_wcs=use_wcs,
             fits_output=fits_output,
+            noise_map_output=noise_map_output,
             plot_output=plot,
             colormap=colormap,
             coverage_threshold=coverage_threshold,
@@ -4420,6 +4444,9 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             hex_plot=hex_plot,
             contour=contour,
             stretch=stretch,
+            smooth_sigma=smooth_sigma,
+            percentile_clip=percentile_clip,
+            snr_threshold=snr_threshold,
         )
 
         click.echo(f"\n✓ Collapsed map: {collapsed.shape[1]} × {collapsed.shape[0]} pixels")

@@ -1,0 +1,43 @@
+PCA correction — fixes to align with original pyclass behaviour
+==============================================================
+
+1. Remove the re-fit step (most likely cause of over-subtraction)
+   - pyclass uses the original full-set coefficients for subtraction even after
+     rejecting some components
+   - our code re-fits using only the surviving components, which inflates the
+     coefficients because survivors absorb cross-talk from rejected components
+   - fix: use the original coeff[j] for subtraction, not refit_coeff[j]
+   - location: pca_correct_fits.py, _apply_correction_worker(), ~line 470-480
+
+2. Add mean centering before projection
+   - sklearn PCA subtracts pca_model.mean_ (mean of training sky-diff spectra)
+     before computing components, so the correct projection is:
+       coeff = components · (spectrum - mean_sky)
+     but we compute:
+       coeff = components · spectrum
+   - the extra term components · mean_sky is a fixed bias on every coefficient
+     causing non-zero subtraction even when there is no atmospheric contamination
+   - mean_spectrum is already stored in the decomposition object but never used
+     during correction
+   - fix: subtract mean_spectrum from the spectrum before the dot product /
+     lstsq fit in _apply_correction_worker()
+
+4. Smarter fallback when line detection fails
+   - currently: if OpenCV finds no line in a group, the fit runs over the entire
+     spectrum (same behaviour as pyclass — no fallback)
+   - --force-line-window masks the full config line_window in that case, but this
+     is too aggressive: line_window covers the full expected velocity range across
+     the whole map (line shifts with position), so it removes a large clean
+     baseline region unnecessarily
+   - better fallback idea: when detection fails for a spectrum, borrow the
+     detected line position from neighbouring spectra in the same
+     (mission, telescope, scan) group rather than falling back to the full window
+   - only use line_window as a last resort if no group neighbour has a detection
+   - leave --force-line-window as an explicit opt-in, do not make it the default
+
+3. Revisit cut_coefficients scale
+   - pyclass normalises the spectrum by its std before projection, so its
+     coefficients are dimensionless (units of sigma)
+   - our coefficients are in raw K, so cut_coefficients=0.1 means something
+     very different from pyclass's cut_coefficients=0.1
+   - after fixing points 1 and 2, check whether the threshold needs rescaling

@@ -39,7 +39,7 @@ rymin=-1000
 rymax=1000
 
 [pca]
-n_components = 6
+n_components = 5
 pca_source="SKYCHOPDIFF"
 # smooth the components in frequency space by a box car with a
 # a kernel length of

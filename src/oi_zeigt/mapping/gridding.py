@@ -1819,9 +1819,10 @@ def collapse_cube(
     region_radius_arcmin: Optional[float] = None,
     use_wcs: bool = False,
     fits_output: Optional[str] = None,
+    noise_map_output: Optional[str] = None,
     plot_output: Optional[str] = None,
     overwrite: bool = True,
-    colormap: str = 'inferno',
+    colormap: str = 'rainbow',
     coverage_threshold: float = 0.3,
     mask_ra: Optional[float] = None,
     mask_dec: Optional[float] = None,
@@ -1830,6 +1831,9 @@ def collapse_cube(
     hex_plot: bool = False,
     contour: bool = False,
     stretch: str = 'linear',
+    smooth_sigma: Optional[float] = None,
+    percentile_clip: Optional[Tuple[float, float]] = None,
+    snr_threshold: Optional[float] = None,
 ) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
@@ -1992,6 +1996,49 @@ def collapse_cube(
           f"range [{np.nanmin(collapsed_display):.2f}, {np.nanmax(collapsed_display):.2f}] K km/s")
 
     # ------------------------------------------------------------------
+    # 4c. Noise map: per-pixel RMS from line-free channels
+    # ------------------------------------------------------------------
+    noise_map = None
+    noise_chan_mask = ~chan_mask
+    if noise_chan_mask.sum() >= 2:
+        noise_map = np.nanstd(cube[noise_chan_mask, :, :], axis=0).astype(np.float32)
+        noise_map[display_mask] = np.nan
+        avg_noise = float(np.nanmean(noise_map))
+        print(f"  Noise map: {noise_chan_mask.sum()} line-free channels, "
+              f"mean noise = {avg_noise:.4f} K")
+    elif velocity_range is None:
+        print("  Noise map: no --velocity-range given — cannot identify line-free channels")
+    else:
+        print("  Noise map: insufficient line-free channels for noise estimation")
+
+    # ------------------------------------------------------------------
+    # 4c2. SNR threshold: mask pixels below signal-to-noise cutoff
+    # ------------------------------------------------------------------
+    # SNR = collapsed [K km/s] / (noise [K] × sqrt(n_signal_chan) × deltav [km/s])
+    if snr_threshold is not None and noise_map is not None:
+        n_signal_chan = int(chan_mask.sum())
+        snr_map = collapsed / (noise_map * np.sqrt(n_signal_chan) * deltav_kms)
+        snr_mask = np.isfinite(snr_map) & (snr_map < snr_threshold)
+        display_mask |= snr_mask
+        collapsed_display[snr_mask] = np.nan
+        print(f"  SNR threshold: {snr_threshold:.1f} — masked {snr_mask.sum()} additional pixels")
+    elif snr_threshold is not None and noise_map is None:
+        print("  Warning: --snr-threshold ignored — noise map unavailable "
+              "(need --velocity-range to identify line-free channels)")
+
+    # ------------------------------------------------------------------
+    # 4d. Optional Gaussian smoothing of the display map (NaN-aware)
+    # ------------------------------------------------------------------
+    if smooth_sigma is not None and smooth_sigma > 0:
+        from astropy.convolution import Gaussian2DKernel, convolve as _convolve
+        _kernel = Gaussian2DKernel(x_stddev=smooth_sigma)
+        collapsed_display = _convolve(collapsed_display, _kernel,
+                                      boundary='fill', fill_value=np.nan,
+                                      nan_treatment='interpolate',
+                                      preserve_nan=True).astype(np.float32)
+        print(f"  Gaussian smoothing applied: sigma = {smooth_sigma:.1f} pixels")
+
+    # ------------------------------------------------------------------
     # 5. Build 2D WCS header (drop spectral axis)
     # ------------------------------------------------------------------
     wcs3d = WCS(header)
@@ -2018,6 +2065,19 @@ def collapse_cube(
                      header2d,
                      overwrite=overwrite)
         print(f"  FITS saved: {fits_output}")
+
+    if noise_map_output:
+        if noise_map is not None:
+            noise_header = header2d.copy()
+            noise_header['BUNIT'] = 'K'
+            noise_header['COMMENT'] = 'Per-pixel RMS noise from line-free channels'
+            fits.writeto(noise_map_output,
+                         noise_map.astype(np.float32),
+                         noise_header,
+                         overwrite=overwrite)
+            print(f"  Noise map FITS saved: {noise_map_output}")
+        else:
+            print("  Warning: noise map not computed — --output-noise-map skipped")
 
     # ------------------------------------------------------------------
     # 7. Plot
@@ -2159,8 +2219,9 @@ def collapse_cube(
             ax.set_ylabel('Dec pixel')
 
     def _vminmax(data):
-        vmin_p = 0.0 if suppress_negative else np.nanpercentile(data, 2)
-        vmax_p = np.nanpercentile(data, 98)
+        lo, hi = percentile_clip if percentile_clip is not None else (0, 100)
+        vmin_p = 0.0 if suppress_negative else np.nanpercentile(data, lo)
+        vmax_p = np.nanpercentile(data, hi)
         return vmin_p, vmax_p
 
     def _make_norm(vmin_p, vmax_p):
@@ -2187,7 +2248,10 @@ def collapse_cube(
     def _imshow_map(ax, data, title, wcs_proj=None, cmap=colormap):
         vmin_p, vmax_p = _vminmax(data)
         norm = _make_norm(vmin_p, vmax_p)
-        im = ax.imshow(data, origin='lower', cmap=cmap,
+        import matplotlib
+        cmap_obj = matplotlib.colormaps[cmap].copy() if isinstance(cmap, str) else cmap.copy()
+        cmap_obj.set_bad('white')
+        iim = ax.imshow(data, origin='lower', cmap=cmap_obj,
                        norm=norm, interpolation='nearest')
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)

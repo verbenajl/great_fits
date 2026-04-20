@@ -487,6 +487,11 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
         'n_components_used': len(used_components),
         'used_components': used_components,
         'component_info': component_info,
+        'n_gcf_channels': int(np.sum(good_channels_fit)),
+        'n_gcs_channels': int(np.sum(good_channels_sub)),
+        'n_total_channels': len(good_channels_fit),
+        'gcf_mask': good_channels_fit.copy(),
+        'gcs_mask': good_channels_sub.copy(),
     }
     return corrected, details
 
@@ -767,10 +772,25 @@ def _pca_spectrum_worker(args):
             cut_coefficients=s.get('cut_coefficients', 0),
         )
 
+        # Log mask coverage (debug level — too verbose for normal runs)
+        n_total = len(spectrum)
+        n_corr = ch_last - ch_first + 1
+        n_gcf = details.get('n_gcf_channels', 0)
+        n_gcs = details.get('n_gcs_channels', 0)
+        logger.debug(
+            f"  idx={idx}: correction range [{ch_first},{ch_last}] ({n_corr}/{n_total} ch), "
+            f"gcf={n_gcf}/{n_corr} ch ({100*n_gcf/n_corr:.0f}%), "
+            f"gcs={n_gcs}/{n_corr} ch ({100*n_gcs/n_corr:.0f}%)"
+        )
+
         # Embed corrected slice back into a full-length copy of the spectrum
         corrected = spectrum.copy()
         corrected[ch_first:ch_last + 1] = corrected_slice
 
+        # Store channel-range info so _generate_plots can use it
+        details['ch_first'] = ch_first
+        details['ch_last'] = ch_last
+        details['n_total_channels'] = n_total
         details['status'] = 'ok'
         return idx, corrected, details
     except Exception as e:
@@ -1717,6 +1737,18 @@ class PCACorrector:
                         )
 
                         prelim_corrected_spectra[idx] = corrected
+                        # Store mask info so _generate_plots can visualise it
+                        details['gcf_mask'] = good_channels_for_fitting.copy()
+                        details['gcs_mask'] = good_channels_for_subtraction.copy()
+                        details['n_gcf_channels'] = int(np.sum(good_channels_for_fitting))
+                        details['n_gcs_channels'] = int(np.sum(good_channels_for_subtraction))
+                        details['n_total_channels'] = len(spectrum)
+                        details['ch_first'] = 0
+                        details['ch_last'] = len(spectrum) - 1
+                        logger.debug(
+                            f"  idx={idx}: gcf={details['n_gcf_channels']}/{len(spectrum)} ch, "
+                            f"gcs={details['n_gcs_channels']}/{len(spectrum)} ch"
+                        )
                         correction_details[idx] = details
 
                         if mission_decompositions:
@@ -1744,6 +1776,26 @@ class PCACorrector:
                               f"mean={np.mean(comp_coeff):.4e}, "
                               f"std={np.std(comp_coeff):.4e}, "
                               f"median={np.median(comp_coeff):.4e}")
+
+            # Log mask coverage summary across all corrected spectra
+            gcf_counts = [correction_details[i]['n_gcf_channels']
+                          for i in indices
+                          if i in correction_details and 'n_gcf_channels' in correction_details[i]]
+            gcs_counts = [correction_details[i]['n_gcs_channels']
+                          for i in indices
+                          if i in correction_details and 'n_gcs_channels' in correction_details[i]]
+            n_total_ch = correction_details[next(
+                (i for i in indices if i in correction_details and 'n_total_channels' in correction_details[i]),
+                indices[0]
+            )].get('n_total_channels', '?') if indices else '?'
+            if gcf_counts:
+                logger.info(
+                    f"MASK COVERAGE (phase 1, {len(gcf_counts)} spectra, {n_total_ch} total channels): "
+                    f"gcf (fit) = {np.mean(gcf_counts):.0f} ch avg "
+                    f"({100*np.mean(gcf_counts)/n_total_ch:.1f}%), "
+                    f"gcs (subtract) = {np.mean(gcs_counts):.0f} ch avg "
+                    f"({100*np.mean(gcs_counts)/n_total_ch:.1f}%)"
+                )
             
             # Step 2: Detect lines FROM the corrected spectra (following original pca_correct.py)
             logger.info("STEP 2: Detecting lines from corrected spectra (iterative refinement)")
@@ -2123,6 +2175,9 @@ class PCACorrector:
                         corrected[_ch_first:_ch_last + 1] = corrected_slice
 
                         corrected_spectra[idx] = corrected
+                        details['ch_first'] = _ch_first
+                        details['ch_last'] = _ch_last
+                        details['n_total_channels'] = len(_spec_full)
                         correction_details[idx] = details
 
                         stats['corrected'] += 1
@@ -2145,6 +2200,27 @@ class PCACorrector:
                         if mission_decompositions:
                             self.components = saved_components
                             self.explained_variance_ratio = saved_variance_ratio
+
+            # Log Phase 3 mask coverage (shows effect of line detection on gcs)
+            gcf3_counts = [correction_details[i]['n_gcf_channels']
+                           for i in indices
+                           if i in correction_details and 'n_gcf_channels' in correction_details[i]]
+            gcs3_counts = [correction_details[i]['n_gcs_channels']
+                           for i in indices
+                           if i in correction_details and 'n_gcs_channels' in correction_details[i]]
+            n_total_ch3 = next(
+                (correction_details[i]['n_total_channels'] for i in indices
+                 if i in correction_details and 'n_total_channels' in correction_details[i]),
+                None
+            )
+            if gcf3_counts and n_total_ch3:
+                logger.info(
+                    f"MASK COVERAGE (phase 3, {len(gcf3_counts)} spectra, {n_total_ch3} total channels): "
+                    f"gcf (fit) = {np.mean(gcf3_counts):.0f} ch avg "
+                    f"({100*np.mean(gcf3_counts)/n_total_ch3:.1f}%), "
+                    f"gcs (subtract) = {np.mean(gcs3_counts):.0f} ch avg "
+                    f"({100*np.mean(gcs3_counts)/n_total_ch3:.1f}%)"
+                )
 
             # Update data with corrected spectra
             data[spectrum_col] = corrected_spectra
@@ -2503,20 +2579,81 @@ class PCACorrector:
             
             n_components_show = len(components_to_plot)
             spectral_height = 0.85 / (2 + n_components_show)  # 2 for orig/corr + n for components
-            
+
+            # ------------------------------------------------------------------
+            # Build group-level mean masks for shading Column 1 mean plots.
+            # gcs_mean: fraction of spectra for which each channel is in gcs
+            # gcf_mean: same for gcf
+            # ------------------------------------------------------------------
+            group_gcf_masks = []
+            group_gcs_masks = []
+            for gidx in usable_global_indices[:n_display]:
+                if gidx in correction_details:
+                    _d = correction_details[gidx]
+                    if 'gcf_mask' in _d:
+                        group_gcf_masks.append(_d['gcf_mask'])
+                    if 'gcs_mask' in _d:
+                        group_gcs_masks.append(_d['gcs_mask'])
+
+            # Mean fraction of spectra that include each channel in gcf / gcs
+            mean_gcf = np.mean(group_gcf_masks, axis=0) if group_gcf_masks else None
+            mean_gcs = np.mean(group_gcs_masks, axis=0) if group_gcs_masks else None
+
+            def _shade_masks(ax):
+                """Add semi-transparent mask shading to a mean-spectrum axes."""
+                if len(x_axis) == 0:
+                    return
+                if mean_gcs is not None and len(mean_gcs) == len(x_axis):
+                    # Channels excluded from subtraction in >50% of spectra → red shade
+                    ex_sub = mean_gcs < 0.5
+                    in_span = False
+                    for ch, val in enumerate(ex_sub):
+                        if val and not in_span:
+                            v0 = x_axis[ch]; in_span = True
+                        elif not val and in_span:
+                            ax.axvspan(v0, x_axis[ch - 1], color='red', alpha=0.15, zorder=0)
+                            in_span = False
+                    if in_span:
+                        ax.axvspan(v0, x_axis[-1], color='red', alpha=0.15, zorder=0)
+                if mean_gcf is not None and mean_gcs is not None and len(mean_gcf) == len(x_axis):
+                    # Channels in gcs but not gcf (telluric region) → blue shade
+                    tel_only = (mean_gcs >= 0.5) & (mean_gcf < 0.5)
+                    in_span = False
+                    for ch, val in enumerate(tel_only):
+                        if val and not in_span:
+                            v0 = x_axis[ch]; in_span = True
+                        elif not val and in_span:
+                            ax.axvspan(v0, x_axis[ch - 1], color='blue', alpha=0.12, zorder=0)
+                            in_span = False
+                    if in_span:
+                        ax.axvspan(v0, x_axis[-1], color='blue', alpha=0.12, zorder=0)
+
+            # Log group-level mask summary
+            if mean_gcf is not None and len(x_axis) > 0:
+                frac_gcf = float(np.mean(mean_gcf))
+                frac_gcs = float(np.mean(mean_gcs)) if mean_gcs is not None else float('nan')
+                logger.info(
+                    f"  Plot mask summary for {mission_id}/{telescope}/scan{scan}: "
+                    f"gcf={frac_gcf*100:.1f}% of channels used for fitting, "
+                    f"gcs={frac_gcs*100:.1f}% used for subtraction "
+                    f"(red shade=excluded from subtraction, blue shade=telluric only)"
+                )
+
             # Original mean
             ax1 = fig.add_axes([padding, 0.90 - spectral_height, plot_width, spectral_height])
+            _shade_masks(ax1)
             ax1.plot(x_axis, original_mean, 'r-', lw=1.5)
             ax1.set_title('Original Mean', fontsize=10)
             ax1.set_ylim(min_val, max_val)
             ax1.grid(True, alpha=0.3)
             ax1.tick_params(labelsize=8)
-            
+
             # Corrected mean
             ax2 = fig.add_axes([padding, 0.90 - 2*spectral_height, plot_width, spectral_height])
+            _shade_masks(ax2)
             ax2.plot(x_axis, original_mean, 'r-', lw=1, alpha=0.5, label='Orig')
             ax2.plot(x_axis, corrected_mean, 'g-', lw=1.5, label='Corr')
-            ax2.set_title('Corrected Mean', fontsize=10)
+            ax2.set_title('Corrected Mean  [red=excl. subtraction | blue=telluric fit-excl.]', fontsize=9)
             ax2.set_ylim(min_val, max_val)
             ax2.legend(fontsize=8, loc='upper right')
             ax2.grid(True, alpha=0.3)
@@ -2934,14 +3071,46 @@ class PCACorrector:
             original_ex = original_spectra_subset[example_idx]
             corrected_ex = corrected_spectra_subset[example_idx]
             
-            # Get component info for this spectrum
+            # Get component info and mask info for this spectrum
             if example_global_idx in correction_details:
                 details = correction_details[example_global_idx]
                 comp_info = details.get('component_info', {})
                 coeffs = details.get('coefficients', np.zeros(len(self.components)))
+                ex_gcf_mask = details.get('gcf_mask', None)
+                ex_gcs_mask = details.get('gcs_mask', None)
             else:
                 comp_info = {}
                 coeffs = np.zeros(len(self.components))
+                ex_gcf_mask = None
+                ex_gcs_mask = None
+
+            # Pre-compute velocity spans for mask shading
+            # excluded_gcs (bad + science line): neither fitted nor subtracted
+            # telluric (in gcs but not gcf): subtracted but not fitted
+            # For contiguous False regions, compute velocity spans for axvspan
+            def _mask_spans(bool_mask):
+                """Return list of (v_start, v_end) velocity spans where bool_mask is False."""
+                if bool_mask is None or len(x_axis) == 0 or len(bool_mask) != len(x_axis):
+                    return []
+                spans = []
+                in_span = False
+                for ch, val in enumerate(bool_mask):
+                    if not val and not in_span:
+                        span_start = x_axis[ch]
+                        in_span = True
+                    elif val and in_span:
+                        spans.append((span_start, x_axis[ch - 1]))
+                        in_span = False
+                if in_span:
+                    spans.append((span_start, x_axis[-1]))
+                return spans
+
+            ex_gcs_excluded = _mask_spans(ex_gcs_mask)   # bad + science line → no subtraction
+            if ex_gcf_mask is not None and ex_gcs_mask is not None:
+                telluric_only = ex_gcs_mask & ~ex_gcf_mask   # in gcs but excluded from gcf
+            else:
+                telluric_only = None
+            ex_telluric_spans = _mask_spans(~telluric_only if telluric_only is not None else None)
             
             # Plot correction for each component (show all components)
             n_comp_show = len(self.components)
@@ -2956,24 +3125,37 @@ class PCACorrector:
                                           y_pos, 
                                           plot_width, spec_height])
                 
+                # Shade masked regions (same on every sub-panel for easy reading)
+                for v0, v1 in ex_gcs_excluded:
+                    ax_ex_comp.axvspan(v0, v1, color='red', alpha=0.15, zorder=0,
+                                       label='excluded (bad/line)' if comp_idx == 0 and v0 == ex_gcs_excluded[0][0] else '_')
+                for v0, v1 in ex_telluric_spans:
+                    ax_ex_comp.axvspan(v0, v1, color='blue', alpha=0.12, zorder=0,
+                                       label='telluric (sub only)' if comp_idx == 0 and v0 == ex_telluric_spans[0][0] else '_')
+
                 # Plot original, corrected, and component contribution
                 ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=1.5, alpha=0.8, label='Orig', zorder=1)
                 ax_ex_comp.plot(x_axis, corrected_ex, color='green', lw=1.5, alpha=0.8, label='Corr', zorder=2)
                 
                 scaled_comp_raw = coeffs[comp_idx] * self.components[comp_idx]
-                # Embed trimmed component back into full channel range for plotting
+                # Embed component into full channel range so it always plots against x_axis.
+                # Without this, a trimmed (shorter) component would be plotted at channel
+                # indices 0,1,2,... as x-values instead of velocities, appearing as a
+                # narrow compressed line in only part of the panel.
                 _plot_meta = getattr(self, 'metadata', {}) or {}
                 _cf = _plot_meta.get('channel_first', None)
                 _cl = _plot_meta.get('channel_last', None)
-                if _cf is not None and _cl is not None and len(scaled_comp_raw) == _cl - _cf + 1 and len(x_axis) > _cl:
+                if len(scaled_comp_raw) == len(x_axis):
+                    scaled_comp = scaled_comp_raw
+                elif _cf is not None and _cl is not None and len(scaled_comp_raw) == _cl - _cf + 1:
                     scaled_comp = np.zeros(len(x_axis))
                     scaled_comp[_cf:_cl + 1] = scaled_comp_raw
                 else:
-                    scaled_comp = scaled_comp_raw
-                if len(scaled_comp) == len(x_axis):
-                    ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')
-                else:
-                    ax_ex_comp.plot(scaled_comp, 'b-', lw=1, label='Comp')
+                    # Fallback: embed at start, zero-pad the rest
+                    scaled_comp = np.zeros(len(x_axis))
+                    n = min(len(scaled_comp_raw), len(x_axis))
+                    scaled_comp[:n] = scaled_comp_raw[:n]
+                ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')
                 
                 info = comp_info.get(comp_idx, {})
                 used = info.get('used', False)
