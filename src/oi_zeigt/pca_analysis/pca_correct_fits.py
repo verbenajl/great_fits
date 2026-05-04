@@ -422,8 +422,9 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
             continue
 
         # Coefficient cutoff: skip if projection onto this spectrum is negligible.
-        # Uses original (full-set) coefficient — matches original pyclass.
-        if cut_coefficients and abs(coeff[i]) < float(cut_coefficients):
+        # Normalised by spectrum_std so the threshold is dimensionless (in sigma)
+        # and has consistent meaning across datasets with different noise levels.
+        if cut_coefficients and spectrum_std > 0 and abs(coeff[i]) / spectrum_std < float(cut_coefficients):
             component_info[i] = {'used': False, 'reason': 'cut_coefficients',
                                  'coeff': coeff[i], 'variance': var_ratio}
             continue
@@ -1784,10 +1785,11 @@ class PCACorrector:
             gcs_counts = [correction_details[i]['n_gcs_channels']
                           for i in indices
                           if i in correction_details and 'n_gcs_channels' in correction_details[i]]
-            n_total_ch = correction_details[next(
+            _n_total_key = next(
                 (i for i in indices if i in correction_details and 'n_total_channels' in correction_details[i]),
-                indices[0]
-            )].get('n_total_channels', '?') if indices else '?'
+                None
+            )
+            n_total_ch = correction_details[_n_total_key]['n_total_channels'] if _n_total_key is not None else '?'
             if gcf_counts:
                 logger.info(
                     f"MASK COVERAGE (phase 1, {len(gcf_counts)} spectra, {n_total_ch} total channels): "
@@ -2049,11 +2051,12 @@ class PCACorrector:
                     if detected_lines_mask is not None and np.any(detected_lines_mask):
                         line_regions = detected_lines_mask[spec_idx]
                         gcf = gcf & ~line_regions
-                        gcs = gcs & ~line_regions
+                        # gcs NOT modified: line channels are still corrected (artifact removed),
+                        # only excluded from fitting so line emission doesn't bias the projection.
                     if telluric_line_mask is not None:
                         telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
                         gcf = gcf & ~telluric_regions
-                        # gcs NOT modified (legacy: telluric excluded from fitting only)
+                        # gcs NOT modified (telluric excluded from fitting only)
                     phase3_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s,
                                         per_spectrum_cutoffs[spec_idx]))
                 from multiprocessing import Pool
@@ -2112,11 +2115,13 @@ class PCACorrector:
                         n_good = np.sum(good_channels_for_fitting)
                         n_line = 0
 
-                        # Exclude detected lines from FITTING (following original pca_correct.py)
+                        # Exclude detected lines from FITTING only — not from subtraction.
+                        # The PCA correction is still subtracted at line channels to remove
+                        # instrumental artifacts there; only the coefficient fit avoids them
+                        # so the line emission does not bias the projection.
                         if detected_lines_mask is not None and np.any(detected_lines_mask):
                             line_regions = detected_lines_mask[spec_idx]
                             good_channels_for_fitting = good_channels_for_fitting & ~line_regions
-                            good_channels_for_subtraction = good_channels_for_subtraction & ~line_regions
                             n_line = np.sum(line_regions)
                             stats['lines_detected'] = True
 
@@ -2580,6 +2585,8 @@ class PCACorrector:
             n_components_show = len(components_to_plot)
             spectral_height = 0.85 / (2 + n_components_show)  # 2 for orig/corr + n for components
 
+            n_display = len(usable_global_indices)
+
             # ------------------------------------------------------------------
             # Build group-level mean masks for shading Column 1 mean plots.
             # gcs_mean: fraction of spectra for which each channel is in gcs
@@ -2710,10 +2717,6 @@ class PCACorrector:
             ax_waterfall.set_ylim(n_display_waterfall, 0)  # Top to bottom
             fig.colorbar(im_waterfall, ax=ax_waterfall, pad=0.02)
             ax_waterfall.tick_params(labelsize=8)
-            
-            # Calculate n_display early - all plots will use this for consistent sizing
-            # Display only the usable processed spectra (those with correction details)
-            n_display = len(usable_global_indices)
             
             # Before correction heatmap with line detection contours overlay
             threshold_2d = None
@@ -3363,7 +3366,7 @@ Examples:
         type=float,
         default=None,
         dest='cut_coefficients',
-        help='Skip component if |coeff| < this value (0 = disabled, matches original pyclass cut_coefficients)'
+        help='Skip component if |coeff|/spectrum_std < this value (dimensionless, in sigma). 0 = disabled.'
     )
     parser.add_argument(
         '--object',

@@ -1986,6 +1986,12 @@ def collapse_cube(
         print(f"  Circular mask: blanking outside r={mask_radius_arcmin:.1f}′ "
               f"(centre pixel {cx_m:.1f}, {cy_m:.1f})")
 
+    # Pixels where every channel in the integration range is NaN have no data.
+    # np.nansum returns 0 for those, so we mask them explicitly here so they
+    # show as white in the plot rather than as the colormap colour for zero.
+    all_nan_pixels = np.all(np.isnan(cube[chan_mask, :, :]), axis=0)
+    display_mask |= all_nan_pixels
+
     collapsed_display = collapsed.copy()
     collapsed_display[display_mask] = np.nan
     n_masked = int(display_mask.sum())
@@ -2025,6 +2031,16 @@ def collapse_cube(
     elif snr_threshold is not None and noise_map is None:
         print("  Warning: --snr-threshold ignored — noise map unavailable "
               "(need --velocity-range to identify line-free channels)")
+
+    # ------------------------------------------------------------------
+    # 4c3. Suppress negative values: set to 0 rather than NaN so they
+    #      show as the zero colour rather than white (no-data).
+    # ------------------------------------------------------------------
+    if suppress_negative:
+        neg_mask = np.isfinite(collapsed_display) & (collapsed_display < 0)
+        collapsed_display[neg_mask] = 0.0
+        if neg_mask.sum() > 0:
+            print(f"  Suppress negative: {neg_mask.sum()} pixels clipped to 0")
 
     # ------------------------------------------------------------------
     # 4d. Optional Gaussian smoothing of the display map (NaN-aware)
@@ -2248,8 +2264,7 @@ def collapse_cube(
     def _imshow_map(ax, data, title, wcs_proj=None, cmap=colormap):
         vmin_p, vmax_p = _vminmax(data)
         norm = _make_norm(vmin_p, vmax_p)
-        import matplotlib
-        cmap_obj = matplotlib.colormaps[cmap].copy() if isinstance(cmap, str) else cmap.copy()
+        cmap_obj = plt.colormaps[cmap].copy() if isinstance(cmap, str) else cmap.copy()
         cmap_obj.set_bad('white')
         im = ax.imshow(data, origin='lower', cmap=cmap_obj,
                        norm=norm, interpolation='nearest')

@@ -52,7 +52,7 @@ noise_ratio_cutoff = 1.0
 line_kernel_size = 11
 line_cutoff_std=1.0
 least_squares=true
-cut_coefficients=0.1
+cut_coefficients=0.2  # dimensionless (sigma): skip component if |coeff|/spectrum_std < this
 
 [output]
 clean_fits = "/home/diskB/data_soft/m51/processed_complete_fits/clean_data.fits"
