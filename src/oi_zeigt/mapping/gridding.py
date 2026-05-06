@@ -1828,6 +1828,9 @@ def collapse_cube(
     mask_dec: Optional[float] = None,
     mask_radius_arcmin: Optional[float] = None,
     suppress_negative: bool = False,
+    suppress_high: Optional[float] = None,
+    mode: str = 'moment0',
+    peak_range_channels: int = 5,
     hex_plot: bool = False,
     contour: bool = False,
     stretch: str = 'linear',
@@ -1934,10 +1937,36 @@ def collapse_cube(
               f"{channels_kms.min():.1f} – {channels_kms.max():.1f} km/s")
 
     # ------------------------------------------------------------------
-    # 4. Collapse: sum × |Δv| → K km/s
+    # 4. Collapse
     # ------------------------------------------------------------------
     deltav_kms = abs(cdelt3) / 1e3
-    collapsed = np.nansum(cube[chan_mask, :, :], axis=0) * deltav_kms
+    if mode == 'peak-intensity':
+        collapsed = np.nanmax(cube[chan_mask, :, :], axis=0).astype(np.float32)
+        _map_units = 'K'
+        _map_label = 'Peak intensity (K)'
+    elif mode == 'peak-range-int':
+        sub = cube[chan_mask, :, :]          # (nchan_sel, ny, nx)
+        nchan_sel = sub.shape[0]
+        # Per-pixel peak channel: replace NaN with -inf so argmax works on all-NaN pixels
+        peak_idx = np.argmax(np.where(np.isnan(sub), -np.inf, sub), axis=0)  # (ny, nx)
+        n = peak_range_channels
+        print(f"  Peak-range: ±{n} channels around per-pixel peak "
+              f"(window up to {2*n+1} ch)")
+        acc = np.zeros((ny, nx), dtype=np.float64)
+        row_idx = np.arange(ny)[:, None]
+        col_idx = np.arange(nx)[None, :]
+        for k in range(-n, n + 1):
+            chan_k = peak_idx + k
+            valid = (chan_k >= 0) & (chan_k < nchan_sel)
+            vals = sub[np.clip(chan_k, 0, nchan_sel - 1), row_idx, col_idx]
+            acc += np.where(valid & ~np.isnan(vals), vals, 0.0)
+        collapsed = (acc * deltav_kms).astype(np.float32)
+        _map_units = 'K km/s'
+        _map_label = f'Peak ±{n}ch (K km/s)'
+    else:  # moment0
+        collapsed = np.nansum(cube[chan_mask, :, :], axis=0) * deltav_kms
+        _map_units = 'K km/s'
+        _map_label = 'K km/s'
 
     # ------------------------------------------------------------------
     # 4b. Build display mask (NaN = not shown in plot; FITS always unmasked)
@@ -1998,8 +2027,8 @@ def collapse_cube(
     if n_masked > 0:
         print(f"  Total masked pixels in display: {n_masked}")
 
-    print(f"  Collapsed map: {ny} × {nx} pixels, "
-          f"range [{np.nanmin(collapsed_display):.2f}, {np.nanmax(collapsed_display):.2f}] K km/s")
+    print(f"  Collapsed map ({mode}): {ny} × {nx} pixels, "
+          f"range [{np.nanmin(collapsed_display):.2f}, {np.nanmax(collapsed_display):.2f}] {_map_units}")
 
     # ------------------------------------------------------------------
     # 4c. Noise map: per-pixel RMS from line-free channels
@@ -2023,7 +2052,12 @@ def collapse_cube(
     # SNR = collapsed [K km/s] / (noise [K] × sqrt(n_signal_chan) × deltav [km/s])
     if snr_threshold is not None and noise_map is not None:
         n_signal_chan = int(chan_mask.sum())
-        snr_map = collapsed / (noise_map * np.sqrt(n_signal_chan) * deltav_kms)
+        if mode == 'peak-intensity':
+            # peak value [K] / per-channel noise [K]
+            snr_map = collapsed / noise_map
+        else:
+            # moment-0 [K km/s] / (noise [K] × sqrt(n) × deltav [km/s])
+            snr_map = collapsed / (noise_map * np.sqrt(n_signal_chan) * deltav_kms)
         snr_mask = np.isfinite(snr_map) & (snr_map < snr_threshold)
         display_mask |= snr_mask
         collapsed_display[snr_mask] = np.nan
@@ -2041,6 +2075,15 @@ def collapse_cube(
         collapsed_display[neg_mask] = 0.0
         if neg_mask.sum() > 0:
             print(f"  Suppress negative: {neg_mask.sum()} pixels clipped to 0")
+
+    # ------------------------------------------------------------------
+    # 4c4. Suppress high values: clip pixels above threshold to threshold.
+    # ------------------------------------------------------------------
+    if suppress_high is not None:
+        high_mask = np.isfinite(collapsed_display) & (collapsed_display > suppress_high)
+        collapsed_display[high_mask] = suppress_high
+        if high_mask.sum() > 0:
+            print(f"  Suppress high: {high_mask.sum()} pixels clipped to {suppress_high}")
 
     # ------------------------------------------------------------------
     # 4d. Optional Gaussian smoothing of the display map (NaN-aware)
@@ -2063,7 +2106,7 @@ def collapse_cube(
     header2d['NAXIS']  = 2
     header2d['NAXIS1'] = nx
     header2d['NAXIS2'] = ny
-    header2d['BUNIT']  = 'K km/s'
+    header2d['BUNIT']  = _map_units
     header2d['OBJECT'] = header.get('OBJECT', '').strip()
     for kw in ('BMAJ', 'BMIN', 'BPA', 'TELESCOP', 'RESTFRQ'):
         if kw in header:
@@ -2147,8 +2190,9 @@ def collapse_cube(
     # ------------------------------------------------------------------
     if region_radius_arcmin is not None:
         radius_pix = region_radius_arcmin / 60.0 / pixel_scale_deg
-        if region_x is not None and region_y is not None:
-            cx_reg, cy_reg = float(region_x), float(region_y)
+        if region_x is not None or region_y is not None:
+            cx_reg = float(region_x) if region_x is not None else nx / 2.0
+            cy_reg = float(region_y) if region_y is not None else ny / 2.0
         elif region_ra is not None and region_dec is not None:
             cx_reg, cy_reg = _radec_to_pix(region_ra, region_dec)
             print(f"  Region centre RA={region_ra:.5f}° Dec={region_dec:.5f}° "
@@ -2236,7 +2280,12 @@ def collapse_cube(
 
     def _vminmax(data):
         lo, hi = percentile_clip if percentile_clip is not None else (0, 100)
-        vmin_p = 0.0 if suppress_negative else np.nanpercentile(data, lo)
+        # suppress_negative forces vmin=0 only for moment0: peak-intensity values
+        # are always positive, so vmin=0 would compress the noise floor to black.
+        if suppress_negative and mode == 'moment0':
+            vmin_p = 0.0
+        else:
+            vmin_p = np.nanpercentile(data, lo)
         vmax_p = np.nanpercentile(data, hi)
         return vmin_p, vmax_p
 
@@ -2270,7 +2319,7 @@ def collapse_cube(
                        norm=norm, interpolation='nearest')
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
-        fig.colorbar(im, ax=ax, label='K km/s', fraction=0.046, pad=0.04)
+        fig.colorbar(im, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
 
     _hex_scatters = []  # (scatter, spacing_pix, ax) — sizes updated after tight_layout
 
@@ -2306,7 +2355,7 @@ def collapse_cube(
         _hex_scatters.append((sc, spacing, ax))
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
-        fig.colorbar(sc, ax=ax, label='K km/s', fraction=0.046, pad=0.04)
+        fig.colorbar(sc, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
 
     def _contour_map(ax, data, title, wcs_proj=None, cmap=colormap):
         vmin_p, vmax_p = _vminmax(data)
@@ -2318,7 +2367,7 @@ def collapse_cube(
                         origin='lower', transform=tf)
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
-        fig.colorbar(cs, ax=ax, label='K km/s', fraction=0.046, pad=0.04)
+        fig.colorbar(cs, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
 
     def _plot_map(ax, data, title, wcs_proj=None, cmap=colormap):
         if hex_plot:

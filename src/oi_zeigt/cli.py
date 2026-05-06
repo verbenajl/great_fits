@@ -1461,6 +1461,14 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     help="Remove all rows whose OBSMODE exactly matches one of these comma-separated values "
          "(e.g. --exclude-obsmode BSAB,OTFSWB). TSYS and TAU_SIG rows are always kept."
 )
+@click.option(
+    "--couple-tau-tsys",
+    "couple_tau_tsys",
+    is_flag=True,
+    default=False,
+    help="Add TSYS_INDEX and TAU_SIG_INDEX columns to the clean output if they are not already "
+         "present (same pairing logic used by prepare_for_pca)."
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
                 nan_threshold: float, output_clean: Optional[str],
                 output_rejected: Optional[str], remove: Optional[str],
@@ -1469,7 +1477,7 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
                 spectrum_peak_threshold: Optional[float], filter_tau: bool,
                 filter_flight: tuple, filter_object_exact: Optional[str],
                 filter_out_object_exact: Optional[str],
-                exclude_obsmode: Optional[str]):
+                exclude_obsmode: Optional[str], couple_tau_tsys: bool):
     """
     Filter FITS data by object, NaN content, all-zero spectra, and/or column values.
     
@@ -1661,6 +1669,33 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             exclude_obsmode=exclude_obsmode_list,
         )
         
+        # Optionally add TSYS_INDEX / TAU_SIG_INDEX to the clean output
+        if couple_tau_tsys:
+            from astropy.io import fits as fits_lib
+            from .pca_analysis.prepare_for_pca import build_tau_tsys_indices
+            with fits_lib.open(clean_path) as hdul_c:
+                tbl = hdul_c[1]
+                if 'TSYS_INDEX' in tbl.data.dtype.names and 'TAU_SIG_INDEX' in tbl.data.dtype.names:
+                    click.echo("--couple-tau-tsys: TSYS_INDEX/TAU_SIG_INDEX already present, skipping.")
+                else:
+                    click.echo("--couple-tau-tsys: building TSYS_INDEX and TAU_SIG_INDEX columns...")
+                    tsys_idx, tau_idx = build_tau_tsys_indices(tbl.data, object)
+                    col_list = []
+                    for name in tbl.data.dtype.names:
+                        col_list.append(fits_lib.Column(
+                            name=name,
+                            format=tbl.columns[name].format,
+                            array=tbl.data[name],
+                        ))
+                    col_list.append(fits_lib.Column(name='TSYS_INDEX',    format='J', array=tsys_idx))
+                    col_list.append(fits_lib.Column(name='TAU_SIG_INDEX', format='J', array=tau_idx))
+                    new_tbl = fits_lib.BinTableHDU.from_columns(col_list, header=tbl.header)
+                    fits_lib.HDUList([fits_lib.PrimaryHDU(), new_tbl]).writeto(
+                        clean_path, overwrite=True, checksum=False
+                    )
+                    n_sci = int(np.sum(tsys_idx >= 0))
+                    click.echo(f"  Coupled {n_sci} science spectra to TSYS/TAU_SIG.")
+
         # Get statistics before closing
         from astropy.io import fits as fits_lib
         hdul_clean = fits_lib.open(clean_path)
@@ -3869,7 +3904,9 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
                    'from the fit. If not given, no baseline is applied.')
 @click.option('--filter-flight', 'filter_flight', type=str, multiple=True,
               help='Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated.')
-def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, output, refill_telluric, baseline_order, filter_flight):
+@click.option('--aor-id', 'aor_id', type=str, default=None,
+              help='Keep only rows whose AOR_ID contains one of these substrings (comma-separated, e.g. 506,507).')
+def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, output, refill_telluric, baseline_order, filter_flight, aor_id):
     """
     Post-process spectra: optionally baseline-subtract, then compute per-spectrum RMS.
 
@@ -3974,6 +4011,17 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                 click.echo(f"  Removed flight: {mid}")
             click.echo(f"Flight filter: removed {int(np.sum(~keep_mask))} rows ({len(data)} → {int(np.sum(keep_mask))})")
             data = data[keep_mask]
+
+        if aor_id is not None and 'AOR_ID' in data.dtype.names:
+            terms = [t.strip() for t in aor_id.split(',') if t.strip()]
+            aor_id_col = np.array([
+                s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                for s in data['AOR_ID']
+            ])
+            aor_mask = np.array([any(t in a for t in terms) for a in aor_id_col])
+            matched = sorted(set(aor_id_col[aor_mask].tolist()))
+            click.echo(f"AOR_ID filter {terms}: {int(np.sum(aor_mask))}/{len(data)} rows kept, matched: {matched}")
+            data = data[aor_mask]
 
         n_spectra = len(data)
 
@@ -4321,10 +4369,25 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
 @click.option('--mask-radius', type=float, default=None,
               help='Radius in arcminutes of the circular display mask. '
                    'Pixels outside this circle are set to NaN in the plot.')
+@click.option('--mode', default='moment0', show_default=True,
+              type=click.Choice(['moment0', 'peak-intensity'], case_sensitive=False),
+              help='Collapse mode. moment0: integrated intensity (K km/s). '
+                   'peak-intensity: brightest channel within the velocity window (K). '
+                   'Tip: for peak-intensity, use --percentile-clip 0 98 (or --suppress-high) '
+                   'to prevent noisy edge pixels from dominating the colour scale.')
+@click.option('--peak-range-int', 'peak_range_channels',
+              is_flag=False, flag_value=5, default=None, type=int, metavar='N',
+              help='Integrate N channels on each side of the per-pixel peak channel '
+                   '(window = 2N+1 channels), producing a K km/s map. '
+                   'If given without a number, N defaults to 5. '
+                   'Overrides --mode.')
 @click.option('--suppress-negative', is_flag=True, default=False,
               help='Set vmin=0 in the colour scale, clipping negative (noise) values to the '
                    'bottom. Gives physically correct scaling for moment-0 maps where signal '
                    'is always positive.')
+@click.option('--suppress-high', type=float, default=None, metavar='VALUE',
+              help='Clip pixels with values above VALUE to VALUE. Useful for suppressing '
+                   'bright artefacts that compress the colour scale.')
 @click.option('--hex-plot', is_flag=True, default=False,
               help='Display the map as a hexagonal scatter plot sampled on a beam/2 hex grid, '
                    'similar to PyStructure.')
@@ -4354,7 +4417,8 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
                       region_radius_arcmin, use_wcs,
                       plot, fits_output, no_show, colormap,
                       coverage_threshold, mask_ra, mask_dec, mask_radius,
-                      suppress_negative, hex_plot, contour, stretch,
+                      mode, peak_range_channels, suppress_negative, suppress_high,
+                      hex_plot, contour, stretch,
                       noise_map_output, smooth_sigma, percentile_clip,
                       snr_threshold):
     """
@@ -4399,6 +4463,9 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
         mask_ra_deg  = _parse_angle(mask_ra,  is_ra=True)
         mask_dec_deg = _parse_angle(mask_dec, is_ra=False)
 
+        if peak_range_channels is not None:
+            mode = 'peak-range-int'
+
         click.echo(f"Collapsing cube: {cube_fits}")
         if velocity_range:
             click.echo(f"  Velocity range: {velocity_range[0]:.1f} – {velocity_range[1]:.1f} km/s")
@@ -4440,7 +4507,10 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             mask_ra=mask_ra_deg,
             mask_dec=mask_dec_deg,
             mask_radius_arcmin=mask_radius,
+            mode=mode,
+            peak_range_channels=peak_range_channels if peak_range_channels is not None else 5,
             suppress_negative=suppress_negative,
+            suppress_high=suppress_high,
             hex_plot=hex_plot,
             contour=contour,
             stretch=stretch,

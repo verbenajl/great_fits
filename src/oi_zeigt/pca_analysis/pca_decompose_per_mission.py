@@ -540,8 +540,9 @@ def main_cli():
         help="Verbose output"
     )
     parser.add_argument(
-        "--plot-components",
+        "--plot",
         action="store_true",
+        dest="plot_components",
         help="Generate visualization plots of PCA components"
     )
     

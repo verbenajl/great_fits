@@ -139,3 +139,77 @@ oi-zeigt collapse_cube cube_class_style.fits \
   ≈ 1.054 × beam` (a 5.4% broadening, noted in the source comments).
 - The `--smooth` and `--snr-threshold` options in `collapse_cube` are useful
   post-gridding workarounds regardless of which kernel convention is used.
+
+---
+
+## CLASS source: annotated `xymap.f90` excerpt
+
+Source file: `~/gildas-src-apr25a/packages/class/lib/map/xymap.f90`
+
+This is the code executed by `go view` (and `xy_map`) that sets pixel size and
+kernel FWHM.
+
+### Pixel size (lines 930–955)
+
+```fortran
+if (xymap_user%cell(1).ne.0.0) then
+   ! User defined
+   map%cell(1) = xymap_user%cell(1)*rad_per_sec
+else
+   ! Default: Nyquist sampling — pixel = resolution / 2
+   map%cell(1) = -map%reso(1)/2.0
+endif
+```
+
+The pixel size (`CELL`) defaults to `reso/2` (Nyquist).  If the user sets `CELL`
+explicitly in CLASS before calling `go view`, that value is used directly.
+
+### Kernel FWHM (lines 958–986)
+
+```fortran
+if ((map%reso(1)**2-map%beam**2).gt.(map%beam**2/9.0)) then
+   ! User defined: back-calculate from requested output resolution
+   fwhm(1) = sqrt(map%reso(1)**2-map%beam**2)
+else
+   ! Default: beam/3.0
+   fwhm(1) = map%beam/3.0
+   map%reso(1) = sqrt(map%beam**2+fwhm(1)**2)   ! effective reso ≈ 1.054*beam
+endif
+```
+
+The kernel FWHM is not set directly.  It is derived from the requested output
+`RESOLUTION`:
+
+- If `RESOLUTION` implies a kernel larger than `beam/3` (i.e.
+  `reso² − beam² > beam²/9`), CLASS back-calculates
+  `fwhm = sqrt(reso² − beam²)`.
+- Otherwise the default `fwhm = beam/3` is used, and the effective output
+  resolution becomes `sqrt(beam² + (beam/3)²) ≈ 1.054 × beam` (a 5.4%
+  broadening).
+
+Support radius defaults to `3 × fwhm` (lines 992–1000).
+
+### Kernel function parameters (lines 1002–1009)
+
+```fortran
+map%conv%x%parm(1) = map%support(1) / abs(map%cell(1))          ! support in pixels
+map%conv%x%parm(2) = fwhm(1) / (2*sqrt(log(2.0))) / abs(map%cell(1))  ! σ in pixels
+map%conv%x%parm(3) = 2                                           ! Gaussian exponent
+map%conv%x%ctype   = ctype_exponential   ! kernel = exp(-(r/σ)^2)
+```
+
+The kernel is a pure Gaussian `exp(-(r/σ)²)` where σ is derived from the FWHM
+by `σ = fwhm / (2 √ln2)`.  The `ctype_exponential` with `parm(3)=2` is
+mathematically identical to a Gaussian — the `_exponential` name refers to the
+general form `exp(-(r/σ)^n)`, with `n=2` being the Gaussian special case.
+
+### User-facing `go view` parameters
+
+| CLASS parameter | Maps to          | Default             |
+|-----------------|------------------|---------------------|
+| `CELL`          | pixel size       | `reso / 2` (Nyquist)|
+| `RESOLUTION`    | output reso → kernel FWHM via `sqrt(reso²−beam²)` | `beam` → kernel FWHM = `beam/3` |
+| `SUPPORT`       | convolution support radius | `3 × fwhm` |
+
+There is no direct `FWHM` parameter in `go view` — the kernel width is
+controlled indirectly through `RESOLUTION`.

@@ -18,6 +18,95 @@ from astropy.io import fits
 logger = logging.getLogger(__name__)
 
 
+def build_tau_tsys_indices(data, object_filter: str):
+    """
+    Build TSYS_INDEX and TAU_SIG_INDEX arrays for a FITS BinTable data array.
+
+    For each science spectrum (rows whose OBJECT contains *object_filter*) finds
+    the best-matching TSYS / TAU_SIG row within the same (MISSION_ID, SCAN) group:
+      1. Pattern match  : calibration SUBSCAN == science SUBSCAN - 1
+      2. Temporal nearest: closest by UT or LST timestamp
+      3. First-in-group : fallback of last resort
+
+    Returns int32 arrays of length len(data); unmatched rows have value -1.
+    """
+    def _to_str(s):
+        return s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+
+    objects     = np.array([_to_str(s) for s in data['OBJECT']])
+    mission_ids = np.array([_to_str(s) for s in data['MISSION_ID']])
+
+    tsys_indices    = np.full(len(data), -1, dtype=np.int32)
+    tau_sig_indices = np.full(len(data), -1, dtype=np.int32)
+
+    has_ut  = 'UT'  in data.dtype.names
+    has_lst = 'LST' in data.dtype.names
+    time_col = 'UT' if has_ut else ('LST' if has_lst else None)
+
+    tsys_lookup    = {}
+    tau_sig_lookup = {}
+
+    for idx in range(len(data)):
+        obj = objects[idx]
+        if obj in ('TSYS', 'TAU_SIG'):
+            key     = (mission_ids[idx], data['SCAN'][idx])
+            subscan = data['SUBSCAN'][idx]
+            timestamp = None
+            if time_col:
+                try:
+                    timestamp = float(data[time_col][idx])
+                except Exception:
+                    pass
+            entry = (subscan, idx, timestamp)
+            if obj == 'TSYS':
+                tsys_lookup.setdefault(key, []).append(entry)
+            else:
+                tau_sig_lookup.setdefault(key, []).append(entry)
+
+    logger.info(f"Found {len(tsys_lookup)} TSYS groups and {len(tau_sig_lookup)} TAU_SIG groups")
+
+    n_tsys_linked = n_tsys_fallback = n_tau_linked = n_tau_fallback = 0
+
+    for idx in range(len(data)):
+        if object_filter not in objects[idx]:
+            continue
+        key        = (mission_ids[idx], data['SCAN'][idx])
+        sci_sub    = data['SUBSCAN'][idx]
+        sci_ts     = None
+        if time_col:
+            try:
+                sci_ts = float(data[time_col][idx])
+            except Exception:
+                pass
+
+        def _best(lookup, idx_arr, n_linked, n_fallback):
+            entries = lookup.get(key)
+            if not entries:
+                return n_linked, n_fallback
+            pattern = [e for e in entries if e[0] == sci_sub - 1]
+            if pattern:
+                idx_arr[idx] = pattern[0][1]
+                return n_linked + 1, n_fallback
+            if sci_ts is not None and any(e[2] is not None for e in entries):
+                valid = [e for e in entries if e[2] is not None]
+                nearest = min(valid, key=lambda e: abs(e[2] - sci_ts))
+                idx_arr[idx] = nearest[1]
+            else:
+                idx_arr[idx] = entries[0][1]
+            return n_linked, n_fallback + 1
+
+        n_tsys_linked,  n_tsys_fallback = _best(tsys_lookup,    tsys_indices,    n_tsys_linked,  n_tsys_fallback)
+        n_tau_linked,   n_tau_fallback  = _best(tau_sig_lookup,  tau_sig_indices, n_tau_linked,   n_tau_fallback)
+
+    sci_total = int(np.sum([object_filter in o for o in objects]))
+    logger.info(f"Linked {n_tsys_linked}/{sci_total} science spectra to TSYS (pattern-aware)")
+    logger.info(f"Linked {n_tsys_fallback}/{sci_total} science spectra to TSYS (fallback)")
+    logger.info(f"Linked {n_tau_linked}/{sci_total} science spectra to TAU_SIG (pattern-aware)")
+    logger.info(f"Linked {n_tau_fallback}/{sci_total} science spectra to TAU_SIG (fallback)")
+
+    return tsys_indices, tau_sig_indices
+
+
 def _default_mission_params_file() -> Path:
     """Return the bundled mission_id_parameters.yml path."""
     return Path(__file__).parent / 'mission_id_parameters.yml'
@@ -418,127 +507,7 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         
         # Create index columns for linking science spectra to TSYS and TAU_SIG
         logger.info("Creating TSYS and TAU_SIG index columns...")
-        
-        # Initialize index columns with -1 (indicating no match)
-        tsys_indices = np.full(len(filtered_data), -1, dtype=np.int32)
-        tau_sig_indices = np.full(len(filtered_data), -1, dtype=np.int32)
-        
-        # Build structured lookup for TSYS and TAU_SIG with subscan info
-        # Structure: {(mission_id, scan) -> [(subscan, idx, ut_time), ...]}
-        tsys_lookup = {}  # (mission_id, scan) -> [(subscan, idx, ut_time), ...]
-        tau_sig_lookup = {}  # (mission_id, scan) -> [(subscan, idx, ut_time), ...]
-        
-        # Check if UT or LST columns exist for temporal fallback
-        has_ut_col = 'UT' in filtered_data.dtype.names
-        has_lst_col = 'LST' in filtered_data.dtype.names
-        time_col = 'UT' if has_ut_col else ('LST' if has_lst_col else None)
-        
-        for idx in range(len(filtered_data)):
-            obj = filtered_objects[idx]
-            if obj in ('TSYS', 'TAU_SIG'):
-                key = (filtered_mission_ids[idx], filtered_data['SCAN'][idx])
-                subscan = filtered_data['SUBSCAN'][idx]
-                
-                # Build timestamp for temporal fallback (UT or LST in fractional days)
-                timestamp = None
-                if time_col:
-                    try:
-                        timestamp = float(filtered_data[time_col][idx])
-                    except:
-                        pass
-                
-                entry = (subscan, idx, timestamp)
-                
-                if obj == 'TSYS':
-                    if key not in tsys_lookup:
-                        tsys_lookup[key] = []
-                    tsys_lookup[key].append(entry)
-                else:  # TAU_SIG
-                    if key not in tau_sig_lookup:
-                        tau_sig_lookup[key] = []
-                    tau_sig_lookup[key].append(entry)
-        
-        logger.info(f"Found {len(tsys_lookup)} TSYS groups and {len(tau_sig_lookup)} TAU_SIG groups")
-        
-        # Link science spectra to TSYS and TAU_SIG
-        n_tsys_linked = 0
-        n_tsys_fallback = 0
-        n_tau_sig_linked = 0
-        n_tau_sig_fallback = 0
-
-        for idx in range(len(filtered_data)):
-            if object_filter in filtered_objects[idx]:  # any science source matching object_filter
-                key = (filtered_mission_ids[idx], filtered_data['SCAN'][idx])
-                sci_subscan = filtered_data['SUBSCAN'][idx]
-                m51_timestamp = None
-                
-                if time_col:
-                    try:
-                        m51_timestamp = float(filtered_data[time_col][idx])
-                    except:
-                        pass
-                
-                # Link to TSYS using pattern-aware matching
-                if key in tsys_lookup and len(tsys_lookup[key]) > 0:
-                    # Pattern-aware: look for TSYS with subscan = M51CENTER_subscan - 1
-                    tsys_entries = tsys_lookup[key]
-                    
-                    # First try: exact pattern match (TSYS subscan = M51CENTER subscan - 1)
-                    pattern_matches = [entry for entry in tsys_entries if entry[0] == sci_subscan - 1]
-                    
-                    if pattern_matches:
-                        # Use the first pattern match
-                        tsys_indices[idx] = pattern_matches[0][1]
-                        n_tsys_linked += 1
-                        logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TSYS idx={pattern_matches[0][1]} subscan={pattern_matches[0][0]} (pattern match)")
-                    else:
-                        # Fallback: use nearest TSYS by time if available, else use first TSYS
-                        if m51_timestamp is not None and any(entry[2] is not None for entry in tsys_entries):
-                            # Find TSYS with closest timestamp
-                            valid_entries = [e for e in tsys_entries if e[2] is not None]
-                            nearest = min(valid_entries, key=lambda e: abs(e[2] - m51_timestamp))
-                            tsys_indices[idx] = nearest[1]
-                            n_tsys_fallback += 1
-                            logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TSYS idx={nearest[1]} subscan={nearest[0]} (temporal fallback)")
-                        else:
-                            # Last resort: use first TSYS in group
-                            tsys_indices[idx] = tsys_entries[0][1]
-                            n_tsys_fallback += 1
-                            logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TSYS idx={tsys_entries[0][1]} subscan={tsys_entries[0][0]} (first match fallback)")
-                
-                # Link to TAU_SIG using pattern-aware matching
-                if key in tau_sig_lookup and len(tau_sig_lookup[key]) > 0:
-                    # Pattern-aware: look for TAU_SIG with subscan = M51CENTER_subscan - 1
-                    tau_sig_entries = tau_sig_lookup[key]
-                    
-                    # First try: exact pattern match (TAU_SIG subscan = M51CENTER subscan - 1)
-                    pattern_matches = [entry for entry in tau_sig_entries if entry[0] == sci_subscan - 1]
-                    
-                    if pattern_matches:
-                        # Use the first pattern match
-                        tau_sig_indices[idx] = pattern_matches[0][1]
-                        n_tau_sig_linked += 1
-                        logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TAU_SIG idx={pattern_matches[0][1]} subscan={pattern_matches[0][0]} (pattern match)")
-                    else:
-                        # Fallback: use nearest TAU_SIG by time if available, else use first TAU_SIG
-                        if m51_timestamp is not None and any(entry[2] is not None for entry in tau_sig_entries):
-                            # Find TAU_SIG with closest timestamp
-                            valid_entries = [e for e in tau_sig_entries if e[2] is not None]
-                            nearest = min(valid_entries, key=lambda e: abs(e[2] - m51_timestamp))
-                            tau_sig_indices[idx] = nearest[1]
-                            n_tau_sig_fallback += 1
-                            logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TAU_SIG idx={nearest[1]} subscan={nearest[0]} (temporal fallback)")
-                        else:
-                            # Last resort: use first TAU_SIG in group
-                            tau_sig_indices[idx] = tau_sig_entries[0][1]
-                            n_tau_sig_fallback += 1
-                            logger.debug(f"Science idx={idx} obj={filtered_objects[idx]} subscan={sci_subscan} -> TAU_SIG idx={tau_sig_entries[0][1]} subscan={tau_sig_entries[0][0]} (first match fallback)")
-        
-        sci_total = int(np.sum([object_filter in o for o in filtered_objects]))
-        logger.info(f"Linked {n_tsys_linked}/{sci_total} science spectra to TSYS (pattern-aware)")
-        logger.info(f"Linked {n_tsys_fallback}/{sci_total} science spectra to TSYS (fallback)")
-        logger.info(f"Linked {n_tau_sig_linked}/{sci_total} science spectra to TAU_SIG (pattern-aware)")
-        logger.info(f"Linked {n_tau_sig_fallback}/{sci_total} science spectra to TAU_SIG (fallback)")
+        tsys_indices, tau_sig_indices = build_tau_tsys_indices(filtered_data, object_filter)
         
         # Add the index columns to filtered_data by extending the table
         # Build column list from filtered data arrays
