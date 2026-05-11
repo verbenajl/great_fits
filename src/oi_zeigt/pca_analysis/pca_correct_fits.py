@@ -368,7 +368,8 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
                           good_channels_fit, good_channels_sub,
                           cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size,
                           use_lstsq=False,
-                          cut_coefficients=0):
+                          cut_coefficients=0,
+                          per_component_cutoffs=None):
     """
     Pure-function PCA correction for one spectrum.
 
@@ -389,20 +390,21 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
     component_info = {}
 
     # Pre-compute spectrum_std once (used identically for every component).
-    spec_masked = spectrum[good_channels_fit]
+    # Smooth the full spectrum first, then restrict to good channels — matches
+    # legacy pca_correct.py which convolved new_spec before masking.
     if smoothing_kernel_size and smoothing_kernel_size > 0:
         sk = np.ones(smoothing_kernel_size) / smoothing_kernel_size
-        nan_mask = np.isnan(spec_masked)
+        nan_mask = np.isnan(spectrum)
         if np.any(nan_mask):
             valid_idx = np.where(~nan_mask)[0]
-            s4s = spec_masked.copy()
+            s4s = spectrum.copy()
             if len(valid_idx) > 0:
-                s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spec_masked[valid_idx])
+                s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spectrum[valid_idx])
         else:
-            s4s = spec_masked
-        spectrum_std = np.nanstd(np.convolve(s4s, sk, mode='same'))
+            s4s = spectrum
+        spectrum_std = np.nanstd(np.convolve(s4s, sk, mode='same')[good_channels_fit])
     else:
-        spectrum_std = np.nanstd(spec_masked)
+        spectrum_std = np.nanstd(spectrum[good_channels_fit])
 
     # Pass 1: apply all cutoffs (variance, coefficient, noise ratio) using the
     # original coefficients from the full-set fit.  Collect the smoothed
@@ -422,17 +424,12 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
             continue
 
         # Coefficient cutoff: skip if projection onto this spectrum is negligible.
-        # Normalised by spectrum_std so the threshold is dimensionless (in sigma)
-        # and has consistent meaning across datasets with different noise levels.
-        if cut_coefficients and spectrum_std > 0 and abs(coeff[i]) / spectrum_std < float(cut_coefficients):
+        # Raw coefficient threshold in antenna-temperature units, matching legacy
+        # pca_correct.py: abs(coeff[j]) < cut_coefficients.
+        if cut_coefficients and abs(coeff[i]) < float(cut_coefficients):
             component_info[i] = {'used': False, 'reason': 'cut_coefficients',
                                  'coeff': coeff[i], 'variance': var_ratio}
             continue
-
-        # Smooth component — matches original pyclass smooth_pca_components().
-        # Done at correction time so kernel can be varied without re-decomposing.
-        if smoothing_kernel_size and smoothing_kernel_size > 0:
-            comp = np.convolve(comp, sk, mode='same')
 
         # Noise ratio: component_std on ALL channels (matches original pyclass).
         # spectrum_std already computed above (shared across all components).
@@ -454,12 +451,19 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
                                  'coeff': coeff[i], 'noise_ratio': noise_ratio}
             continue
 
-        effective_cutoff = cutoff_noise_ratio
+        # Per-component cutoffs from KDE take priority over the scalar fallback.
+        # np.nan → globally rejected; np.inf → no cutoff; float → threshold.
+        if per_component_cutoffs is not None and i < len(per_component_cutoffs):
+            effective_cutoff = per_component_cutoffs[i]
+        else:
+            effective_cutoff = cutoff_noise_ratio
 
-        if effective_cutoff is not None and noise_ratio > effective_cutoff:
-            component_info[i] = {'used': False, 'reason': 'noise_ratio_cutoff',
-                                 'coeff': coeff[i], 'noise_ratio': noise_ratio}
-            continue
+        if effective_cutoff is not None:
+            ec = float(effective_cutoff)
+            if np.isnan(ec) or (np.isfinite(ec) and noise_ratio > ec):
+                component_info[i] = {'used': False, 'reason': 'noise_ratio_cutoff',
+                                     'coeff': coeff[i], 'noise_ratio': noise_ratio}
+                continue
 
         survivors.append((i, comp, var_ratio, noise_ratio))
 
@@ -514,26 +518,25 @@ def _compute_group_noise_ratios(spectra, good_channels_list, components, smoothi
         if not np.any(gcf):
             continue
         coeff = np.dot(components[:, gcf], spectrum[gcf]) if not np.all(gcf) else np.dot(components, spectrum)
-        spec_masked = spectrum[gcf]
 
         sk = None
         if smoothing_kernel_size and smoothing_kernel_size > 0:
             sk = np.ones(smoothing_kernel_size) / smoothing_kernel_size
 
-        for i, comp in enumerate(components):
-            comp_w = np.convolve(comp, sk, mode='same') if sk is not None else comp
-            component_std = np.nanstd(coeff[i] * comp_w)
+        # Smooth full spectrum then restrict to good channels — matches legacy order.
+        if sk is not None:
+            nan_mask = np.isnan(spectrum)
+            s4s = spectrum.copy()
+            if np.any(nan_mask):
+                valid_idx = np.where(~nan_mask)[0]
+                if len(valid_idx) > 0:
+                    s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spectrum[valid_idx])
+            spectrum_std = np.nanstd(np.convolve(s4s, sk, mode='same')[gcf])
+        else:
+            spectrum_std = np.nanstd(spectrum[gcf])
 
-            if sk is not None:
-                nan_mask = np.isnan(spec_masked)
-                s4s = spec_masked.copy()
-                if np.any(nan_mask):
-                    valid_idx = np.where(~nan_mask)[0]
-                    if len(valid_idx) > 0:
-                        s4s[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, spec_masked[valid_idx])
-                spectrum_std = np.nanstd(np.convolve(s4s, sk, mode='same'))
-            else:
-                spectrum_std = np.nanstd(spec_masked)
+        for i, comp in enumerate(components):
+            component_std = np.nanstd(coeff[i] * comp)
 
             eps = 1e-15
             if not np.isfinite(component_std) or component_std < eps:
@@ -727,6 +730,7 @@ def _pca_spectrum_worker(args):
     """
     args_base = args[:6]
     idx, spectrum, gcf, gcs, mission_id, telescope = args_base
+    per_component_cutoffs = args[6] if len(args) > 6 else None
     s = _pca_worker_state
     try:
         if s['mission_decompositions'] and mission_id is not None:
@@ -771,6 +775,7 @@ def _pca_spectrum_worker(args):
             s['cutoff_variance'], s['cutoff_noise_ratio'], s['smoothing_kernel_size'],
             use_lstsq=s.get('use_lstsq', False),
             cut_coefficients=s.get('cut_coefficients', 0),
+            per_component_cutoffs=per_component_cutoffs,
         )
 
         # Log mask coverage (debug level — too verbose for normal runs)
@@ -997,15 +1002,28 @@ class PCACorrector:
                     
                     # Look for telescope pattern: LFAH_PX##_S or LFAV_PX##_S
                     # The mission_id is everything before the telescope code, INCLUDING the date
+                    known_receivers = ['LFAH', 'LFAI', 'LFAV', 'LFBI', 'LFBH', 'HFAV',
+                                       '4G1', '4G2', '4G3', '4G4']
                     for i in range(len(parts) - 1, -1, -1):
-                        if parts[i] in ['LFAH', 'LFAI', 'LFAV', 'LFBI', 'LFBH']:
+                        if parts[i] in known_receivers:
                             # Found telescope type
                             if i + 2 < len(parts) and parts[i+1].startswith('PX') and parts[i+2] == 'S':
                                 # Reconstruct mission_id with the date at the front
                                 mission_id = date_str + '_' + '_'.join(parts[:i])
                                 telescope = '_'.join(parts[i:i+3])  # LFAH_PX00_S
                                 break
-                
+
+                    # If date parsed but no known receiver found, check for unknown RECV_PX##_S pattern
+                    if telescope is None:
+                        for i in range(len(parts) - 2, -1, -1):
+                            if (i + 2 < len(parts) and parts[i+1].startswith('PX')
+                                    and parts[i+2] == 'S' and parts[i] not in known_receivers):
+                                logger.error(
+                                    f"Unknown receiver '{parts[i]}' in {filename}. "
+                                    f"Add it to known_receivers in load_decompositions_from_dir."
+                                )
+                                sys.exit(1)
+
                 # Fallback for old YYYYMMDD format
                 if flight_date is None:
                     parts = base.split('_')
@@ -1070,6 +1088,9 @@ class PCACorrector:
         PCACorrector or dict
             Decomposition for this mission/telescope, or None if not found
         """
+        if not mission_decompositions:
+            return None
+
         # Try exact match first: (mission_id, telescope)
         key_tuple = (mission_id, telescope)
         if key_tuple in mission_decompositions:
@@ -1148,22 +1169,27 @@ class PCACorrector:
         scaled_comp_masked = coeff * comp_for_noise
         component_std = np.nanstd(scaled_comp_masked)
 
-        # Spectrum std on the masked channels, with optional smoothing
+        # Spectrum std: smooth the full spectrum first, then restrict to good
+        # channels — matches legacy pca_correct.py order of operations.
         if smoothing_kernel_size and smoothing_kernel_size > 0:
-            nan_mask = np.isnan(spec_for_noise)
+            nan_mask = np.isnan(spectrum)
             if np.any(nan_mask):
                 valid_idx = np.where(~nan_mask)[0]
                 if len(valid_idx) > 0:
-                    s4s = spec_for_noise.copy()
+                    s4s = spectrum.copy()
                     s4s[nan_mask] = np.interp(
-                        np.where(nan_mask)[0], valid_idx, spec_for_noise[valid_idx]
+                        np.where(nan_mask)[0], valid_idx, spectrum[valid_idx]
                     )
                 else:
-                    s4s = spec_for_noise
+                    s4s = spectrum
             else:
-                s4s = spec_for_noise
+                s4s = spectrum
             kernel = np.ones(smoothing_kernel_size) / smoothing_kernel_size
-            spectrum_std = np.nanstd(np.convolve(s4s, kernel, mode='same'))
+            smoothed = np.convolve(s4s, kernel, mode='same')
+            if good_channels is not None and not np.all(good_channels):
+                spectrum_std = np.nanstd(smoothed[good_channels])
+            else:
+                spectrum_std = np.nanstd(smoothed)
         else:
             spectrum_std = np.nanstd(spec_for_noise)
 
@@ -2175,6 +2201,7 @@ class PCACorrector:
                             self.smoothing_kernel_size,
                             use_lstsq=self.use_lstsq,
                             cut_coefficients=cut_coefficients,
+                            per_component_cutoffs=per_spectrum_cutoffs[spec_idx],
                         )
                         corrected = _spec_full.copy()
                         corrected[_ch_first:_ch_last + 1] = corrected_slice

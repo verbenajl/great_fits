@@ -1,0 +1,172 @@
+PCA parameter behaviour — deferred fixes
+=========================================
+
+[x] Fix double-smoothing of PCA components in the new fits-based pipeline.
+
+    Problem:
+      pca_decompose_per_mission.py smooths components at decompose time and
+      stores the smoothed versions in the DecompositionResult pickle.
+      _pca_apply_correction() (pca_correct_fits.py) then smooths the loaded
+      components a second time before subtraction.  This means the effective
+      kernel is applied twice.
+
+    Desired behaviour (matches legacy pyclass):
+      Components are smoothed exactly once.  In the legacy path this happened
+      at decompose time (PCADecomposition.smooth_pca_components()).  At
+      correction time only the spectrum was additionally smoothed, and only
+      for the noise-ratio comparison — the component was used as-is.
+
+    Fix options:
+      a) Remove component smoothing from _pca_apply_correction() and rely on
+         the components already being smoothed in the pickle (decompose-time
+         smoothing only).  PCACorrector.get_noise_ratio() already follows this
+         pattern and should be kept as the reference implementation.
+      b) Remove component smoothing from pca_decompose_per_mission.py and keep
+         it only in _pca_apply_correction() (correction-time smoothing only).
+         This matches the comment at pca_correct_fits.py line 432 ("done at
+         correction time so kernel can be varied without re-decomposing").
+
+    Either option (a) or (b) is acceptable.  Choose one and apply it
+    consistently across all decompose and correct entry points.
+
+[x] Fix order-of-operations for spectrum smoothing in the noise-ratio
+    computation (smoothing_kernel_size).
+
+    Problem:
+      Legacy pca_correct.py smooths the full spectrum first, then applies the
+      channel mask to compute the noise std:
+        new_smoothed_spec = np.convolve(new_spec, kernel, mode="same")
+        noise = ma.std(ma.masked_array(new_smoothed_spec, threshold))
+      _pca_apply_correction() (pca_correct_fits.py) instead extracts the
+      good-channel subset first and then smooths that shorter array:
+        spec_masked = spectrum[good_channels_fit]
+        spectrum_std = np.nanstd(np.convolve(spec_masked, sk, mode='same'))
+      With mode='same', convolving a shorter array pads implicitly at its
+      boundaries.  Channels within kernel_size/2 of a mask edge are therefore
+      computed differently from the legacy path.
+
+    Desired behaviour (matches legacy pyclass):
+      Smooth the full spectrum with the boxcar kernel, then restrict to the
+      good-channel region when computing the std.
+
+    Fix:
+      In _pca_apply_correction() and _compute_group_noise_ratios(), apply
+      np.convolve to the full spectrum before indexing with good_channels_fit.
+
+[ ] [LOW PRIORITY] Restore rolling_noise_window diagnostic in component plots.
+
+    Problem:
+      The legacy pca_decompose.py computes a per-component "global structure"
+      score (component.std() / mean(rolling_rms_noise)) using rolling_noise_window
+      and displays it as a label on each component panel in the correction plots.
+      In the new fits-based path, rolling_noise_window is read from config in
+      decompose.py (line 118) but never used — the diagnostic is absent from
+      the new component plots.
+      Note: this parameter has no effect on the correction itself in either
+      path (scale_to_running_noise(), which would use it, is commented out in
+      the legacy code).
+
+    Fix:
+      Compute the global structure score in pca_decompose_per_mission.py or
+      DecompositionResult and carry it through to the component plot labels
+      in pca_correct_fits.py, mirroring pca_correct.py lines 179-193.
+
+[ ] [MARGINAL] noise_cutoff — parameter present in new code but is a no-op.
+
+    Context:
+      In the legacy path (pca_decompose.py lines 293-307), noise_cutoff gates
+      detect_if_line_is_present() at decompose time: non-sky spectra mixed into
+      the PCA input whose line window exceeds noise_cutoff * noise_std by more
+      than channel_line_width channels are dropped from the decomposition.
+      SKY-DIFF and SKYCHOPDIFF are always kept regardless.
+      In the new fits-based path the parameter is parsed into DecompositionConfig
+      but never acted upon.
+
+    Why marginal:
+      The new path uses only SKYCHOPDIFF spectra for decomposition; noise_cutoff
+      only ever filtered non-sky (science) spectra.  Since science spectra are
+      not mixed into the new decomposition input, no correction behaviour is
+      lost.  Only relevant if non-sky spectra are ever added to the input set.
+
+[ ] [MARGINAL] scramble — dead code in both legacy and new paths.
+
+    Context:
+      InputSpectra.scramble_spectra() (pca_decompose.py lines 56-62) alternates
+      signs and applies a random scaling factor to each input spectrum before
+      decomposition.  Intended as a validation tool: scrambled input should
+      yield noise-only components, confirming the PCA framework is not injecting
+      structure.  The parameter is parsed from config and command line in both
+      paths, and scramble: bool = False exists in DecompositionConfig (decompose.py
+      line 57), but it is never passed when InputSpectra() is instantiated
+      (pca_decompose.py line 256) and never acted upon in the new fits path.
+      Effectively unfinished in the legacy code and not ported to the new path.
+
+    Fix (if desired):
+      Wire scramble through from config into InputSpectra() in the legacy path,
+      and implement the equivalent randomisation in pca_decompose_per_mission.py
+      for the new path.
+
+[x] Fix noise_ratio_cutoff: adaptive per-component cutoff path missing in new code.
+
+    Two related problems, both needed to match legacy pca_correct.py behaviour.
+
+    Problem 1 — adaptive cutoff path not implemented:
+      Legacy logic (pca_correct.py lines 1409-1420):
+        - global_noise_ratio_cutoff == 0  → no per-spectrum cutoff at all
+        - global_noise_ratio_cutoff != 0 AND noise_ratio_cutoff == 0
+            → adaptive per-component cutoff: center[j] + 3 * dev[j] from KDE
+        - global_noise_ratio_cutoff != 0 AND noise_ratio_cutoff != 0
+            → fixed scalar threshold for all components
+      New code (pca_correct_fits.py line 1432):
+        effective_cutoff_noise_ratio = cutoff_noise_ratio if global_noise_ratio_cutoff else None
+      When global_noise_ratio_cutoff is set but noise_ratio_cutoff is 0/None,
+      the new code passes None → no cutoff applied.  The adaptive path is absent.
+
+    Problem 2 — per-component KDE cutoffs computed but never wired into correction:
+      _derive_component_cutoffs() correctly returns a per-component array and
+      it is stored in per_spectrum_cutoffs (pca_correct_fits.py line 2046).
+      However:
+        - Sequential path (line 2190): passes effective_cutoff_noise_ratio
+          (scalar) to _pca_apply_correction(), ignoring per_spectrum_cutoffs.
+        - Parallel path (line 2077): per_spectrum_cutoffs[spec_idx] is packed
+          into phase3_args as args[6], but _pca_spectrum_worker reads only
+          args[:6] (line 728) and discards it, using s['cutoff_noise_ratio']
+          (scalar) instead.
+      The KDE-derived per-component cutoffs only reach the plots, never the
+      correction itself.
+
+    Fix:
+      a) In _pca_apply_correction(), replace the scalar cutoff_noise_ratio with
+         a per-component array (or list) so each component can have its own
+         threshold.  Pass None/inf for components with no cutoff.
+      b) In the sequential path, pass per_spectrum_cutoffs[spec_idx] (the
+         per-component array) instead of the scalar effective_cutoff_noise_ratio.
+      c) In the parallel path, update _pca_spectrum_worker to read args[6] as
+         the per-component cutoff array and pass it to _pca_apply_correction().
+      d) Implement the adaptive fallback: when global_noise_ratio_cutoff is set
+         but noise_ratio_cutoff is 0/None, derive the per-component cutoffs from
+         the KDE (center + 3*dev) as the legacy code does.
+
+[x] Fix cut_coefficients: normalisation differs between legacy and new code.
+
+    Problem:
+      Legacy pca_correct.py (line 1422-1425) compares the raw coefficient:
+        coefficient_cutoff = abs(coeff[j]) < float(config["cut_coefficients"])
+      The threshold is in the same physical units as the data (antenna temperature).
+      New _pca_apply_correction() (pca_correct_fits.py line 427) normalises by
+      spectrum_std before comparing:
+        abs(coeff[i]) / spectrum_std < float(cut_coefficients)
+      The threshold is dimensionless (in units of sigma).
+      The same numerical value (e.g. 0.1) produces completely different behaviour
+      in the two paths and cannot be used interchangeably.
+
+    Note:
+      The parameter is marked EXPERIMENTAL in M51_pca_reduction.toml and is
+      disabled (false/0) in both the M51 config and the command-line default.
+      Keep it disabled in production until the scaling is resolved.
+
+    Fix:
+      Change _pca_apply_correction() to use the raw coefficient comparison
+      without normalisation, matching legacy pca_correct.py:
+        abs(coeff[i]) < float(cut_coefficients)
+      The original pyclass default value is 0.1 (in antenna temperature units).
