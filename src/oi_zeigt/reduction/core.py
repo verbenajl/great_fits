@@ -800,9 +800,13 @@ def filter_and_save_fits(hdul: fits.HDUList,
             pos_mask = old_vals >= 0
             if np.any(pos_mask):
                 ins = np.searchsorted(keys, old_vals[pos_mask])
-                valid = (ins < len(keys)) & (keys[ins] == old_vals[pos_mask])
+                # Clip before indexing: searchsorted may return len(keys) for
+                # values past the end, and NumPy evaluates both sides of &
+                # before masking, so keys[ins] would be out of bounds without it.
+                ins_safe = np.minimum(ins, len(keys) - 1)
+                valid = (ins < len(keys)) & (keys[ins_safe] == old_vals[pos_mask])
                 tmp = np.full(int(np.sum(pos_mask)), -1, dtype=np.int32)
-                tmp[valid] = vals[ins[valid]]
+                tmp[valid] = vals[ins_safe[valid]]
                 new_vals[pos_mask] = tmp
         arr[col_name] = new_vals
 
