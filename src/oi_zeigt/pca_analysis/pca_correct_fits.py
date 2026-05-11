@@ -263,26 +263,33 @@ def get_velocity_window_channels(velocity_axis, window_km_s, tolerance=1.0):
     return (min(ch_min, ch_max), max(ch_min, ch_max))
 
 
-def load_mission_parameters(mission_id):
+def load_mission_parameters(mission_id, yaml_path=None):
     """
     Load mission-specific parameters from YAML file.
-    
+
     Parameters
     ----------
     mission_id : str
         Mission identifier (e.g., '2017-02-01_GR_F367')
-    
+    yaml_path : str or Path, optional
+        Path to the YAML file.  When None, falls back to the bundled
+        mission_id_parameters.yml in the package directory.
+
     Returns
     -------
     dict
         Mission parameters including telluric_line_center and telluric_line_width
     """
-    yaml_file = Path(__file__).parent / 'mission_id_parameters.yml'
-    
+    if yaml_path:
+        yaml_file = Path(yaml_path)
+    else:
+        yaml_file = Path(__file__).parent / 'mission_id_parameters.yml'
+
     if not yaml_file.exists():
         logger.warning(f"Mission parameters file not found: {yaml_file}")
         return {}
-    
+
+    logger.info(f"Loading mission parameters from {yaml_file}")
     try:
         with open(yaml_file, 'r') as f:
             config = yaml.safe_load(f)
@@ -300,10 +307,10 @@ def load_mission_parameters(mission_id):
         return {}
 
 
-def get_telluric_line_mask(mission_id, velocity_axis_kms, n_spectra):
+def get_telluric_line_mask(mission_id, velocity_axis_kms, n_spectra, yaml_path=None):
     """
     Create a mask for telluric lines based on mission-specific parameters.
-    
+
     Parameters
     ----------
     mission_id : str
@@ -312,13 +319,16 @@ def get_telluric_line_mask(mission_id, velocity_axis_kms, n_spectra):
         Velocity axis in km/s (already converted from m/s)
     n_spectra : int
         Number of spectra
-    
+    yaml_path : str or Path, optional
+        Path to the mission parameters YAML file.  Passed through to
+        load_mission_parameters(); defaults to the bundled file.
+
     Returns
     -------
     ndarray or None
         Boolean mask array of shape (n_spectra, len(velocity_axis_kms)) where True = line region
     """
-    params = load_mission_parameters(mission_id)
+    params = load_mission_parameters(mission_id, yaml_path=yaml_path)
     
     if not params or 'telluric_line_center' not in params:
         return None
@@ -811,7 +821,8 @@ class PCACorrector:
                  n_components=None,
                  line_kernel_size=51, line_cutoff_std=2.0,
                  smoothing_kernel_size=None, line_window_velocities=None,
-                 use_lstsq=False, force_line_window=False):
+                 use_lstsq=False, force_line_window=False,
+                 mission_params_file=None):
         """
         Initialize PCA corrector with decomposition results.
 
@@ -840,6 +851,7 @@ class PCACorrector:
         self.line_window_velocities = line_window_velocities
         self.use_lstsq = use_lstsq
         self.force_line_window = force_line_window
+        self.mission_params_file = mission_params_file
         
         self.decomposition = self._load_decomposition(decomposition_pkl)
         self.pca = self.decomposition.pca if hasattr(self.decomposition, 'pca') else None
@@ -1614,7 +1626,8 @@ class PCACorrector:
                     for mid in np.unique(mission_ids):
                         if mid == "UNKNOWN":
                             continue
-                        mid_result = get_telluric_line_mask(mid, velocity_axis_kms, 1)
+                        mid_result = get_telluric_line_mask(mid, velocity_axis_kms, 1,
+                                                            yaml_path=self.mission_params_file)
                         if mid_result is not None:
                             channel_mask = mid_result[0]
                             mask_array[mission_ids == mid] = channel_mask
@@ -3560,6 +3573,7 @@ Examples:
     config_line_kernel_size = 51
     config_line_cutoff_std = 2.0
     config_smoothing_kernel = None
+    config_mission_params_file = None
     
     try:
         config_path = Path(args.config)
@@ -3648,6 +3662,10 @@ Examples:
                     config_cut_coefficients = float(cut_coeff_val)
                 except (ValueError, TypeError):
                     config_cut_coefficients = 0
+
+            # Check [pca] then [input] then fall back to bundled file.
+            config_mission_params_file = (pca_config.get('mission_parameters')
+                                          or config.get('input', {}).get('mission_parameters'))
             
             logger.debug(f"PCA plots directory from config: {config_plot_dir}")
             if config_input_file:
@@ -3825,6 +3843,7 @@ Examples:
                 line_window_velocities=line_window_velocities,
                 use_lstsq=use_lstsq,
                 force_line_window=force_line_window,
+                mission_params_file=config_mission_params_file,
             )
             mission_decompositions_to_use = None
         else:
@@ -3856,6 +3875,7 @@ Examples:
                     line_window_velocities=line_window_velocities,
                     use_lstsq=use_lstsq,
                     force_line_window=force_line_window,
+                    mission_params_file=config_mission_params_file,
                 )
             finally:
                 # Clean up temp file

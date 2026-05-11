@@ -455,6 +455,9 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
         if fill_noise:
             # Fill telluric lines with Gaussian noise (parallelized)
             logger.info("Filling telluric lines with Gaussian noise...")
+            _yml_used = (Path(mission_params_file) if mission_params_file
+                         else _default_mission_params_file())
+            logger.info(f"  Mission parameters file: {_yml_used}")
 
             # Pre-cache mission parameters — avoids re-parsing the YAML file for every spectrum
             unique_mission_ids = list(set(filtered_mission_ids))
@@ -632,10 +635,11 @@ def prepare_for_pca(fits_file: Optional[str] = None,
             parameters_cfg = cfg.get('parameters', {})
             object_filter = parameters_cfg.get('object', 'M51CENTER')
 
-        # Get mission parameters file (optional)
+        # Get mission parameters file (optional).
+        # Check [pca] then [input] so both config styles work.
         if not mission_params_file:
-            pca_cfg = cfg.get('pca', {})
-            mission_params_file = pca_cfg.get('mission_parameters', None)
+            mission_params_file = (cfg.get('pca', {}).get('mission_parameters')
+                                   or cfg.get('input', {}).get('mission_parameters'))
     
     # Validate required parameters
     if not fits_file:

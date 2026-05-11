@@ -72,6 +72,7 @@
 #   # This option writes out line free spectra with a new line name
 #   # "SELF-PCA" to be used in a second decompose/correct step
 #    create_self_pca = false
+#
 
 
 [decompose]

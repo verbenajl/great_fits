@@ -640,8 +640,15 @@ def main_cli():
         # Load mission-specific parameters from mission_id_parameters.yml
         mission_line_windows = {}
         try:
-            mission_yml = Path(__file__).parent / "mission_id_parameters.yml"
+            # Check [pca] then [input] then fall back to bundled file.
+            _mission_params_path = (pca_config.get('mission_parameters')
+                                    or config.get('input', {}).get('mission_parameters'))
+            if _mission_params_path:
+                mission_yml = Path(_mission_params_path)
+            else:
+                mission_yml = Path(__file__).parent / "mission_id_parameters.yml"
             if mission_yml.exists():
+                logger.info(f"Loading mission parameters from {mission_yml}")
                 import yaml
                 with open(mission_yml, 'r') as f:
                     mission_params = yaml.safe_load(f) or {}

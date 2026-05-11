@@ -966,8 +966,15 @@ def main_cli():
         logger.info(f"Loading configuration from {args.config}")
         config = ConfigLoader(args.config)
         
-        # Load mission-specific parameters from mission_id_parameters.yml
-        mission_yml = Path(__file__).parent / "mission_id_parameters.yml"
+        # Load mission-specific parameters: config [pca][mission_parameters] takes
+        # priority; bundled mission_id_parameters.yml is used as fallback.
+        # Check [pca] then [input] then fall back to bundled file.
+        _mission_params_path = (config.get('pca', {}).get('mission_parameters')
+                                or config.get('input', {}).get('mission_parameters'))
+        if _mission_params_path:
+            mission_yml = Path(_mission_params_path)
+        else:
+            mission_yml = Path(__file__).parent / "mission_id_parameters.yml"
         if mission_yml.exists():
             logger.info(f"Loading mission parameters from {mission_yml}")
             config.load_missions(mission_yml)
