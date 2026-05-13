@@ -2319,7 +2319,7 @@ def collapse_cube(
                        norm=norm, interpolation='nearest')
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
-        fig.colorbar(im, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
+        return fig.colorbar(im, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
 
     _hex_scatters = []  # (scatter, spacing_pix, ax) — sizes updated after tight_layout
 
@@ -2355,27 +2355,26 @@ def collapse_cube(
         _hex_scatters.append((sc, spacing, ax))
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
-        fig.colorbar(sc, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
+        return fig.colorbar(sc, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
 
     def _contour_map(ax, data, title, wcs_proj=None, cmap=colormap):
         vmin_p, vmax_p = _vminmax(data)
         levels = np.linspace(vmin_p, vmax_p, 10)
-        # Replace NaN with vmin so contour doesn't choke on masked edges
         data_filled = np.where(np.isfinite(data), data, vmin_p)
         tf = ax.get_transform('pixel') if wcs_proj is not None else ax.transData
         cs = ax.contour(data_filled, levels=levels, cmap=cmap,
                         origin='lower', transform=tf)
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
-        fig.colorbar(cs, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
+        return fig.colorbar(cs, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
 
     def _plot_map(ax, data, title, wcs_proj=None, cmap=colormap):
         if hex_plot:
-            _hexplot_map(ax, data, title, wcs_proj, cmap)
+            return _hexplot_map(ax, data, title, wcs_proj, cmap)
         elif contour:
-            _contour_map(ax, data, title, wcs_proj, cmap)
+            return _contour_map(ax, data, title, wcs_proj, cmap)
         else:
-            _imshow_map(ax, data, title, wcs_proj, cmap)
+            return _imshow_map(ax, data, title, wcs_proj, cmap)
 
     def _plot_spec(ax, vel, spec, title, color='steelblue'):
         ax.plot(vel, spec, color=color, linewidth=1.0)
@@ -2389,18 +2388,20 @@ def collapse_cube(
             ax.legend(fontsize=8)
 
     # Full map
-    _plot_map(ax_full, collapsed_display, title_base, wcs_proj=wcs2d_obj)
+    _cb_full = [_plot_map(ax_full, collapsed_display, title_base, wcs_proj=wcs2d_obj)]
+    _cb_zoom = [None]
 
     # Zoom box on full map + zoom panel
+    _zoom_rect = [None]   # mutable ref so the interactive handler can replace it
     if has_zoom:
         pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
-        ax_full.add_patch(Rectangle(
+        _zoom_rect[0] = ax_full.add_patch(Rectangle(
             (x0 - 0.5, y0 - 0.5), x1 - x0, y1 - y0,
             linewidth=1.5, edgecolor='white', facecolor='none',
             linestyle='--', transform=pix_tf_full))
-        _plot_map(ax_zoom, zoomed,
-                  f"Zoom centre  {zoom_size_arcmin:.1f}′ × {zoom_size_arcmin:.1f}′",
-                  wcs_proj=wcs2d_zoom)
+        _cb_zoom[0] = _plot_map(ax_zoom, zoomed,
+                                f"Zoom centre  {zoom_size_arcmin:.1f}′ × {zoom_size_arcmin:.1f}′",
+                                wcs_proj=wcs2d_zoom)
 
     # Circle overlay on full map (and zoom map if active)
     if has_region:
@@ -2445,6 +2446,337 @@ def collapse_cube(
             hex_r_pt = spacing * pts_per_data / np.sqrt(3)
             s = max(1.0, (3 * np.sqrt(3) / 2) * hex_r_pt ** 2)
             sc.set_sizes([s] * len(sc.get_offsets()))
+
+    # ------------------------------------------------------------------
+    # Interactive: click on the zoom map to show the pixel spectrum
+    # in the bottom-right panel and mark the pixel with a circle.
+    # ------------------------------------------------------------------
+    if has_zoom:
+        _click_circle = [None]   # mutable slot for the current marker patch
+        # Shared zoom bounds — updated when the user redefines the zoom region.
+        _zb = {'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1}
+        # Last pixel selected by clicking on a map panel.
+        _selected_pixel = {'px': None, 'py': None}
+        # Current velocity range — updated by clicking the spectrum panels.
+        _vr = {
+            'v_min': float(v_min) if velocity_range is not None else float(channels_kms[0]),
+            'v_max': float(v_max) if velocity_range is not None else float(channels_kms[-1]),
+        }
+
+        def _on_zoom_click(event):
+            if event.inaxes is not ax_zoom or event.xdata is None:
+                return
+            px_zoom = int(round(event.xdata))
+            py_zoom = int(round(event.ydata))
+            px_cube = px_zoom + _zb['x0']
+            py_cube = py_zoom + _zb['y0']
+            if not (0 <= px_cube < nx and 0 <= py_cube < ny):
+                return
+
+            # _show_pixel_spectrum is defined later but called at event time — ok.
+            _show_pixel_spectrum(px_cube, py_cube)
+
+            # Circle on zoom map
+            if _click_circle[0] is not None:
+                _click_circle[0].remove()
+            pix_tf = ax_zoom.get_transform('pixel') if use_wcs else ax_zoom.transData
+            c = Circle((px_zoom, py_zoom), radius=0.5,
+                       linewidth=2.0, edgecolor='white', facecolor='none',
+                       transform=pix_tf)
+            ax_zoom.add_patch(c)
+            _click_circle[0] = c
+
+            # Mirror circle on the full map
+            if _full_circle[0] is not None:
+                try:
+                    _full_circle[0].remove()
+                except Exception:
+                    pass
+            pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
+            cf = Circle((px_cube, py_cube), radius=0.5,
+                        linewidth=2.0, edgecolor='white', facecolor='none',
+                        transform=pix_tf_full)
+            ax_full.add_patch(cf)
+            _full_circle[0] = cf
+
+            fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('button_press_event', _on_zoom_click)
+
+        # Interactive: full-map clicks.
+        #   Left click  (button 1) — show pixel spectrum + circle (same as zoom map)
+        #   Right click (button 3) — define new zoom region by two opposite corners
+        _corner_clicks = []
+        _corner_marker = [None]
+        _full_circle   = [None]   # circle marker on the full map
+
+        def _show_pixel_spectrum(px_cube, py_cube):
+            """Shared helper: update ax_spec_reg with the spectrum at (px_cube, py_cube)."""
+            _selected_pixel['px'] = px_cube
+            _selected_pixel['py'] = py_cube
+            spec = cube[:, py_cube, px_cube]
+            ax_spec_reg.set_visible(True)
+            ax_spec_reg.cla()
+            ax_spec_reg.set_axis_on()
+            ax_spec_reg.plot(channels_kms, spec, color='tomato', linewidth=1.0)
+            ax_spec_reg.set_xlabel('Velocity (km/s)')
+            ax_spec_reg.set_ylabel('T$_A^*$ (K)')
+            ax_spec_reg.axhline(0, color='gray', linewidth=0.5, linestyle=':')
+            ax_spec_reg.axvspan(_vr['v_min'], _vr['v_max'], alpha=0.15, color='tomato',
+                                label=f"{_vr['v_min']:.0f}–{_vr['v_max']:.0f} km/s")
+            ax_spec_reg.legend(fontsize=8)
+            title_str = f'Pixel ({px_cube}, {py_cube})'
+            try:
+                sky = wcs2d.pixel_to_world(px_cube, py_cube)
+                ra_str  = sky.ra.to_string(unit='hourangle', sep=':', precision=1)
+                dec_str = sky.dec.to_string(sep=':', precision=0, alwayssign=True)
+                title_str += f'\n{ra_str}  {dec_str}'
+            except Exception:
+                pass
+            ax_spec_reg.set_title(title_str, fontsize=9)
+
+        def _on_full_click(event):
+            if event.inaxes is not ax_full or event.xdata is None:
+                return
+            px = int(round(event.xdata))
+            py = int(round(event.ydata))
+            if not (0 <= px < nx and 0 <= py < ny):
+                return
+
+            if event.button == 1:
+                # Left click: show pixel spectrum and mark with a circle
+                _show_pixel_spectrum(px, py)
+
+                # Circle on the full map
+                if _full_circle[0] is not None:
+                    _full_circle[0].remove()
+                pix_tf = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
+                c = Circle((px, py), radius=0.5,
+                           linewidth=2.0, edgecolor='white', facecolor='none',
+                           transform=pix_tf)
+                ax_full.add_patch(c)
+                _full_circle[0] = c
+
+                # Also mark on zoom map if the pixel falls within the zoom region
+                if _click_circle[0] is not None:
+                    try:
+                        _click_circle[0].remove()
+                    except Exception:
+                        pass
+                    _click_circle[0] = None
+                if (_zb['x0'] <= px < _zb['x1'] and _zb['y0'] <= py < _zb['y1']):
+                    pix_tf_z = ax_zoom.get_transform('pixel') if use_wcs else ax_zoom.transData
+                    cz = Circle((px - _zb['x0'], py - _zb['y0']), radius=0.5,
+                                linewidth=2.0, edgecolor='white', facecolor='none',
+                                transform=pix_tf_z)
+                    ax_zoom.add_patch(cz)
+                    _click_circle[0] = cz
+
+                fig.canvas.draw_idle()
+
+            elif event.button == 3:
+                # Right click: corner selection for zoom region redefinition
+                _corner_clicks.append((px, py))
+
+                if len(_corner_clicks) == 1:
+                    if _corner_marker[0] is not None:
+                        _corner_marker[0].remove()
+                    pix_tf = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
+                    m, = ax_full.plot(px, py, '+', color='yellow',
+                                      markersize=12, markeredgewidth=2,
+                                      transform=pix_tf)
+                    _corner_marker[0] = m
+                    fig.canvas.draw_idle()
+
+                elif len(_corner_clicks) == 2:
+                    (px0, py0), (px1, py1) = _corner_clicks
+                    new_x0 = max(0, min(px0, px1))
+                    new_x1 = min(nx, max(px0, px1) + 1)
+                    new_y0 = max(0, min(py0, py1))
+                    new_y1 = min(ny, max(py0, py1) + 1)
+
+                    _corner_clicks.clear()
+                    if _corner_marker[0] is not None:
+                        _corner_marker[0].remove()
+                        _corner_marker[0] = None
+
+                    if new_x1 <= new_x0 or new_y1 <= new_y0:
+                        fig.canvas.draw_idle()
+                        return
+
+                    _zb['x0'] = new_x0
+                    _zb['y0'] = new_y0
+                    _zb['x1'] = new_x1
+                    _zb['y1'] = new_y1
+
+                    new_zoomed    = collapsed_display[new_y0:new_y1, new_x0:new_x1]
+                    new_zoom_spec = np.nanmean(cube[:, new_y0:new_y1, new_x0:new_x1],
+                                               axis=(1, 2))
+
+                    if _zoom_rect[0] is not None:
+                        _zoom_rect[0].remove()
+                    pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
+                    _zoom_rect[0] = ax_full.add_patch(Rectangle(
+                        (new_x0 - 0.5, new_y0 - 0.5),
+                        new_x1 - new_x0, new_y1 - new_y0,
+                        linewidth=1.5, edgecolor='white', facecolor='none',
+                        linestyle='--', transform=pix_tf_full))
+
+                    if _cb_zoom[0] is not None:
+                        _cb_zoom[0].remove()
+                    ax_zoom.cla()
+                    _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
+                                            f"Zoom ({new_x0}:{new_x1}, {new_y0}:{new_y1})")
+
+                    ax_spec_zoom.cla()
+                    _plot_spec(ax_spec_zoom, channels_kms, new_zoom_spec,
+                               'Mean spectrum — zoom')
+
+                    if _click_circle[0] is not None:
+                        try:
+                            _click_circle[0].remove()
+                        except Exception:
+                            pass
+                        _click_circle[0] = None
+
+                    fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('button_press_event', _on_full_click)
+
+        # Interactive: click on a spectrum panel to set velocity-range edges.
+        # First click draws an orange dashed line; second click recollapses the cube.
+        _vel_clicks  = []
+        _vel_markers = []   # list of axvline handles (one per visible spectrum panel)
+
+        def _recompute_velocity_range(new_v_min, new_v_max):
+            _vr['v_min'] = new_v_min
+            _vr['v_max'] = new_v_max
+            new_chan_mask = (channels_kms >= new_v_min) & (channels_kms <= new_v_max)
+            if not np.any(new_chan_mask):
+                return
+            new_deltav = abs(cdelt3) / 1e3
+            if mode == 'peak-intensity':
+                new_col = np.nanmax(cube[new_chan_mask], axis=0).astype(np.float32)
+            else:
+                new_col = (np.nansum(cube[new_chan_mask], axis=0) * new_deltav).astype(np.float32)
+            new_col_disp = new_col.copy()
+            new_col_disp[display_mask] = np.nan
+            if suppress_negative:
+                new_col_disp[np.isfinite(new_col_disp) & (new_col_disp < 0)] = 0.0
+            if suppress_high is not None:
+                new_col_disp[np.isfinite(new_col_disp) & (new_col_disp > suppress_high)] = suppress_high
+            if smooth_sigma is not None and smooth_sigma > 0:
+                from astropy.convolution import Gaussian2DKernel, convolve as _conv
+                new_col_disp = _conv(new_col_disp, Gaussian2DKernel(x_stddev=smooth_sigma),
+                                     boundary='fill', fill_value=np.nan,
+                                     nan_treatment='interpolate',
+                                     preserve_nan=True).astype(np.float32)
+
+            new_title = f"{title_base}  [{new_v_min:.0f}–{new_v_max:.0f} km/s]"
+
+            # Redraw full map
+            if _cb_full[0] is not None:
+                _cb_full[0].remove()
+            ax_full.cla()
+            _cb_full[0] = _plot_map(ax_full, new_col_disp, new_title, wcs_proj=wcs2d_obj)
+            pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
+            _zoom_rect[0] = ax_full.add_patch(Rectangle(
+                (_zb['x0'] - 0.5, _zb['y0'] - 0.5),
+                _zb['x1'] - _zb['x0'], _zb['y1'] - _zb['y0'],
+                linewidth=1.5, edgecolor='white', facecolor='none',
+                linestyle='--', transform=pix_tf_full))
+            _full_circle[0] = None
+            if _selected_pixel['px'] is not None:
+                c = Circle((_selected_pixel['px'], _selected_pixel['py']), radius=0.5,
+                           linewidth=2.0, edgecolor='white', facecolor='none',
+                           transform=pix_tf_full)
+                ax_full.add_patch(c)
+                _full_circle[0] = c
+
+            # Redraw zoom map
+            if _cb_zoom[0] is not None:
+                _cb_zoom[0].remove()
+            new_zoomed = new_col_disp[_zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
+            ax_zoom.cla()
+            _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
+                                    f"Zoom ({_zb['x0']}:{_zb['x1']}, {_zb['y0']}:{_zb['y1']})")
+            _click_circle[0] = None
+            if (_selected_pixel['px'] is not None and
+                    _zb['x0'] <= _selected_pixel['px'] < _zb['x1'] and
+                    _zb['y0'] <= _selected_pixel['py'] < _zb['y1']):
+                px_z = _selected_pixel['px'] - _zb['x0']
+                py_z = _selected_pixel['py'] - _zb['y0']
+                pix_tf_z = ax_zoom.get_transform('pixel') if use_wcs else ax_zoom.transData
+                cz = Circle((px_z, py_z), radius=0.5,
+                            linewidth=2.0, edgecolor='white', facecolor='none',
+                            transform=pix_tf_z)
+                ax_zoom.add_patch(cz)
+                _click_circle[0] = cz
+
+            # Redraw zoom mean spectrum with updated velocity range
+            new_zoom_spec = np.nanmean(
+                cube[:, _zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']], axis=(1, 2))
+            ax_spec_zoom.cla()
+            ax_spec_zoom.plot(channels_kms, new_zoom_spec, color='steelblue', linewidth=1.0)
+            ax_spec_zoom.set_xlabel('Velocity (km/s)')
+            ax_spec_zoom.set_ylabel('Mean T$_A^*$ (K)')
+            ax_spec_zoom.set_title('Mean spectrum — zoom', fontsize=10)
+            ax_spec_zoom.axhline(0, color='gray', linewidth=0.5, linestyle=':')
+            ax_spec_zoom.axvspan(new_v_min, new_v_max, alpha=0.15, color='steelblue',
+                                 label=f'{new_v_min:.0f}–{new_v_max:.0f} km/s')
+            ax_spec_zoom.legend(fontsize=8)
+
+            # Redraw pixel spectrum if one is selected
+            if _selected_pixel['px'] is not None:
+                _show_pixel_spectrum(_selected_pixel['px'], _selected_pixel['py'])
+
+        def _on_spec_click(event):
+            if event.inaxes not in (ax_spec_zoom, ax_spec_reg) or event.xdata is None:
+                return
+            v = float(event.xdata)
+            _vel_clicks.append(v)
+
+            if len(_vel_clicks) == 1:
+                # First edge: orange dashed line on every visible spectrum panel
+                for line in _vel_markers:
+                    try:
+                        line.remove()
+                    except Exception:
+                        pass
+                _vel_markers.clear()
+                for ax in (ax_spec_zoom, ax_spec_reg):
+                    if ax.get_visible():
+                        _vel_markers.append(
+                            ax.axvline(v, color='orange', lw=1.5, linestyle='--', alpha=0.8))
+                fig.canvas.draw_idle()
+
+            elif len(_vel_clicks) == 2:
+                new_v_min = min(_vel_clicks)
+                new_v_max = max(_vel_clicks)
+                _vel_clicks.clear()
+                for line in _vel_markers:
+                    try:
+                        line.remove()
+                    except Exception:
+                        pass
+                _vel_markers.clear()
+                if new_v_min < new_v_max:
+                    _recompute_velocity_range(new_v_min, new_v_max)
+                fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('button_press_event', _on_spec_click)
+
+        # Show a hint in the bottom-right panel when no region was pre-defined
+        if not has_region:
+            ax_spec_reg.set_visible(True)
+            ax_spec_reg.set_axis_off()
+            ax_spec_reg.text(0.5, 0.5,
+                             'Left-click any map → pixel spectrum\n'
+                             'Right-click full map ×2 → redefine zoom\n\n'
+                             'Click spectrum ×2 → set velocity range',
+                             ha='center', va='center',
+                             transform=ax_spec_reg.transAxes,
+                             fontsize=9, color='gray', style='italic')
 
     if plot_output:
         fig.savefig(plot_output, dpi=150, bbox_inches='tight')

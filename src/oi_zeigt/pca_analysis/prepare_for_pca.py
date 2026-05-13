@@ -391,10 +391,22 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                 for mid, params in mission_params.items():
                     if not params:
                         continue
-                    drop_cfg = params.get('drop') or {}
+                    drop_val = params.get('drop')
+                    mid_mask = mission_ids == mid
+
+                    # drop: flight — remove every row for this mission/flight
+                    if drop_val == 'flight' or (
+                            isinstance(drop_val, dict) and drop_val.get('flight')):
+                        n = int(np.sum(mid_mask & combined_mask))
+                        if n:
+                            logger.info(f"  drop.flight: {mid} — dropping entire flight "
+                                        f"({n} rows)")
+                            combined_mask &= ~mid_mask
+                        continue
+
+                    drop_cfg = drop_val if isinstance(drop_val, dict) else {}
                     if not drop_cfg:
                         continue
-                    mid_mask = mission_ids == mid
                     if not np.any(mid_mask & combined_mask):
                         continue  # mission not present in current data, skip silently
 

@@ -3906,7 +3906,13 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
               help='Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated.')
 @click.option('--aor-id', 'aor_id', type=str, default=None,
               help='Keep only rows whose AOR_ID contains one of these substrings (comma-separated, e.g. 506,507).')
-def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, output, refill_telluric, baseline_order, filter_flight, aor_id):
+@click.option('--filter-missions', 'filter_missions', is_flag=True, default=False,
+              help='Apply telescope/scan drop rules from mission_id_parameters.yml '
+                   '(same rules as prepare_for_pca --filter-missions).')
+@click.option('--mission-parameters', 'mission_parameters', type=click.Path(), default=None,
+              help='Path to mission_id_parameters YAML. Overrides config [pca]/[input][mission_parameters].')
+def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, output, refill_telluric,
+                          baseline_order, filter_flight, aor_id, filter_missions, mission_parameters):
     """
     Post-process spectra: optionally baseline-subtract, then compute per-spectrum RMS.
 
@@ -4022,6 +4028,94 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
             matched = sorted(set(aor_id_col[aor_mask].tolist()))
             click.echo(f"AOR_ID filter {terms}: {int(np.sum(aor_mask))}/{len(data)} rows kept, matched: {matched}")
             data = data[aor_mask]
+
+        if filter_missions:
+            import yaml as _yaml
+            from pathlib import Path as _Path
+            from .pca_analysis.prepare_for_pca import _default_mission_params_file
+
+            if mission_parameters:
+                _yml_path = _Path(mission_parameters)
+            else:
+                _yml_path = (cfg.get('pca', {}).get('mission_parameters') or
+                             cfg.get('input', {}).get('mission_parameters'))
+                _yml_path = _Path(_yml_path) if _yml_path else _default_mission_params_file()
+
+            if not _yml_path.exists():
+                click.echo(click.style(f"Warning: mission YAML not found: {_yml_path} — skipping --filter-missions", fg='yellow'))
+            else:
+                click.echo(f"Applying mission drop rules from {_yml_path}")
+                with open(_yml_path, 'r') as _f:
+                    _mparams = _yaml.safe_load(_f) or {}
+
+                mission_ids_col = np.array([
+                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                    for s in data['MISSION_ID']
+                ]) if 'MISSION_ID' in data.dtype.names else None
+                scan_col = np.array(data['SCAN']) if 'SCAN' in data.dtype.names else None
+                telescop_col = np.array([
+                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                    for s in data['TELESCOP']
+                ]) if 'TELESCOP' in data.dtype.names else None
+
+                if mission_ids_col is not None:
+                    keep_mask = np.ones(len(data), dtype=bool)
+                    n_before = len(data)
+
+                    def _tele_match(tele):
+                        return np.array([t == tele or t.startswith(tele + '_')
+                                         for t in telescop_col])
+
+                    for mid, params in _mparams.items():
+                        if not params:
+                            continue
+                        drop_val = params.get('drop')
+                        mid_mask = mission_ids_col == mid
+
+                        # drop: flight — remove every row for this mission/flight
+                        if drop_val == 'flight' or (
+                                isinstance(drop_val, dict) and drop_val.get('flight')):
+                            n = int(np.sum(mid_mask & keep_mask))
+                            if n:
+                                click.echo(f"  drop.flight: {mid} — dropping entire flight "
+                                           f"({n} rows)")
+                                keep_mask &= ~mid_mask
+                            continue
+
+                        drop_cfg = drop_val if isinstance(drop_val, dict) else {}
+                        if not drop_cfg:
+                            continue
+                        if not np.any(mid_mask & keep_mask):
+                            continue
+
+                        for tele in (drop_cfg.get('telescope') or []):
+                            if telescop_col is not None:
+                                drop = keep_mask & mid_mask & _tele_match(tele)
+                                n = int(np.sum(drop))
+                                if n:
+                                    click.echo(f"  drop.telescope: {mid} / {tele} — removing {n} rows")
+                                    keep_mask &= ~drop
+
+                        scans_cfg = drop_cfg.get('scans') or {}
+                        if scans_cfg and scan_col is not None:
+                            for scan_num in (scans_cfg.get('complete') or []):
+                                drop = keep_mask & mid_mask & (scan_col == int(scan_num))
+                                n = int(np.sum(drop))
+                                if n:
+                                    click.echo(f"  drop.scans.complete: {mid} / scan {scan_num} — removing {n} rows")
+                                    keep_mask &= ~drop
+                            for tele, scan_list in ((scans_cfg.get('telescope') or {}).items()):
+                                if telescop_col is not None:
+                                    for scan_num in (scan_list or []):
+                                        drop = keep_mask & mid_mask & _tele_match(tele) & (scan_col == int(scan_num))
+                                        n = int(np.sum(drop))
+                                        if n:
+                                            click.echo(f"  drop.scans.telescope: {mid} / {tele} / scan {scan_num} — removing {n} rows")
+                                            keep_mask &= ~drop
+
+                    data = data[keep_mask]
+                    click.echo(f"Mission drop rules: {n_before} → {len(data)} rows "
+                               f"(removed {n_before - len(data)})")
 
         n_spectra = len(data)
 
@@ -4584,7 +4678,22 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
     default=False,
     help="Do not open the interactive plot window (useful with --output)."
 )
-def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, output, no_show):
+@click.option(
+    "--mask-telluric",
+    is_flag=True,
+    default=False,
+    help="Shade the telluric line region on each panel.  Reads the YAML path from "
+         "config [pca][mission_parameters] or [input][mission_parameters], "
+         "falling back to the bundled mission_id_parameters.yml."
+)
+@click.option(
+    "--telluric-file",
+    type=click.Path(),
+    default=None,
+    help="Path to mission_id_parameters YAML.  Implies --mask-telluric."
+)
+def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, output,
+                     no_show, mask_telluric, telluric_file):
     """
     Plot the averaged telluric spectrum per mission_id/telescop combination.
 
@@ -4672,6 +4781,53 @@ def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, out
         n_groups = len(sorted_keys)
         click.echo(f"Found {n_groups} missions with OBJECT='{target_obj}'")
 
+        # Load telluric mask ranges from YAML if requested
+        telluric_ranges = {}   # mission_id → (v_min_km/s, v_max_km/s)
+        if mask_telluric or telluric_file:
+            import yaml as _yaml
+            from pathlib import Path as _Path
+            from oi_zeigt.pca_analysis.prepare_for_pca import _default_mission_params_file
+
+            if telluric_file:
+                yaml_path = _Path(telluric_file)
+            else:
+                # Read path from config: [pca] then [input], then bundled fallback.
+                # Load cfg now if it wasn't already loaded (e.g. --fits was given directly).
+                yaml_path = None
+                _cfg_for_mask = cfg if 'cfg' in dir() else {}
+                if not _cfg_for_mask and config:
+                    try:
+                        import tomllib as _tl
+                    except ModuleNotFoundError:
+                        import tomli as _tl
+                    with open(config, 'rb') as _f:
+                        _cfg_for_mask = _tl.load(_f)
+                yaml_path = (_cfg_for_mask.get('pca', {}).get('mission_parameters') or
+                             _cfg_for_mask.get('input', {}).get('mission_parameters'))
+                if yaml_path:
+                    yaml_path = _Path(yaml_path)
+                else:
+                    yaml_path = _default_mission_params_file()
+
+            if yaml_path.exists():
+                click.echo(f"Telluric mask: reading from {yaml_path}")
+                with open(yaml_path, 'r') as _f:
+                    _mission_params = _yaml.safe_load(_f) or {}
+                for mission_key in sorted_keys:
+                    for yaml_key, params in _mission_params.items():
+                        if yaml_key and mission_key in yaml_key:
+                            if params and 'telluric_line_center' in params:
+                                center = float(params['telluric_line_center'])
+                                width  = float(params.get('telluric_line_width', 30))
+                                telluric_ranges[mission_key] = (center - width / 2,
+                                                                center + width / 2)
+                            break
+                click.echo(f"  Telluric ranges found for "
+                           f"{len(telluric_ranges)}/{n_groups} missions")
+            else:
+                click.echo(click.style(
+                    f"Warning: telluric YAML not found: {yaml_path}", fg="yellow"))
+
         # Layout: roughly square grid
         n_cols = min(4, n_groups)
         n_rows = _math.ceil(n_groups / n_cols)
@@ -4700,6 +4856,12 @@ def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, out
             ax.grid(True, alpha=0.3)
             ax.text(0.97, 0.95, f"n={len(indices)}",
                     transform=ax.transAxes, ha="right", va="top", fontsize=6)
+
+            if mission in telluric_ranges and vel_kms is not None:
+                t_min, t_max = telluric_ranges[mission]
+                ax.axvspan(t_min, t_max, alpha=0.25, color="orange", zorder=0,
+                           label=f"telluric {t_min:.0f}–{t_max:.0f} km/s")
+                ax.legend(fontsize=5, loc="upper left")
 
         # Hide unused axes
         for idx in range(n_groups, n_rows * n_cols):
