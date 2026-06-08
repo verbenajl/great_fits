@@ -4232,8 +4232,19 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
 
         # --- Optionally refill telluric channels with post-PCA noise ---
         if refill_telluric:
-            from .pca_analysis.prepare_for_pca import get_telluric_indices, load_mission_parameters
+            from pathlib import Path as _TPath
+            from .pca_analysis.prepare_for_pca import load_mission_parameters, _default_mission_params_file
             click.echo("Refilling telluric channels with post-PCA Gaussian noise...")
+            np.random.seed(42)
+
+            # Resolve mission parameters YAML — same priority as filter_missions block
+            if mission_parameters:
+                _tel_yml = _TPath(mission_parameters)
+            else:
+                _tel_yml_raw = (cfg.get('pca', {}).get('mission_parameters') or
+                                cfg.get('input', {}).get('mission_parameters'))
+                _tel_yml = _TPath(_tel_yml_raw) if _tel_yml_raw else _default_mission_params_file()
+            click.echo(f"  Mission parameters: {_tel_yml}")
 
             if 'MISSION_ID' not in data.dtype.names:
                 click.echo(click.style("Warning: MISSION_ID column not found — skipping telluric refill", fg='yellow'), err=True)
@@ -4249,8 +4260,9 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                 NON_SCIENCE = {'TSYS', 'TAU_SIG', 'SKYCHOPDIFF'}
                 science_mask = np.array([o not in NON_SCIENCE for o in objects_col])
 
-                unique_missions = list(set(mission_ids))
-                mission_params_cache = {mid: load_mission_parameters(mid) for mid in unique_missions}
+                unique_missions = sorted(set(mission_ids))
+                mission_params_cache = {mid: load_mission_parameters(mid, yaml_file=_tel_yml)
+                                        for mid in unique_missions}
 
                 n_refilled = 0
 
@@ -4264,14 +4276,19 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
 
                     idx = np.where((mission_ids == mid) & science_mask)[0]
 
-                    # Velocity axis reconstructed from VELOCITY/DELTAV/CRPIX1 (same for all spectra)
                     vel_kms = velocity_axis_kms
 
-                    telluric_mask = get_telluric_indices(mid, vel_kms)
-                    if telluric_mask is None or not np.any(telluric_mask):
+                    # Compute telluric mask directly from cached params (correct YAML already used)
+                    _center = params['telluric_line_center']
+                    _width  = params.get('telluric_line_width', 30)
+                    telluric_mask = ((vel_kms >= _center - _width / 2.0) &
+                                     (vel_kms <= _center + _width / 2.0))
+                    if not np.any(telluric_mask):
                         continue
 
                     n_tel = int(np.sum(telluric_mask))
+                    click.echo(f"  {mid}: center={_center} km/s  width={_width} km/s  "
+                               f"({n_tel} channels,  {len(idx)} science spectra)")
                     clean_mask = outside_mask & ~telluric_mask
 
                     # Vectorised: noise level per spectrum from clean channels
