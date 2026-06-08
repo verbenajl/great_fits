@@ -1941,9 +1941,11 @@ def collapse_cube(
     # ------------------------------------------------------------------
     deltav_kms = abs(cdelt3) / 1e3
     if mode == 'peak-intensity':
-        collapsed = np.nanmax(cube[chan_mask, :, :], axis=0).astype(np.float32)
+        collapsed = np.nanmax(cube, axis=0).astype(np.float32)
         _map_units = 'K'
         _map_label = 'Peak intensity (K)'
+        print(f"  Peak-intensity: full spectrum ({nvel} channels, "
+              f"{channels_kms.min():.1f} – {channels_kms.max():.1f} km/s)")
     elif mode == 'peak-range-int':
         sub = cube[chan_mask, :, :]          # (nchan_sel, ny, nx)
         nchan_sel = sub.shape[0]
