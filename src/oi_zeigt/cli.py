@@ -3528,6 +3528,17 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         else:
             output_file = output
 
+        # Extract unique PCAPARAM values from input before gridding
+        _pcapar_values = []
+        for _hdu in hdul:
+            if (hasattr(_hdu, 'data') and _hdu.data is not None
+                    and hasattr(_hdu.data, 'dtype')
+                    and 'PCAPARAM' in _hdu.data.dtype.names):
+                def _s(v): return v.decode('utf-8').strip() if isinstance(v, bytes) else str(v).strip()
+                _raw = [_s(v) for v in _hdu.data['PCAPARAM']]
+                _pcapar_values = sorted(set(_raw))
+                break
+
         # Create datacube
         from oi_zeigt.mapping.gridding import create_spectral_datacube
 
@@ -3548,6 +3559,15 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
             channel_weights=weight_channels,
             kernel_fwhm_arcsec=kernel_fwhm,
         )
+
+        # Write PCA parameters into the cube primary header
+        if _pcapar_values:
+            with fits.open(output_file, mode='update') as _out:
+                for _i, _val in enumerate(_pcapar_values):
+                    _key = f'PCAPAR{_i}'
+                    _out[0].header[_key] = (_val, 'PCA correction parameters')
+                _out.flush()
+            click.echo(f"  PCA parameters written to cube header ({len(_pcapar_values)} unique value(s))")
 
         click.echo(f"\n✓ Spectral datacube created")
         click.echo(f"  Beam size: {beamsize_deg:.4f}°")
@@ -4305,7 +4325,9 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                             spectra[row_idx][telluric_mask] = np.random.normal(0, nl, n_tel)
                             n_refilled += 1
 
-                click.echo(f"  Refilled telluric channels in {n_refilled} / {n_spectra} spectra")
+                n_cal = int(np.sum(~science_mask))
+                click.echo(f"  Refilled telluric channels in {n_refilled} science spectra "
+                           f"({n_cal} calibration rows skipped)")
                 # Write modified spectra back into the data array
                 data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
 
@@ -4925,43 +4947,63 @@ def print_pca_parameters(fits_path, config):
             sys.exit(1)
 
     click.echo(f"Reading: {fits_path}")
-    with fits.open(fits_path, memmap=True) as hdul:
-        data = None
-        for hdu in hdul:
-            if hasattr(hdu, 'data') and hdu.data is not None and hasattr(hdu.data, 'dtype'):
-                if 'PCAPARAM' in hdu.data.dtype.names:
-                    data = hdu.data
-                    break
-        if data is None:
-            click.echo("No PCAPARAM column found in this file.")
-            return
 
     def _s(v):
         return v.decode('utf-8').strip() if isinstance(v, bytes) else str(v).strip()
 
-    raw = np.array([_s(v) for v in data['PCAPARAM']])
-    unique_vals, counts = np.unique(raw, return_counts=True)
+    unique_vals = []
+    counts = []
+    source_label = ''
 
-    click.echo(f"\nFound {len(unique_vals)} unique PCAPARAM value(s) across {len(raw)} spectra:\n")
+    with fits.open(fits_path, memmap=True) as hdul:
+        # Case 1: binary table with PCAPARAM column (pca_correct output)
+        data = None
+        for hdu in hdul:
+            if (hasattr(hdu, 'data') and hdu.data is not None
+                    and hasattr(hdu.data, 'dtype')
+                    and 'PCAPARAM' in hdu.data.dtype.names):
+                data = hdu.data
+                break
+
+        if data is not None:
+            raw = np.array([_s(v) for v in data['PCAPARAM']])
+            unique_vals, counts = np.unique(raw, return_counts=True)
+            source_label = f'{len(raw)} spectra'
+        else:
+            # Case 2: datacube with PCAPAR* header keywords
+            hdr = hdul[0].header
+            hdr_vals = [hdr[k] for k in hdr if k.startswith('PCAPAR')]
+            if hdr_vals:
+                unique_vals = hdr_vals
+                counts = [None] * len(hdr_vals)
+                source_label = 'cube header'
+            else:
+                click.echo("No PCAPARAM column or PCAPAR* header keywords found in this file.")
+                return
+
+    n_label = f"across {source_label}"
+    click.echo(f"\nFound {len(unique_vals)} unique PCAPARAM value(s) {n_label}:\n")
 
     param_labels = {
-        'vc': 'variance cutoff',
-        'nr': 'noise ratio cutoff',
-        'sk': 'smoothing kernel size',
-        'cc': 'cut coefficients',
-        'gnr': 'global noise ratio cutoff',
-        'lk': 'line kernel size',
+        'vc':    'variance cutoff',
+        'nr':    'noise ratio cutoff',
+        'sk':    'smoothing kernel size',
+        'cc':    'cut coefficients',
+        'gnr':   'global noise ratio cutoff',
+        'lk':    'line kernel size',
+        'ls':    'line cutoff std (σ)',
         'lstsq': 'least squares',
     }
 
     for val, count in zip(unique_vals, counts):
-        click.echo(f"  [{count} spectra]  {val}")
+        prefix = f"[{count} spectra]" if count is not None else "[cube header]"
+        click.echo(f"  {prefix}  {val}")
         tokens = val.split()
         for token in tokens:
             if '=' in token:
                 k, v = token.split('=', 1)
                 label = param_labels.get(k, k)
-                click.echo(f"    {k:4s}  ({label}) = {v}")
+                click.echo(f"    {k:5s}  ({label}) = {v}")
         click.echo()
 
 

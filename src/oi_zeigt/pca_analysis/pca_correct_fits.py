@@ -1659,6 +1659,9 @@ class PCACorrector:
             # ============================================================================
             # ITERATIVE LINE DETECTION FOLLOWING ORIGINAL pca_correct.py APPROACH
             # ============================================================================
+            # TODO: detect_science_lines parameter (accepted in signature, passed from --no-line-detection)
+            #       is never checked here — line detection always runs. Add an `if detect_science_lines:`
+            #       guard around Steps 1-2 and skip straight to Step 3 when False.
             # Step 1: First pass correction WITHOUT line mask to get preliminary corrected spectra
             logger.info("STEP 1: First pass correction (without line detection mask)")
             
@@ -1887,11 +1890,12 @@ class PCACorrector:
                                 group_key = (mission_id_group, telescope_group, scan_id)
                                 group_thresholds[group_key] = group_threshold
 
-                            # Apply detected lines to mask
-                            for group_spectrum_position, global_spectrum_idx in enumerate(group_indices):
+                            # Apply detected lines to mask.
+                            # group_indices contains local positions within the indices array
+                            # (0..len(indices)-1), not raw FITS row numbers.
+                            for group_spectrum_position, local_idx in enumerate(group_indices):
                                 line_mask = group_threshold[group_spectrum_position]
                                 if np.any(line_mask):
-                                    local_idx = np.where(indices == global_spectrum_idx)[0][0]
                                     detected_lines_mask[local_idx] = line_mask
                         elif (self.force_line_window
                               and line_window_kms is not None
@@ -1911,8 +1915,7 @@ class PCACorrector:
                                     f"({v_min_fb:.0f}–{v_max_fb:.0f} km/s, "
                                     f"{np.sum(fallback_channel_mask)} channels)"
                                 )
-                                for global_spectrum_idx in group_indices:
-                                    local_idx = np.where(indices == global_spectrum_idx)[0][0]
+                                for local_idx in group_indices:
                                     detected_lines_mask[local_idx] |= fallback_channel_mask
 
                     except Exception as e:
@@ -2375,6 +2378,7 @@ class PCACorrector:
                 f"cc={_fmt(cut_coefficients)} "
                 f"gnr={_fmt(global_noise_ratio_cutoff)} "
                 f"lk={self.line_kernel_size} "
+                f"ls={self.line_cutoff_std} "
                 f"lstsq={int(self.use_lstsq)}"
             )
             n_rows = len(output_table.data)
