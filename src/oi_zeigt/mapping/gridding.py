@@ -2227,13 +2227,21 @@ def collapse_cube(
     # ------------------------------------------------------------------
     # WCS objects for map axes (built once, reused per panel)
     # ------------------------------------------------------------------
+    def _make_wcs_zoom(zx0, zy0):
+        # Build a WCS for the zoom panel whose reference pixel is shifted to
+        # account for the zoom box's lower-left corner (zx0, zy0) in the
+        # full-map pixel grid. Must be recomputed whenever the zoom box is
+        # redefined interactively, otherwise the zoom panel's coordinate
+        # ticks/labels are computed for the wrong pixel offset and vanish.
+        h_zoom = header2d.copy()
+        h_zoom['CRPIX1'] = float(header2d.get('CRPIX1', nx / 2 + 1)) - zx0
+        h_zoom['CRPIX2'] = float(header2d.get('CRPIX2', ny / 2 + 1)) - zy0
+        return WCS(h_zoom)
+
     if use_wcs:
         wcs2d_obj = WCS(header2d)
         if zoom_size_arcmin is not None:
-            h_zoom = header2d.copy()
-            h_zoom['CRPIX1'] = float(header2d.get('CRPIX1', nx / 2 + 1)) - x0
-            h_zoom['CRPIX2'] = float(header2d.get('CRPIX2', ny / 2 + 1)) - y0
-            wcs2d_zoom = WCS(h_zoom)
+            wcs2d_zoom = _make_wcs_zoom(x0, y0)
         else:
             wcs2d_zoom = None
     else:
@@ -2260,6 +2268,14 @@ def collapse_cube(
     ax_zoom      = _add_map_subplot(2, wcs2d_zoom) if has_zoom else fig.add_subplot(2, 2, 2)
     ax_spec_zoom = fig.add_subplot(2, 2, 3)
     ax_spec_reg  = fig.add_subplot(2, 2, 4)
+
+    # fig.colorbar() shrinks the host axes to make room for the colorbar.
+    # When a map panel is redrawn (cla() + _plot_map), repeating that on an
+    # already-shrunk axes would shrink it further each time, eventually
+    # pushing the colorbar (and its label) off the figure. Restore each
+    # axes to its original position before redrawing.
+    _ax_full_pos = ax_full.get_position().frozen()
+    _ax_zoom_pos = ax_zoom.get_position().frozen()
 
     if not has_zoom:
         ax_zoom.set_visible(False)
@@ -2468,6 +2484,8 @@ def collapse_cube(
     # scale (left click = new lower clip, right click = new upper clip).
     # The same scale is applied to the zoom map's colorbar, if present.
     # ------------------------------------------------------------------
+    _cb_history = []
+
     def _on_colorbar_click(event):
         cb_full = _cb_full[0]
         if cb_full is None or event.inaxes is not cb_full.ax or event.ydata is None:
@@ -2484,6 +2502,8 @@ def collapse_cube(
         if new_vmin >= new_vmax:
             return
 
+        _cb_history.append((norm_full.vmin, norm_full.vmax))
+
         for cb in (_cb_full[0], _cb_zoom[0]):
             if cb is None:
                 continue
@@ -2494,7 +2514,24 @@ def collapse_cube(
 
         fig.canvas.draw_idle()
 
+    def _on_key_press(event):
+        if event.key != 'b' or not _cb_history:
+            return
+
+        prev_vmin, prev_vmax = _cb_history.pop()
+
+        for cb in (_cb_full[0], _cb_zoom[0]):
+            if cb is None:
+                continue
+            norm = cb.mappable.norm
+            norm.vmin, norm.vmax = prev_vmin, prev_vmax
+            cb.mappable.set_norm(norm)
+            cb.update_normal(cb.mappable)
+
+        fig.canvas.draw_idle()
+
     fig.canvas.mpl_connect('button_press_event', _on_colorbar_click)
+    fig.canvas.mpl_connect('key_press_event', _on_key_press)
 
     # ------------------------------------------------------------------
     # Interactive: click on the zoom map to show the pixel spectrum
@@ -2586,6 +2623,7 @@ def collapse_cube(
             ax_spec_reg.set_title(title_str, fontsize=9)
 
         def _on_full_click(event):
+            nonlocal ax_zoom, wcs2d_zoom
             if event.inaxes is not ax_full or event.xdata is None:
                 return
             px = int(round(event.xdata))
@@ -2674,7 +2712,17 @@ def collapse_cube(
 
                     if _cb_zoom[0] is not None:
                         _cb_zoom[0].remove()
-                    ax_zoom.cla()
+                    if use_wcs:
+                        # The zoom box's pixel offset changed, so the WCS
+                        # reference pixel must change too. WCSAxes binds its
+                        # projection at creation time, so cla() alone can't
+                        # pick up the new WCS — recreate the axes instead.
+                        wcs2d_zoom = _make_wcs_zoom(new_x0, new_y0)
+                        fig.delaxes(ax_zoom)
+                        ax_zoom = fig.add_subplot(2, 2, 2, projection=wcs2d_zoom)
+                    else:
+                        ax_zoom.cla()
+                    ax_zoom.set_position(_ax_zoom_pos)
                     _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
                                             f"Zoom ({new_x0}:{new_x1}, {new_y0}:{new_y1})",
                                             wcs_proj=wcs2d_zoom)
@@ -2729,6 +2777,7 @@ def collapse_cube(
             if _cb_full[0] is not None:
                 _cb_full[0].remove()
             ax_full.cla()
+            ax_full.set_position(_ax_full_pos)
             _cb_full[0] = _plot_map(ax_full, new_col_disp, new_title, wcs_proj=wcs2d_obj)
             pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
             _zoom_rect[0] = ax_full.add_patch(Rectangle(
@@ -2749,6 +2798,7 @@ def collapse_cube(
                 _cb_zoom[0].remove()
             new_zoomed = new_col_disp[_zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
             ax_zoom.cla()
+            ax_zoom.set_position(_ax_zoom_pos)
             _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
                                     f"Zoom ({_zb['x0']}:{_zb['x1']}, {_zb['y0']}:{_zb['y1']})",
                                     wcs_proj=wcs2d_zoom)
