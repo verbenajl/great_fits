@@ -1998,12 +1998,15 @@ class PCACorrector:
                             except Exception as e:
                                 logger.debug(f"Re-correction iteration {iteration + 1} failed for spectrum {idx}: {e}")
             
-            # Step 2.5: KDE noise ratio fitting (when global_noise_ratio_cutoff is set).
+            # Step 2.5: KDE noise ratio fitting.
             # For each group, build noise ratio matrix → fit KDE → derive per-component cutoffs.
-            # When global_noise_ratio_cutoff is not set, per_spectrum_cutoffs stays None and
-            # the existing simple cutoff_noise_ratio threshold is used in phase 3 (backward compat).
+            # Always run when KDE plots are requested, so the diagnostic plots are produced
+            # even if global_noise_ratio_cutoff is not set. The derived cutoffs only feed
+            # back into per_spectrum_cutoffs (and thus the actual correction) when
+            # global_noise_ratio_cutoff is set — otherwise the existing simple
+            # cutoff_noise_ratio threshold is used in phase 3 (backward compat).
             per_spectrum_cutoffs = [None] * len(indices)
-            if global_noise_ratio_cutoff:
+            if global_noise_ratio_cutoff or generate_kde_plots:
                 logger.info("STEP 2.5: KDE noise ratio fitting per group")
                 Path(output_dir).mkdir(parents=True, exist_ok=True)
                 for group_row in unique_groups:
@@ -2068,8 +2071,9 @@ class PCACorrector:
                         kde_data[(mission_id_group, telescope_group, scan_id)] = (
                             kde_params, component_cutoffs)
 
-                        for local_idx in group_local_indices:
-                            per_spectrum_cutoffs[local_idx] = component_cutoffs
+                        if global_noise_ratio_cutoff:
+                            for local_idx in group_local_indices:
+                                per_spectrum_cutoffs[local_idx] = component_cutoffs
                     else:
                         logger.warning(f"  KDE fitting failed for group "
                                        f"{mission_id_group}/{telescope_group}/scan{scan_id} "
@@ -3058,22 +3062,34 @@ class PCACorrector:
             # Plot coefficient magnitudes heatmap
             ax_coeff = fig.add_axes([4*padding + 3*plot_width, 0.05, plot_width, 0.45])
             all_coefficients = []
+            used_mask = []
             for idx in usable_global_indices:
                 if idx in correction_details and 'coefficients' in correction_details[idx]:
                     # Get the coefficients for this spectrum
                     all_coefficients.append(correction_details[idx]['coefficients'])
+                    info = correction_details[idx].get('component_info', {})
+                    used_mask.append([info.get(c, {}).get('used', False)
+                                       for c in range(len(components_to_plot))])
                 else:
                     # Zero coefficients for spectra without correction details
-                    all_coefficients.append(np.zeros(len(self.components)))
-            
+                    all_coefficients.append(np.zeros(len(components_to_plot)))
+                    used_mask.append([False] * len(components_to_plot))
+
             all_coefficients = np.array(all_coefficients)[:n_display]
+            used_mask = np.array(used_mask)[:n_display]
             coeff_magnitudes = np.abs(all_coefficients)
-            
-            # Display with component number on X-axis, spectrum number on Y-axis
-            im_coeff = ax_coeff.imshow(coeff_magnitudes, aspect='auto',
-                                      extent=[0, len(self.components), n_display, 0],
+
+            # Display with component number on X-axis, spectrum number on Y-axis.
+            # Like the legacy plot, components not used in the correction are
+            # shown grayed out (background layer), with used components drawn
+            # in color on top.
+            extent = [0, len(components_to_plot), n_display, 0]
+            ax_coeff.imshow(coeff_magnitudes, aspect='auto', extent=extent,
+                            interpolation='nearest', cmap='gray', alpha=0.5)
+            coeff_used_only = np.ma.masked_array(coeff_magnitudes, mask=~used_mask)
+            im_coeff = ax_coeff.imshow(coeff_used_only, aspect='auto', extent=extent,
                                       interpolation='nearest', cmap='viridis')
-            ax_coeff.set_title(f'Coefficient Magnitudes', fontsize=10)
+            ax_coeff.set_title(f'Coefficient Magnitudes\n(unused components grayed out)', fontsize=10)
             ax_coeff.set_xlabel('Component #', fontsize=9)
             ax_coeff.set_ylabel('Spectrum #', fontsize=9)
             fig.colorbar(im_coeff, ax=ax_coeff, pad=0.02)
@@ -3122,12 +3138,13 @@ class PCACorrector:
             if example_global_idx in correction_details:
                 details = correction_details[example_global_idx]
                 comp_info = details.get('component_info', {})
-                coeffs = details.get('coefficients', np.zeros(len(self.components)))
+                coeffs = details.get('coefficients', np.zeros(len(components_to_plot)))
                 ex_gcf_mask = details.get('gcf_mask', None)
                 ex_gcs_mask = details.get('gcs_mask', None)
             else:
+                details = {}
                 comp_info = {}
-                coeffs = np.zeros(len(self.components))
+                coeffs = np.zeros(len(components_to_plot))
                 ex_gcf_mask = None
                 ex_gcs_mask = None
 
@@ -3160,7 +3177,7 @@ class PCACorrector:
             ex_telluric_spans = _mask_spans(~telluric_only if telluric_only is not None else None)
             
             # Plot correction for each component (show all components)
-            n_comp_show = len(self.components)
+            n_comp_show = len(components_to_plot)
             # Allocate space evenly for all components (no separate title, use title area for first component)
             spec_height = 0.90 / n_comp_show
             
@@ -3184,14 +3201,22 @@ class PCACorrector:
                 ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=1.5, alpha=0.8, label='Orig', zorder=1)
                 ax_ex_comp.plot(x_axis, corrected_ex, color='green', lw=1.5, alpha=0.8, label='Corr', zorder=2)
                 
-                scaled_comp_raw = coeffs[comp_idx] * self.components[comp_idx]
+                # Use the coefficient that was actually applied during subtraction
+                # (re-fitted on surviving components for used ones), not the
+                # original full-set fit coefficient — otherwise the plotted
+                # "Comp" curve doesn't match what was subtracted from "Orig".
+                info = comp_info.get(comp_idx, {})
+                coeff_val = info.get('coeff', coeffs[comp_idx])
+                scaled_comp_raw = coeff_val * components_to_plot[comp_idx]
                 # Embed component into full channel range so it always plots against x_axis.
                 # Without this, a trimmed (shorter) component would be plotted at channel
                 # indices 0,1,2,... as x-values instead of velocities, appearing as a
                 # narrow compressed line in only part of the panel.
-                _plot_meta = getattr(self, 'metadata', {}) or {}
-                _cf = _plot_meta.get('channel_first', None)
-                _cl = _plot_meta.get('channel_last', None)
+                # Use the channel range actually used for THIS spectrum's correction
+                # (set by _pca_apply_correction_worker), not the corrector's default
+                # metadata — per-mission decompositions can use a different range.
+                _cf = details.get('ch_first', None)
+                _cl = details.get('ch_last', None)
                 if len(scaled_comp_raw) == len(x_axis):
                     scaled_comp = scaled_comp_raw
                 elif _cf is not None and _cl is not None and len(scaled_comp_raw) == _cl - _cf + 1:
@@ -3203,10 +3228,8 @@ class PCACorrector:
                     n = min(len(scaled_comp_raw), len(x_axis))
                     scaled_comp[:n] = scaled_comp_raw[:n]
                 ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')
-                
-                info = comp_info.get(comp_idx, {})
+
                 used = info.get('used', False)
-                coeff_val = coeffs[comp_idx]
                 noise_ratio = info.get('noise_ratio', 0)
                 
                 # Create label
@@ -3245,11 +3268,22 @@ class PCACorrector:
 
             # KDE noise ratio plot for this group (if available)
             if kde_data:
-                group_kde = kde_data.get((mission_id, telescope, scan))
+                # kde_data keys are built from to_string()-normalized
+                # (mission_id, telescope, scan) in correct_fits_file's STEP 2.5;
+                # normalize the same way here, since `missions`/`telescopes`/`scans`
+                # in this function may still be raw bytes/numpy scalars.
+                def _to_string(x):
+                    if isinstance(x, bytes):
+                        return x.decode('utf-8').strip()
+                    return str(x).strip()
+                group_kde = kde_data.get(
+                    (_to_string(mission_id), _to_string(telescope), _to_string(scan)))
                 if group_kde is not None:
                     kde_params_g, component_cutoffs_g = group_kde
                     group_label = f"{mission_id}_{telescope}_scan{scan}"
-                    kde_plot_path = Path(output_dir) / f"pca_correction_{group_label}_kdeplot.png"
+                    kde_dir = Path(output_dir) / "kde"
+                    kde_dir.mkdir(parents=True, exist_ok=True)
+                    kde_plot_path = kde_dir / f"pca_correction_{group_label}_kdeplot.png"
                     try:
                         _plot_kde_noise_ratios(
                             kde_params_g, component_cutoffs_g, kde_plot_path, group_label)

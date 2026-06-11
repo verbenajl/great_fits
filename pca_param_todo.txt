@@ -88,6 +88,62 @@ PCA parameter behaviour — deferred fixes
       not mixed into the new decomposition input, no correction behaviour is
       lost.  Only relevant if non-sky spectra are ever added to the input set.
 
+[ ] decomposition_type — config key has no effect; active pipeline always uses
+    sklearn PCA.
+
+    Context:
+      pca_decompose_per_mission.py hardcodes
+      `PCADecomposer(n_components=n_components, scale=False)`, always PCA.
+      decomposition_type is parsed from config in the unused decompose.py
+      template only. Legacy pca_decompose.py actually dispatches between
+      PCA / SparsePCA / ICA based on this value.
+
+    Why low priority:
+      pca_parameters.md already says "PCA is the only well-tested option" —
+      SparsePCA/ICA were never validated. Implement only if a future need
+      for an alternative decomposition algorithm arises.
+
+[ ] do_scale — config key has no effect; both decompose and correct run on
+    raw (unscaled) spectra.
+
+    Context:
+      pca_decompose_per_mission.py hardcodes scale=False; pca_correct_fits.py
+      applies no StandardScaler. This is internally consistent (see
+      pca_differences.md item 7, closed) so likely fine as-is. If do_scale is
+      ever wired up, it must be applied symmetrically to both decompose and
+      correct, with inverse_transform after subtraction (legacy pattern).
+
+[ ] z_score_cutoff — spike-channel rejection not implemented in active
+    pipeline.
+
+    Context:
+      pca_parameters.md recommends z_score_cutoff=10 as a starting point for
+      spike contamination, but the active pca_decompose_per_mission.py /
+      pca_correct_fits.py never blank high-z-score channels. Only the legacy
+      reference pca_utilities.py implements this (lines ~259-271).
+
+    Fix (if needed):
+      Port the per-channel z-score blanking from legacy pca_utilities.py into
+      the spectrum-preparation step before PCA fitting (decompose) and/or
+      before coefficient projection (correct).
+
+[ ] pca_exclude_range — "remove band before PCA, refill after" mechanism
+    missing entirely from active pipeline.
+
+    Context:
+      Legacy pca_utilities.py implements apply_pca_exclude_range /
+      refill_pca_exclude_range to hard-exclude a velocity band from both
+      decomposition and correction fitting, then restore the original values
+      afterward. No equivalent exists in pca_decompose_per_mission.py or
+      pca_correct_fits.py.
+
+    Fix (if needed):
+      Port apply_pca_exclude_range/refill_pca_exclude_range from legacy
+      pca_utilities.py into both the decompose spectrum-preparation step and
+      the correct fitting step, masking the configured velocity range before
+      the dot-product/lstsq fit and restoring original channel values after
+      subtraction.
+
 [ ] [MARGINAL] scramble — dead code in both legacy and new paths.
 
     Context:

@@ -237,24 +237,29 @@ def _print_object_info(hdul, object_filter=None):
                 try:
                     if 'MISSION_ID' in hdu.columns.names:
                         mission_ids = hdu.data['MISSION_ID']
-                        
+                        scans = hdu.data['SCAN'] if 'SCAN' in hdu.columns.names else None
+
                         # Get unique MISSION_IDs and their counts
                         mission_id_counts = Counter(mission_ids)
-                        
+
                         click.echo("="*70)
                         click.echo("UNIQUE MISSION_IDS IN FITS FILE")
                         click.echo("="*70)
                         click.echo(f"Total unique MISSION_IDs: {len(mission_id_counts)}\n")
-                        
+
                         # Sort by count (descending)
                         sorted_mission_ids = sorted(mission_id_counts.items(), key=lambda x: x[1], reverse=True)
-                        
-                        max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id) 
+
+                        max_mission_len = max(len(mission_id.decode() if isinstance(mission_id, bytes) else mission_id)
                                               for mission_id, _ in sorted_mission_ids)
-                        
+
                         for mission_id, count in sorted_mission_ids:
                             mission_id_str = mission_id.decode().strip() if isinstance(mission_id, bytes) else str(mission_id).strip()
                             click.echo(f"  {mission_id_str:<{max_mission_len}}  : {count:6d} entries")
+                            if scans is not None:
+                                mid_mask = mission_ids == mission_id
+                                unique_scans = sorted(set(int(s) for s in scans[mid_mask]))
+                                click.echo(f"  {'':<{max_mission_len}}    scans: {unique_scans}")
 
                         click.echo("="*70 + "\n")
                 except (OSError, ValueError, TypeError):
@@ -645,10 +650,11 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
         # Find binary table HDU with spectra
         matrix_hdu = None
         for hdu in hdul:
-            if hasattr(hdu, 'data') and hdu.data is not None:
-                if 'SPECTRUM' in hdu.data.dtype.names:
-                    matrix_hdu = hdu
-                    break
+            if (hasattr(hdu, 'data') and hdu.data is not None
+                    and hdu.data.dtype.names is not None
+                    and 'SPECTRUM' in hdu.data.dtype.names):
+                matrix_hdu = hdu
+                break
         
         if matrix_hdu is None:
             raise ValueError("No HDU with SPECTRUM column found")
@@ -898,10 +904,11 @@ def plot_skies(config: Optional[str], fits: Optional[str], reduced: bool, clean:
         # Find binary table HDU with spectra
         matrix_hdu = None
         for hdu in hdul:
-            if hasattr(hdu, 'data') and hdu.data is not None:
-                if 'SPECTRUM' in hdu.data.dtype.names:
-                    matrix_hdu = hdu
-                    break
+            if (hasattr(hdu, 'data') and hdu.data is not None
+                    and hdu.data.dtype.names is not None
+                    and 'SPECTRUM' in hdu.data.dtype.names):
+                matrix_hdu = hdu
+                break
         
         if matrix_hdu is None:
             raise ValueError("No HDU with SPECTRUM column found")
@@ -1107,10 +1114,11 @@ def plot_skyobsfit(config: Optional[str], fits: Optional[str], reduced: bool, cl
         # Find binary table HDU with spectra
         matrix_hdu = None
         for hdu in hdul:
-            if hasattr(hdu, 'data') and hdu.data is not None:
-                if 'SPECTRUM' in hdu.data.dtype.names:
-                    matrix_hdu = hdu
-                    break
+            if (hasattr(hdu, 'data') and hdu.data is not None
+                    and hdu.data.dtype.names is not None
+                    and 'SPECTRUM' in hdu.data.dtype.names):
+                matrix_hdu = hdu
+                break
         
         if matrix_hdu is None:
             raise ValueError("No HDU with SPECTRUM column found")
@@ -1841,8 +1849,10 @@ def filter_missions(fits, output, yaml_file):
         # Find table HDU
         table_hdu = None
         for hdu in hdul[1:]:
-            if hasattr(hdu, "data") and hdu.data is not None and hasattr(hdu.data, "dtype"):
-                if "MISSION_ID" in hdu.data.dtype.names:
+            if (hasattr(hdu, "data") and hdu.data is not None
+                    and hasattr(hdu.data, "dtype")
+                    and hdu.data.dtype.names is not None
+                    and "MISSION_ID" in hdu.data.dtype.names):
                     table_hdu = hdu
                     break
         if table_hdu is None:
@@ -2292,6 +2302,7 @@ def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
             matrix_hdu = next(
                 (hdu for hdu in hdul
                  if hasattr(hdu, 'data') and hdu.data is not None
+                 and hdu.data.dtype.names is not None
                  and 'SPECTRUM' in hdu.data.dtype.names),
                 None
             )
@@ -3533,6 +3544,7 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         for _hdu in hdul:
             if (hasattr(_hdu, 'data') and _hdu.data is not None
                     and hasattr(_hdu.data, 'dtype')
+                    and _hdu.data.dtype.names is not None
                     and 'PCAPARAM' in _hdu.data.dtype.names):
                 def _s(v): return v.decode('utf-8').strip() if isinstance(v, bytes) else str(v).strip()
                 _raw = [_s(v) for v in _hdu.data['PCAPARAM']]
@@ -4017,10 +4029,11 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         # Prefer per-spectrum VELOCITY_AXIS column if present (set by reduce_spectra)
         matrix_hdu = None
         for hdu in hdul:
-            if hasattr(hdu, 'data') and hdu.data is not None:
-                if 'SPECTRUM' in hdu.data.dtype.names:
-                    matrix_hdu = hdu
-                    break
+            if (hasattr(hdu, 'data') and hdu.data is not None
+                    and hdu.data.dtype.names is not None
+                    and 'SPECTRUM' in hdu.data.dtype.names):
+                matrix_hdu = hdu
+                break
         if matrix_hdu is None:
             raise ValueError("No SPECTRUM column found in FITS file")
 
@@ -4777,6 +4790,7 @@ def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, out
         matrix_hdu = next(
             (hdu for hdu in hdul
              if hasattr(hdu, "data") and hdu.data is not None
+             and hdu.data.dtype.names is not None
              and "SPECTRUM" in hdu.data.dtype.names),
             None,
         )
@@ -4961,6 +4975,7 @@ def print_pca_parameters(fits_path, config):
         for hdu in hdul:
             if (hasattr(hdu, 'data') and hdu.data is not None
                     and hasattr(hdu.data, 'dtype')
+                    and hdu.data.dtype.names is not None
                     and 'PCAPARAM' in hdu.data.dtype.names):
                 data = hdu.data
                 break

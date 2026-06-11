@@ -2378,6 +2378,19 @@ def collapse_cube(
         else:
             return _imshow_map(ax, data, title, wcs_proj, cmap)
 
+    # Fixed y-axis range per spectrum panel, so the scale stays put when the
+    # user changes the zoom/region/velocity range interactively. Each panel's
+    # range is locked to whatever spectrum is first drawn in it.
+    _spec_ylims = {}
+
+    def _fixed_ylim(ax, spec):
+        if ax not in _spec_ylims:
+            ymin = float(np.nanmin(spec))
+            ymax = float(np.nanmax(spec))
+            margin = 0.05 * (ymax - ymin)
+            _spec_ylims[ax] = (ymin - margin, ymax + margin)
+        return _spec_ylims[ax]
+
     def _plot_spec(ax, vel, spec, title, color='steelblue'):
         ax.plot(vel, spec, color=color, linewidth=1.0)
         ax.set_xlabel('Velocity (km/s)')
@@ -2388,6 +2401,7 @@ def collapse_cube(
             ax.axvspan(v_min, v_max, alpha=0.15, color=color,
                        label=f'{v_min:.0f}–{v_max:.0f} km/s')
             ax.legend(fontsize=8)
+        ax.set_ylim(_fixed_ylim(ax, spec))
 
     # Full map
     _cb_full = [_plot_map(ax_full, collapsed_display, title_base, wcs_proj=wcs2d_obj)]
@@ -2448,6 +2462,39 @@ def collapse_cube(
             hex_r_pt = spacing * pts_per_data / np.sqrt(3)
             s = max(1.0, (3 * np.sqrt(3) / 2) * hex_r_pt ** 2)
             sc.set_sizes([s] * len(sc.get_offsets()))
+
+    # ------------------------------------------------------------------
+    # Interactive: click on the full map's colorbar to adjust the colour
+    # scale (left click = new lower clip, right click = new upper clip).
+    # The same scale is applied to the zoom map's colorbar, if present.
+    # ------------------------------------------------------------------
+    def _on_colorbar_click(event):
+        cb_full = _cb_full[0]
+        if cb_full is None or event.inaxes is not cb_full.ax or event.ydata is None:
+            return
+        if event.button not in (1, 3):
+            return
+
+        norm_full = cb_full.mappable.norm
+        new_vmin, new_vmax = norm_full.vmin, norm_full.vmax
+        if event.button == 1:
+            new_vmin = float(event.ydata)
+        else:
+            new_vmax = float(event.ydata)
+        if new_vmin >= new_vmax:
+            return
+
+        for cb in (_cb_full[0], _cb_zoom[0]):
+            if cb is None:
+                continue
+            norm = cb.mappable.norm
+            norm.vmin, norm.vmax = new_vmin, new_vmax
+            cb.mappable.set_norm(norm)
+            cb.update_normal(cb.mappable)
+
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('button_press_event', _on_colorbar_click)
 
     # ------------------------------------------------------------------
     # Interactive: click on the zoom map to show the pixel spectrum
@@ -2527,6 +2574,7 @@ def collapse_cube(
             ax_spec_reg.axvspan(_vr['v_min'], _vr['v_max'], alpha=0.15, color='tomato',
                                 label=f"{_vr['v_min']:.0f}–{_vr['v_max']:.0f} km/s")
             ax_spec_reg.legend(fontsize=8)
+            ax_spec_reg.set_ylim(_fixed_ylim(ax_spec_reg, spec))
             title_str = f'Pixel ({px_cube}, {py_cube})'
             try:
                 sky = wcs2d.pixel_to_world(px_cube, py_cube)
@@ -2628,7 +2676,8 @@ def collapse_cube(
                         _cb_zoom[0].remove()
                     ax_zoom.cla()
                     _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
-                                            f"Zoom ({new_x0}:{new_x1}, {new_y0}:{new_y1})")
+                                            f"Zoom ({new_x0}:{new_x1}, {new_y0}:{new_y1})",
+                                            wcs_proj=wcs2d_zoom)
 
                     ax_spec_zoom.cla()
                     _plot_spec(ax_spec_zoom, channels_kms, new_zoom_spec,
@@ -2701,7 +2750,8 @@ def collapse_cube(
             new_zoomed = new_col_disp[_zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
             ax_zoom.cla()
             _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
-                                    f"Zoom ({_zb['x0']}:{_zb['x1']}, {_zb['y0']}:{_zb['y1']})")
+                                    f"Zoom ({_zb['x0']}:{_zb['x1']}, {_zb['y0']}:{_zb['y1']})",
+                                    wcs_proj=wcs2d_zoom)
             _click_circle[0] = None
             if (_selected_pixel['px'] is not None and
                     _zb['x0'] <= _selected_pixel['px'] < _zb['x1'] and
@@ -2727,6 +2777,7 @@ def collapse_cube(
             ax_spec_zoom.axvspan(new_v_min, new_v_max, alpha=0.15, color='steelblue',
                                  label=f'{new_v_min:.0f}–{new_v_max:.0f} km/s')
             ax_spec_zoom.legend(fontsize=8)
+            ax_spec_zoom.set_ylim(_fixed_ylim(ax_spec_zoom, new_zoom_spec))
 
             # Redraw pixel spectrum if one is selected
             if _selected_pixel['px'] is not None:
