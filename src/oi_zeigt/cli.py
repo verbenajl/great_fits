@@ -3420,12 +3420,22 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
               help='Number of parallel workers for channel gridding. -1 = all CPUs (default), 1 = sequential.')
 @click.option('--weight-spectra', type=str, default=None, metavar='COLUMN',
               help='Column name to use for per-spectrum weighting during gridding '
-                   '(e.g. --weight-spectra RMSRATIOB or --weight-spectra RMS_BASELINE_2). '
-                   'For RMSRATIO* columns a Gaussian transform exp(-(v-1)²/0.5²) is applied; '
-                   'for all other columns the raw values are used directly as weights. '
+                   '(e.g. --weight-spectra RMS, --weight-spectra RMS_THEORETICAL, or '
+                   '--weight-spectra RMSRATIOB). For RMSRATIO* columns a Gaussian transform '
+                   'exp(-(v-1)²/0.5²) is applied; for all other columns inverse-variance '
+                   'weighting w=1/value² is used (e.g. RMS gives GILDAS-style SIGMA weighting). '
                    'A WEIGHT_MAP extension is written to the output FITS file.')
 @click.option('--weight-channels', is_flag=True, default=False,
               help='Weight each channel by exp(-tau)/T_sys from TSYS/TAU_SIG calibration spectra.')
+@click.option('--create-weights-datacube', is_flag=True, default=False,
+              help='Only effective together with --weight-channels: writes a full 3D '
+                   'WEIGHT_CUBE extension (one weight-sum plane per channel) instead of the '
+                   'usual 2D WEIGHT_MAP, since per-channel weights vary channel to channel '
+                   '(GILDAS\'s xy_map never needs this — its per-spectrum weights are constant '
+                   'across channels, hence its .wei file is always 2D). Without '
+                   '--weight-channels this flag has no effect: the existing 2D WEIGHT_MAP/'
+                   'COVERAGE extensions are written exactly as before whenever --weight-spectra '
+                   'is set.')
 @click.option('--kernel-fwhm', type=float, default=None,
               help='Gridding kernel FWHM in arcseconds. If not specified, uses the beam size. '
                    'Use a value smaller than the beam to minimize resolution degradation '
@@ -3433,7 +3443,7 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
 @click.option('--telescop', type=str, default=None,
               help='Telescope name written to the FITS header. '
                    'If not specified, reads from config [gridding].telescop (default: IRAM-30M).')
-def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, pixel_size_arcsec, output, plot, n_jobs, weight_spectra, weight_channels, kernel_fwhm, telescop):
+def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, pixel_size_arcsec, output, plot, n_jobs, weight_spectra, weight_channels, create_weights_datacube, kernel_fwhm, telescop):
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -3570,6 +3580,7 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
             weight_column=eff_weight_column,
             channel_weights=weight_channels,
             kernel_fwhm_arcsec=kernel_fwhm,
+            create_weights_datacube=create_weights_datacube,
         )
 
         # Write PCA parameters into the cube primary header
@@ -3591,6 +3602,12 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
             click.echo(f"  Per-spectrum weighting: {eff_weight_column}")
         if weight_channels:
             click.echo(f"  Per-channel weighting: exp(-tau)/T_sys from TSYS/TAU_SIG calibration spectra")
+            if create_weights_datacube:
+                click.echo(f"  Weight output: 3D WEIGHT_CUBE (per-channel weight sum)")
+            elif eff_weight_column:
+                click.echo(f"  Weight output: 2D WEIGHT_MAP (per-spectrum only — pass --create-weights-datacube for the full 3D cube)")
+        elif eff_weight_column:
+            click.echo(f"  Weight output: 2D WEIGHT_MAP")
         click.echo(f"  Datacube shape: {datacube.shape[0]} channels × {datacube.shape[1]} × {datacube.shape[2]} pixels")
         click.echo(f"  Output file: {output_file}")
 

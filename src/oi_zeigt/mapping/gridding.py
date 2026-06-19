@@ -1149,6 +1149,7 @@ def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
                      spectral_params: Optional[Dict[str, Any]] = None,
                      coverage_map: Optional[np.ndarray] = None,
                      weight_map: Optional[np.ndarray] = None,
+                     weight_cube: Optional[np.ndarray] = None,
                      weight_column: Optional[str] = None) -> None:
     """
     Save a gridded map to a FITS file with proper WCS and beam information.
@@ -1251,6 +1252,16 @@ def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
                                     'Proportional to the denominator of the weighted average.')
         hdul.append(wm_hdu)
 
+    # Add full 3D weight cube as ImageHDU if provided (only built when per-channel
+    # weights are active, since that's the only case where the weight sum
+    # actually varies channel to channel).
+    if weight_cube is not None:
+        wc_hdu = fits.ImageHDU(data=weight_cube.astype(np.float32), name='WEIGHT_CUBE')
+        wc_hdu.header['COMMENT'] = ('Per-channel kernel-weighted sum of combined spectrum x '
+                                    'channel weights. Denominator of the per-channel weighted '
+                                    'average; varies channel to channel (unlike WEIGHT_MAP).')
+        hdul.append(wc_hdu)
+
     # Write to file
     hdul.writeto(output_file, overwrite=overwrite)
     
@@ -1265,6 +1276,9 @@ def save_map_to_fits(grid_map: np.ndarray, wcs_header: fits.Header,
         print(f"  Spectral axis: {nvel} channels (SPECTRUM HDU)")
         print(f"    Reference velocity: {velo_ref:.2f} km/s at channel {spectral_params['crpix1_spec']-1:.0f}")
 
+    if weight_cube is not None:
+        print(f"  Weight cube: {weight_cube.shape} (WEIGHT_CUBE HDU)")
+
 
 # ---------------------------------------------------------------------------
 # Multiprocessing worker functions for parallel channel gridding.
@@ -1277,7 +1291,7 @@ _gridding_worker_state: dict = {}
 def _init_gridding_worker(ras, decs, wcs_header_dict,
                           naxis1, naxis2, beamsize_deg,
                           ra_min, ra_max, dec_min, dec_max,
-                          kernel_fwhm_deg=None):
+                          kernel_fwhm_deg=None, need_weight_grid=False):
     """Pool initializer — stores shared geometry in each worker process once."""
     global _gridding_worker_state
     _gridding_worker_state = dict(
@@ -1288,17 +1302,26 @@ def _init_gridding_worker(ras, decs, wcs_header_dict,
         ra_min=ra_min, ra_max=ra_max,
         dec_min=dec_min, dec_max=dec_max,
         kernel_fwhm_deg=kernel_fwhm_deg,
+        need_weight_grid=need_weight_grid,
     )
 
 
 def _grid_channel_worker(args):
-    """Worker: grid one spectral channel and return (ichannel, 2D map or None)."""
+    """Worker: grid one spectral channel.
+
+    Returns (ichannel, 2D map or None, 2D weight-sum map or None). The weight
+    map is only computed when the pool was initialised with
+    need_weight_grid=True (i.e. a full per-channel weight cube was
+    requested) — it grids the same per-channel weight array used for the
+    data, with no further re-weighting, mirroring weight_map_2d below but
+    per channel instead of once.
+    """
     ichannel, channel_data, weights = args
     s = _gridding_worker_state
     valid = (np.isfinite(s['ras']) & np.isfinite(s['decs']) &
              np.isfinite(channel_data))
     if not np.any(valid):
-        return ichannel, None
+        return ichannel, None, None
     w = weights[valid] if weights is not None else None
     channel_map = grid_to_map(
         s['ras'][valid], s['decs'][valid], channel_data[valid],
@@ -1310,7 +1333,19 @@ def _grid_channel_worker(args):
         weights=w,
         kernel_fwhm_deg=s.get('kernel_fwhm_deg'),
     )
-    return ichannel, channel_map
+    channel_weight_map = None
+    if s.get('need_weight_grid') and w is not None:
+        channel_weight_map = grid_to_map(
+            s['ras'][valid], s['decs'][valid], w,
+            wcs_header_dict=s['wcs_header_dict'],
+            naxis1=s['naxis1'], naxis2=s['naxis2'],
+            beamsize_deg=s['beamsize_deg'],
+            ra_min=s['ra_min'], ra_max=s['ra_max'],
+            dec_min=s['dec_min'], dec_max=s['dec_max'],
+            weights=None,
+            kernel_fwhm_deg=s.get('kernel_fwhm_deg'),
+        )
+    return ichannel, channel_map, channel_weight_map
 
 
 # ---------------------------------------------------------------------------
@@ -1326,7 +1361,8 @@ def create_spectral_datacube(hdul: fits.HDUList,
                             n_jobs: int = -1,
                             weight_column: Optional[str] = None,
                             channel_weights: bool = False,
-                            kernel_fwhm_arcsec: Optional[float] = None) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
+                            kernel_fwhm_arcsec: Optional[float] = None,
+                            create_weights_datacube: bool = False) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -1357,6 +1393,15 @@ def create_spectral_datacube(hdul: fits.HDUList,
         Weight for spectrum i at channel c: exp(-tau_{i,c}) / tsys_{i,c}.
         Unlike create_integrated_map (which collapses to a scalar), this uses
         the channel-specific weight for each channel slice individually.
+    create_weights_datacube : bool, optional
+        If True *and* channel_weights is also True, write a full 3D
+        WEIGHT_CUBE extension (nvel, dec, ra) holding the gridded weight sum
+        per channel — needed because per-channel weights vary channel to
+        channel, so a single 2D plane (as GILDAS's xy_map writes for its
+        channel-independent per-spectrum weights) can't represent them.
+        If channel_weights is False, this has no effect: the existing 2D
+        WEIGHT_MAP/COVERAGE extensions are written exactly as before,
+        whenever weight_column is set.
 
     Returns
     -------
@@ -1612,6 +1657,15 @@ def create_spectral_datacube(hdul: fits.HDUList,
     print(f"Creating datacube: {nvel} channels × {naxis2} × {naxis1} pixels "
           f"(n_jobs={n_workers})...")
 
+    # A full 3D weight cube only makes sense when weights actually vary by
+    # channel (channel_weights=True). Otherwise the per-spectrum weight is
+    # identical for every channel, so the existing 2D WEIGHT_MAP below
+    # already captures it — same reasoning GILDAS's xy_map uses to force its
+    # own .wei file to 2D (see xymap.f90: hwei%gil%ndim = 2).
+    need_weight_cube = bool(channel_weights and create_weights_datacube)
+    weight_cube_3d = (np.full((nvel, naxis2, naxis1), np.nan, dtype=np.float32)
+                       if need_weight_cube else None)
+
     def _get_channel_weights(ichannel):
         """Combine spectrum and channel weights for a single channel slice."""
         sw = spectrum_weights  # per-spectrum scalar (nobs,) or None
@@ -1649,6 +1703,17 @@ def create_spectral_datacube(hdul: fits.HDUList,
                 weights=w,
                 kernel_fwhm_deg=kernel_fwhm_deg,
             )
+            if need_weight_cube and w is not None:
+                weight_cube_3d[ichannel] = grid_to_map(
+                    ras[valid], decs[valid], w,
+                    wcs_header_dict=wcs_header_dict_ch,
+                    naxis1=naxis1, naxis2=naxis2,
+                    beamsize_deg=beamsize_deg,
+                    ra_min=ra_min, ra_max=ra_max,
+                    dec_min=dec_min, dec_max=dec_max,
+                    weights=None,
+                    kernel_fwhm_deg=kernel_fwhm_deg,
+                )
     else:
         from multiprocessing import Pool
         with Pool(
@@ -1661,13 +1726,16 @@ def create_spectral_datacube(hdul: fits.HDUList,
                 naxis1, naxis2, beamsize_deg,
                 ra_min, ra_max, dec_min, dec_max,
                 kernel_fwhm_deg,
+                need_weight_cube,
             ),
         ) as pool:
             n_done = 0
-            for ichannel, channel_map in pool.imap_unordered(
+            for ichannel, channel_map, channel_weight_map in pool.imap_unordered(
                     _grid_channel_worker, channel_args):
                 if channel_map is not None:
                     datacube[ichannel] = channel_map
+                if need_weight_cube and channel_weight_map is not None:
+                    weight_cube_3d[ichannel] = channel_weight_map
                 n_done += 1
                 if n_done % max(1, nvel // 10) == 0:
                     print(f"  {n_done}/{nvel} channels done...", end='\r')
@@ -1693,9 +1761,12 @@ def create_spectral_datacube(hdul: fits.HDUList,
 
     # Compute 2D weight map: grid spectrum_weights with the same kernel so each
     # pixel shows the kernel-weighted sum of spectrum weights (denominator of the
-    # weighted average).  Only computed when per-spectrum weights are present.
+    # weighted average).  Only computed when per-spectrum weights are present,
+    # and skipped when the full 3D weight cube was built instead (that case
+    # already captures everything this 2D map would show, plus the per-channel
+    # variation it can't represent).
     weight_map_2d = None
-    if HAS_CYGRID and spectrum_weights is not None:
+    if HAS_CYGRID and spectrum_weights is not None and not need_weight_cube:
         _weff = kernel_fwhm_deg if kernel_fwhm_deg is not None else beamsize_deg
         _wks = _weff / 2.355
         _wm_gridder = cygrid.WcsGrid(wcs_header_dict_ch)
@@ -1795,6 +1866,7 @@ def create_spectral_datacube(hdul: fits.HDUList,
                         spectral_params=spectral_params,
                         coverage_map=coverage_map_2d,
                         weight_map=weight_map_2d,
+                        weight_cube=weight_cube_3d,
                         weight_column=weight_column)
 
     return datacube, wcs_header, fig

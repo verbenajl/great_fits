@@ -307,6 +307,50 @@ def load_mission_parameters(mission_id, yaml_path=None):
         return {}
 
 
+def load_mission_pca_parameters(yaml_path):
+    """Load per-mission PCA correction parameters from a YAML file.
+
+    Returns a dict mapping mission_id keys to dicts of correction parameters.
+    Supported keys per mission: global_noise_ratio_cutoff, noise_ratio_cutoff,
+    cutoff_variance (alias variance_cutoff), cut_coefficients, line_kernel_size,
+    line_cutoff_std.
+    """
+    import yaml
+    path = Path(yaml_path)
+    if not path.exists():
+        logger.warning(f"Mission PCA parameters file not found: {yaml_path}")
+        return {}
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        if not data or not isinstance(data, dict):
+            return {}
+        return data
+    except Exception as e:
+        logger.warning(f"Error loading mission PCA parameters from {yaml_path}: {e}")
+        return {}
+
+
+def _resolve_mission_param(mission_id, key, mission_pca_params, fallback):
+    """Return the per-mission override for *key*, or *fallback* if not found.
+
+    Uses substring matching (mission_id in yaml_key) so short identifiers like
+    'F367' will match a full key like '2017-02-01_GR_F367'.
+    """
+    if not mission_pca_params or not mission_id:
+        return fallback
+    for yaml_key, params in mission_pca_params.items():
+        if yaml_key and isinstance(params, dict) and mission_id in yaml_key:
+            # Accept both 'cutoff_variance' and 'variance_cutoff' as aliases
+            if key == 'cutoff_variance' and key not in params:
+                val = params.get('variance_cutoff', None)
+            else:
+                val = params.get(key, None)
+            if val is not None:
+                return val
+    return fallback
+
+
 def get_telluric_line_mask(mission_id, velocity_axis_kms, n_spectra, yaml_path=None):
     """
     Create a mask for telluric lines based on mission-specific parameters.
@@ -651,6 +695,50 @@ def _derive_component_cutoffs(kde_params, global_noise_ratio_cutoff, noise_ratio
     return cutoffs
 
 
+def _draw_kde_panel(ax, kde_param, cutoff, comp_idx):
+    """Draw one component's noise-ratio KDE histogram onto an existing axes.
+
+    Shared by the standalone KDE plot (_plot_kde_noise_ratios) and the
+    per-component KDE row embedded at the bottom of each pca_correction plot.
+    """
+    amplitude, center, dev, X_plot, log_dens, indexes, gaussian_width = kde_param
+    ax.set_title(f'Component {comp_idx + 1}', fontsize=8)
+
+    if X_plot is None or log_dens is None:
+        ax.text(0.5, 0.5, 'no data', ha='center', va='center', transform=ax.transAxes)
+        return
+
+    ax.plot(X_plot[:, 0], np.exp(log_dens), '-', lw=1.5, label='KDE')
+
+    if (center is not None and dev is not None
+            and gaussian_width is not None and len(indexes) > 0):
+        first_index = int(indexes[0])
+        sl = slice(max(0, first_index - gaussian_width), first_index + gaussian_width + 1)
+        try:
+            def _gauss(x, a, c, d):
+                return a * np.exp(-((x - c) ** 2) / (2 * d ** 2))
+            ax.plot(
+                X_plot[:, 0][sl],
+                _gauss(X_plot[:, 0][sl], amplitude, center, dev),
+                '--', lw=1, color='orange',
+                label=f'Gauss c={center:.1f} σ={abs(dev):.1f}',
+            )
+        except Exception:
+            pass
+
+    if np.isnan(cutoff):
+        ax.set_facecolor('#ffeeee')
+        ax.text(0.05, 0.9, 'globally rejected', transform=ax.transAxes,
+                fontsize=7, color='red')
+    elif np.isfinite(cutoff):
+        ax.axvline(cutoff, color='red', lw=1.5, linestyle='--',
+                   label=f'cutoff={cutoff:.1f}')
+
+    ax.legend(fontsize=6)
+    ax.set_xlabel('noise ratio', fontsize=7)
+    ax.tick_params(labelsize=7)
+
+
 def _plot_kde_noise_ratios(kde_params, component_cutoffs, output_path, group_label=''):
     """
     Save diagnostic histogram plot of noise ratio KDE distributions per component.
@@ -667,45 +755,10 @@ def _plot_kde_noise_ratios(kde_params, component_cutoffs, output_path, group_lab
     fig = Figure(figsize=(5 * n_cols, 4 * n_rows))
     fig.suptitle(f'Noise ratio KDE per component  {group_label}', fontsize=10)
 
-    def _gauss(x, a, c, d):
-        return a * np.exp(-((x - c) ** 2) / (2 * d ** 2))
-
     for i in range(n_comp):
-        amplitude, center, dev, X_plot, log_dens, indexes, gaussian_width = kde_params[i]
         ax = fig.add_subplot(n_rows, n_cols, i + 1)
-        ax.set_title(f'Component {i + 1}', fontsize=8)
-
-        if X_plot is None or log_dens is None:
-            ax.text(0.5, 0.5, 'no data', ha='center', va='center', transform=ax.transAxes)
-            continue
-
-        ax.plot(X_plot[:, 0], np.exp(log_dens), '-', lw=1.5, label='KDE')
-
-        if (center is not None and dev is not None
-                and gaussian_width is not None and len(indexes) > 0):
-            first_index = int(indexes[0])
-            sl = slice(max(0, first_index - gaussian_width), first_index + gaussian_width + 1)
-            try:
-                ax.plot(
-                    X_plot[:, 0][sl],
-                    _gauss(X_plot[:, 0][sl], amplitude, center, dev),
-                    '--', lw=1, color='orange',
-                    label=f'Gauss c={center:.1f} σ={abs(dev):.1f}',
-                )
-            except Exception:
-                pass
-
         cutoff = component_cutoffs[i] if i < len(component_cutoffs) else np.inf
-        if np.isnan(cutoff):
-            ax.set_facecolor('#ffeeee')
-            ax.text(0.05, 0.9, 'globally rejected', transform=ax.transAxes,
-                    fontsize=7, color='red')
-        elif np.isfinite(cutoff):
-            ax.axvline(cutoff, color='red', lw=1.5, linestyle='--',
-                       label=f'cutoff={cutoff:.1f}')
-
-        ax.legend(fontsize=6)
-        ax.set_xlabel('noise ratio', fontsize=7)
+        _draw_kde_panel(ax, kde_params[i], cutoff, i)
 
     fig.tight_layout()
     FigureCanvasAgg(fig).print_figure(str(output_path), dpi=100)
@@ -1401,7 +1454,8 @@ class PCACorrector:
                          telescope_filter=None, mission_id_filter=None, aor_id_filter=None,
                          mission_decompositions=None,
                          n_jobs=1, global_noise_ratio_cutoff=None,
-                         cut_coefficients=0, flight_filter=None):
+                         cut_coefficients=0, flight_filter=None,
+                         mission_pca_params=None):
         """
         Correct all spectra in a FITS file.
         
@@ -1517,11 +1571,11 @@ class PCACorrector:
 
             if mission_id_filter is not None:
                 mission_ids_filtered = np.array([to_string(data['MISSION_ID'][i]) for i in indices])
-                f = mission_id_filter.strip()
-                mask = np.array([f in mid for mid in mission_ids_filtered])
+                terms = [t.strip() for t in mission_id_filter.split(',') if t.strip()]
+                mask = np.array([any(t in mid for t in terms) for mid in mission_ids_filtered])
                 indices = indices[mask]
-                logger.info(f"  Filtering to {len(indices)} spectra with MISSION_ID containing '{f}'")
-                
+                logger.info(f"  Filtering to {len(indices)} spectra with MISSION_ID matching {terms}")
+
                 # Debug: show what mission_ids are in the filtered data
                 if len(indices) > 0:
                     filtered_mission_ids = np.unique(mission_ids_filtered[mask])
@@ -1532,7 +1586,7 @@ class PCACorrector:
                                          or (isinstance(k, str) and k in filtered_mission_ids)]
                         logger.info(f"  Relevant decompositions ({len(relevant_keys)} of {len(mission_decompositions)} total): {relevant_keys}")
                 else:
-                    logger.warning(f"  WARNING: No spectra found with MISSION_ID='{mission_id_filter}'")
+                    logger.warning(f"  WARNING: No spectra found with MISSION_ID matching {terms}")
                     # Show what mission_ids ARE available
                     unique_mission_ids = np.unique(mission_ids_filtered)
                     logger.info(f"  Available mission_ids in data: {unique_mission_ids}")
@@ -1653,6 +1707,9 @@ class PCACorrector:
             }
 
             n_workers = os.cpu_count() if n_jobs == -1 else max(1, int(n_jobs))
+            if mission_pca_params and n_workers > 1:
+                logger.warning("Per-mission PCA parameters require sequential mode — forcing n_jobs=1")
+                n_workers = 1
             if n_workers > 1:
                 logger.info(f"Parallel correction enabled: {n_workers} workers (n_jobs={n_jobs})")
 
@@ -1769,12 +1826,21 @@ class PCACorrector:
                             continue
 
                         # First pass: correct without science line mask (telluric already excluded)
+                        if mission_pca_params:
+                            _mid = to_string(data['MISSION_ID'][idx])
+                            _eff_vc = _resolve_mission_param(_mid, 'cutoff_variance', mission_pca_params, cutoff_variance)
+                            _eff_cc = _resolve_mission_param(_mid, 'cut_coefficients', mission_pca_params, cut_coefficients)
+                            _eff_gnr = _resolve_mission_param(_mid, 'global_noise_ratio_cutoff', mission_pca_params, global_noise_ratio_cutoff)
+                            _eff_nr = _resolve_mission_param(_mid, 'noise_ratio_cutoff', mission_pca_params, cutoff_noise_ratio) if _eff_gnr else None
+                        else:
+                            _eff_vc, _eff_cc = cutoff_variance, cut_coefficients
+                            _eff_nr = effective_cutoff_noise_ratio
                         corrected, details = self.apply_correction(
                             spectrum,
                             good_channels=good_channels_for_fitting,
                             good_channels_for_subtraction=good_channels_for_subtraction,
-                            cutoff_variance=cutoff_variance,
-                            cutoff_noise_ratio=effective_cutoff_noise_ratio,
+                            cutoff_variance=_eff_vc,
+                            cutoff_noise_ratio=_eff_nr,
                             verbose=False,
                             smoothing_kernel_size=self.smoothing_kernel_size
                         )
@@ -1874,10 +1940,11 @@ class PCACorrector:
                         if hasattr(self, 'line_window_velocities') and self.line_window_velocities:
                             line_window_kms = tuple(self.line_window_velocities)
 
-                        this_cutoff_std = self.line_cutoff_std
+                        this_cutoff_std = _resolve_mission_param(mission_id_group, 'line_cutoff_std', mission_pca_params, self.line_cutoff_std) if mission_pca_params else self.line_cutoff_std
+                        this_kernel_size = _resolve_mission_param(mission_id_group, 'line_kernel_size', mission_pca_params, self.line_kernel_size) if mission_pca_params else self.line_kernel_size
                         group_threshold = find_science_lines(
                             group_corrected_spectra,
-                            kernel_size=self.line_kernel_size,
+                            kernel_size=this_kernel_size,
                             cutoff_std=this_cutoff_std,
                             smoothing_kernel=self.smoothing_kernel_size,
                             velocity_axis_kms=velocity_axis_kms,
@@ -1979,12 +2046,20 @@ class PCACorrector:
                                         self.explained_variance_ratio = saved_variance_ratio
                                     continue
 
+                                if mission_pca_params:
+                                    _mid = to_string(data['MISSION_ID'][idx])
+                                    _eff_vc = _resolve_mission_param(_mid, 'cutoff_variance', mission_pca_params, cutoff_variance)
+                                    _eff_gnr = _resolve_mission_param(_mid, 'global_noise_ratio_cutoff', mission_pca_params, global_noise_ratio_cutoff)
+                                    _eff_nr = _resolve_mission_param(_mid, 'noise_ratio_cutoff', mission_pca_params, cutoff_noise_ratio) if _eff_gnr else None
+                                else:
+                                    _eff_vc = cutoff_variance
+                                    _eff_nr = effective_cutoff_noise_ratio
                                 corrected, details = self.apply_correction(
                                     spectrum,
                                     good_channels=good_channels_for_fitting,
                                     good_channels_for_subtraction=gcs,
-                                    cutoff_variance=cutoff_variance,
-                                    cutoff_noise_ratio=effective_cutoff_noise_ratio,
+                                    cutoff_variance=_eff_vc,
+                                    cutoff_noise_ratio=_eff_nr,
                                     verbose=False,
                                     smoothing_kernel_size=self.smoothing_kernel_size
                                 )
@@ -2006,7 +2081,7 @@ class PCACorrector:
             # global_noise_ratio_cutoff is set — otherwise the existing simple
             # cutoff_noise_ratio threshold is used in phase 3 (backward compat).
             per_spectrum_cutoffs = [None] * len(indices)
-            if global_noise_ratio_cutoff or generate_kde_plots:
+            if global_noise_ratio_cutoff or generate_kde_plots or mission_pca_params:
                 logger.info("STEP 2.5: KDE noise ratio fitting per group")
                 Path(output_dir).mkdir(parents=True, exist_ok=True)
                 for group_row in unique_groups:
@@ -2062,8 +2137,10 @@ class PCACorrector:
                     kde_params = _fit_kde_to_noise_ratios(nr_matrix)
 
                     if kde_params is not None:
+                        _gnr_group = _resolve_mission_param(mission_id_group, 'global_noise_ratio_cutoff', mission_pca_params, global_noise_ratio_cutoff) if mission_pca_params else global_noise_ratio_cutoff
+                        _nr_group  = _resolve_mission_param(mission_id_group, 'noise_ratio_cutoff',        mission_pca_params, cutoff_noise_ratio)         if mission_pca_params else cutoff_noise_ratio
                         component_cutoffs = _derive_component_cutoffs(
-                            kde_params, global_noise_ratio_cutoff, cutoff_noise_ratio)
+                            kde_params, _gnr_group, _nr_group)
                         group_label = (f"{mission_id_group}_{telescope_group}"
                                        f"_scan{scan_id}")
                         logger.info(f"  {group_label}: per-component cutoffs = {component_cutoffs}")
@@ -2071,7 +2148,7 @@ class PCACorrector:
                         kde_data[(mission_id_group, telescope_group, scan_id)] = (
                             kde_params, component_cutoffs)
 
-                        if global_noise_ratio_cutoff:
+                        if _gnr_group:
                             for local_idx in group_local_indices:
                                 per_spectrum_cutoffs[local_idx] = component_cutoffs
                     else:
@@ -2210,17 +2287,24 @@ class PCACorrector:
                             _gcs_in = good_channels_for_subtraction
                             _ch_first, _ch_last = 0, len(_spec_full) - 1
 
+                        if mission_pca_params:
+                            _mid3 = to_string(data['MISSION_ID'][idx])
+                            _eff3_vc = _resolve_mission_param(_mid3, 'cutoff_variance', mission_pca_params, cutoff_variance)
+                            _eff3_cc = _resolve_mission_param(_mid3, 'cut_coefficients', mission_pca_params, cut_coefficients)
+                        else:
+                            _eff3_vc = cutoff_variance
+                            _eff3_cc = cut_coefficients
                         corrected_slice, details = _pca_apply_correction(
                             _spec_in,
                             self.components,
                             self.explained_variance_ratio,
                             _gcf_in,
                             _gcs_in,
-                            cutoff_variance,
+                            _eff3_vc,
                             effective_cutoff_noise_ratio,
                             self.smoothing_kernel_size,
                             use_lstsq=self.use_lstsq,
-                            cut_coefficients=cut_coefficients,
+                            cut_coefficients=_eff3_cc,
                             per_component_cutoffs=per_spectrum_cutoffs[spec_idx],
                         )
                         corrected = _spec_full.copy()
@@ -2280,17 +2364,33 @@ class PCACorrector:
             # Preserve calibration objects (TSYS, TAU_SIG) even when filtering
             # These are needed for downstream analysis and pairing with M51CENTER
             if object_filter:
-                # Get indices of calibration objects to preserve
-                calibration_mask = np.array([
-                    _obj_str(s) in ('TSYS', 'TAU_SIG')
-                    for s in data['OBJECT']
-                ])
-                calibration_indices = np.where(calibration_mask)[0]
-                
+                # When aor_id_filter is also active, preserve only calibration rows
+                # actually referenced by the selected spectra — not all rows in the file.
+                # Without aor_id_filter, fall back to all TSYS/TAU_SIG rows.
+                if aor_id_filter:
+                    referenced_cal = set()
+                    if 'TSYS_INDEX' in data.dtype.names:
+                        for i in indices:
+                            ref = data['TSYS_INDEX'][i]
+                            if ref >= 0:
+                                referenced_cal.add(int(ref))
+                    if 'TAU_SIG_INDEX' in data.dtype.names:
+                        for i in indices:
+                            ref = data['TAU_SIG_INDEX'][i]
+                            if ref >= 0:
+                                referenced_cal.add(int(ref))
+                    calibration_indices = np.array(sorted(referenced_cal), dtype=int)
+                else:
+                    calibration_mask = np.array([
+                        _obj_str(s) in ('TSYS', 'TAU_SIG')
+                        for s in data['OBJECT']
+                    ])
+                    calibration_indices = np.where(calibration_mask)[0]
+
                 # Combine filtered science object indices with calibration indices
                 all_indices_to_keep = np.concatenate([indices, calibration_indices])
                 all_indices_to_keep = np.sort(all_indices_to_keep)
-                
+
                 logger.info(f"Filters applied - preserving {len(indices)} corrected {object_filter} + {len(calibration_indices)} calibration spectra (TSYS/TAU_SIG)")
                 filtered_data = data[all_indices_to_keep]
                 
@@ -2343,15 +2443,65 @@ class PCACorrector:
                         logger.debug(f"Restoring header keyword {key} that was lost during table restructuring")
                         output_table.header[key] = value
                         
+            elif aor_id_filter:
+                # Preserve only the calibration rows (TSYS, TAU_SIG) actually referenced
+                # by the selected AOR spectra — not all calibration rows in the file.
+                referenced_cal = set()
+                if 'TSYS_INDEX' in data.dtype.names:
+                    for i in indices:
+                        ref = data['TSYS_INDEX'][i]
+                        if ref >= 0:
+                            referenced_cal.add(int(ref))
+                if 'TAU_SIG_INDEX' in data.dtype.names:
+                    for i in indices:
+                        ref = data['TAU_SIG_INDEX'][i]
+                        if ref >= 0:
+                            referenced_cal.add(int(ref))
+                calibration_indices = np.array(sorted(referenced_cal), dtype=int)
+
+                all_indices_to_keep = np.sort(np.concatenate([indices, calibration_indices]))
+
+                logger.info(f"Filters applied - preserving {len(indices)} corrected AOR_ID={aor_id_filter} + {len(calibration_indices)} calibration spectra (TSYS/TAU_SIG)")
+                filtered_data = data[all_indices_to_keep]
+
+                row_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(all_indices_to_keep)}
+
+                if 'TSYS_INDEX' in filtered_data.columns.names:
+                    old_tsys_indices = filtered_data['TSYS_INDEX'].copy()
+                    new_tsys_indices = np.full_like(old_tsys_indices, -1, dtype=np.int32)
+                    for new_row_idx in range(len(filtered_data)):
+                        old_tsys_ref = old_tsys_indices[new_row_idx]
+                        if old_tsys_ref >= 0 and old_tsys_ref in row_mapping:
+                            new_tsys_indices[new_row_idx] = row_mapping[old_tsys_ref]
+                    filtered_data['TSYS_INDEX'] = new_tsys_indices
+                    logger.debug(f"Remapped TSYS_INDEX: {np.sum(new_tsys_indices >= 0)} entries now point to correct rows in output file")
+
+                if 'TAU_SIG_INDEX' in filtered_data.columns.names:
+                    old_tau_indices = filtered_data['TAU_SIG_INDEX'].copy()
+                    new_tau_indices = np.full_like(old_tau_indices, -1, dtype=np.int32)
+                    for new_row_idx in range(len(filtered_data)):
+                        old_tau_ref = old_tau_indices[new_row_idx]
+                        if old_tau_ref >= 0 and old_tau_ref in row_mapping:
+                            new_tau_indices[new_row_idx] = row_mapping[old_tau_ref]
+                    filtered_data['TAU_SIG_INDEX'] = new_tau_indices
+                    logger.debug(f"Remapped TAU_SIG_INDEX: {np.sum(new_tau_indices >= 0)} entries now point to correct rows in output file")
+
+                header_keywords_to_preserve = dict(header)
+                output_table = fits.BinTableHDU(filtered_data, header=header)
+                for key, value in header_keywords_to_preserve.items():
+                    if key not in output_table.header:
+                        logger.debug(f"Restoring header keyword {key} that was lost during table restructuring")
+                        output_table.header[key] = value
+
             elif scan_filter is not None or subscan_filter is not None or telescope_filter or mission_id_filter:
                 logger.info(f"Filters applied - writing only {len(indices)} filtered spectra to output")
                 filtered_data = data[indices]
-                
+
                 # Preserve ALL header keywords before table restructuring
                 header_keywords_to_preserve = dict(header)
-                
+
                 output_table = fits.BinTableHDU(filtered_data, header=header)
-                
+
                 # Restore any header keywords that were lost during table restructuring
                 for key, value in header_keywords_to_preserve.items():
                     if key not in output_table.header:
@@ -2373,23 +2523,36 @@ class PCACorrector:
                         output_table.header[key] = value
             
             # Add PCAPARAM as a column so it is visible per-row alongside SPECTRUM etc.
+            # When per-mission parameters are active, each row gets the effective values
+            # for its own MISSION_ID rather than a single global string.
             def _fmt(v):
                 return 'none' if v is None or v is False else str(v)
-            pca_param_str = (
-                f"vc={_fmt(cutoff_variance)} "
-                f"nr={_fmt(cutoff_noise_ratio)} "
-                f"sk={_fmt(self.smoothing_kernel_size)} "
-                f"cc={_fmt(cut_coefficients)} "
-                f"gnr={_fmt(global_noise_ratio_cutoff)} "
-                f"lk={self.line_kernel_size} "
-                f"ls={self.line_cutoff_std} "
-                f"lstsq={int(self.use_lstsq)}"
-            )
+
+            def _row_param_str(mission_id_val):
+                eff_vc  = _resolve_mission_param(mission_id_val, 'cutoff_variance',         mission_pca_params, cutoff_variance)
+                eff_nr  = _resolve_mission_param(mission_id_val, 'noise_ratio_cutoff',       mission_pca_params, cutoff_noise_ratio)
+                eff_cc  = _resolve_mission_param(mission_id_val, 'cut_coefficients',         mission_pca_params, cut_coefficients)
+                eff_gnr = _resolve_mission_param(mission_id_val, 'global_noise_ratio_cutoff',mission_pca_params, global_noise_ratio_cutoff)
+                eff_lk  = _resolve_mission_param(mission_id_val, 'line_kernel_size',         mission_pca_params, self.line_kernel_size)
+                eff_ls  = _resolve_mission_param(mission_id_val, 'line_cutoff_std',          mission_pca_params, self.line_cutoff_std)
+                return (f"vc={_fmt(eff_vc)} nr={_fmt(eff_nr)} sk={_fmt(self.smoothing_kernel_size)} "
+                        f"cc={_fmt(eff_cc)} gnr={_fmt(eff_gnr)} lk={eff_lk} ls={eff_ls} lstsq={int(self.use_lstsq)}")
+
             n_rows = len(output_table.data)
+            if mission_pca_params and 'MISSION_ID' in output_table.data.dtype.names:
+                row_strings = [_row_param_str(to_string(output_table.data['MISSION_ID'][i]))
+                               for i in range(n_rows)]
+            else:
+                single = (f"vc={_fmt(cutoff_variance)} nr={_fmt(cutoff_noise_ratio)} "
+                          f"sk={_fmt(self.smoothing_kernel_size)} cc={_fmt(cut_coefficients)} "
+                          f"gnr={_fmt(global_noise_ratio_cutoff)} lk={self.line_kernel_size} "
+                          f"ls={self.line_cutoff_std} lstsq={int(self.use_lstsq)}")
+                row_strings = [single] * n_rows
+            max_len = max(len(s) for s in row_strings)
             pcaparam_col = fits.Column(
                 name='PCAPARAM',
-                format=f'{len(pca_param_str)}A',
-                array=np.full(n_rows, pca_param_str),
+                format=f'{max_len}A',
+                array=np.array(row_strings),
             )
             output_table = fits.BinTableHDU.from_columns(
                 output_table.columns + fits.ColDefs([pcaparam_col]),
@@ -2594,12 +2757,29 @@ class PCACorrector:
                 logger.warning(f"mission_id={mission_id}, telescope={telescope}, scan={scan}: Empty x_axis (skipping plot)")
                 continue
             
-            # Create figure (25x10 to match pca_correct.py)
-            fig = Figure(figsize=(25, 10))
+            # Create figure (25x10 main area to match pca_correct.py, plus an
+            # extra row at the bottom for the per-component KDE noise-ratio
+            # panels when KDE data is available).
+            _has_kde_row = bool(kde_data)
+            KDE_ROW_FRAC = 0.18 if _has_kde_row else 0.0
+            fig_height = 10.0 / (1.0 - KDE_ROW_FRAC) if _has_kde_row else 10.0
+            fig = Figure(figsize=(25, fig_height))
             canvas = FigureCanvasAgg(fig)
-            
+
             plot_width = 0.17
             padding = 0.02
+
+            def _ax(rect):
+                """Place an axes rect (designed for the old 0-1 figure) into
+                the upper (1 - KDE_ROW_FRAC) portion of the figure, leaving
+                the bottom KDE_ROW_FRAC for the KDE panels row."""
+                x, y, w, h = rect
+                return fig.add_axes([
+                    x,
+                    KDE_ROW_FRAC + y * (1.0 - KDE_ROW_FRAC),
+                    w,
+                    h * (1.0 - KDE_ROW_FRAC),
+                ])
             
             # ==================================================================
             # COLUMN 1: ORIGINAL/CORRECTED MEAN + COMPONENTS (LEFT SIDE)
@@ -2626,12 +2806,15 @@ class PCACorrector:
             if plot_decomposition:
                 components_to_plot = plot_decomposition.components
                 variance_ratio_to_plot = plot_decomposition.explained_variance_ratio
+                mean_spectrum_to_plot = getattr(plot_decomposition, 'mean_spectrum', None)
             else:
                 components_to_plot = self.components
                 variance_ratio_to_plot = self.explained_variance_ratio
-            
+                mean_spectrum_to_plot = getattr(self, 'mean_spectrum', None)
+
             n_components_show = len(components_to_plot)
-            spectral_height = 0.85 / (2 + n_components_show)  # 2 for orig/corr + n for components
+            # 3 slots for orig/corr/pca-mean + n for components
+            spectral_height = 0.85 / (3 + n_components_show)
 
             n_display = len(usable_global_indices)
 
@@ -2695,7 +2878,7 @@ class PCACorrector:
                 )
 
             # Original mean
-            ax1 = fig.add_axes([padding, 0.90 - spectral_height, plot_width, spectral_height])
+            ax1 = _ax([padding, 0.90 - spectral_height, plot_width, spectral_height])
             _shade_masks(ax1)
             ax1.plot(x_axis, original_mean, 'r-', lw=1.5)
             ax1.set_title('Original Mean', fontsize=10)
@@ -2704,7 +2887,7 @@ class PCACorrector:
             ax1.tick_params(labelsize=8)
 
             # Corrected mean
-            ax2 = fig.add_axes([padding, 0.90 - 2*spectral_height, plot_width, spectral_height])
+            ax2 = _ax([padding, 0.90 - 2*spectral_height, plot_width, spectral_height])
             _shade_masks(ax2)
             ax2.plot(x_axis, original_mean, 'r-', lw=1, alpha=0.5, label='Orig')
             ax2.plot(x_axis, corrected_mean, 'g-', lw=1.5, label='Corr')
@@ -2713,10 +2896,29 @@ class PCACorrector:
             ax2.legend(fontsize=8, loc='upper right')
             ax2.grid(True, alpha=0.3)
             ax2.tick_params(labelsize=8)
-            
+
+            # PCA mean (pca.mean_ — the per-channel centering vector computed once
+            # at decomposition time from the SKYCHOPDIFF training set; NOT the
+            # mean of the science spectra above, and not used in the actual
+            # correction subtraction). Matches legacy plot_pca_decomposition's
+            # "mean" row, shown between corrected_mean and component 1.
+            ax_mean = _ax([padding, 0.90 - 3*spectral_height, plot_width, spectral_height])
+            if mean_spectrum_to_plot is not None and len(x_axis) > 0 and len(mean_spectrum_to_plot) == len(x_axis):
+                ax_mean.plot(x_axis, mean_spectrum_to_plot, 'k-', lw=1)
+            elif mean_spectrum_to_plot is not None:
+                ax_mean.plot(mean_spectrum_to_plot, 'k-', lw=1)
+            else:
+                ax_mean.text(0.5, 0.5, 'no mean_spectrum stored', ha='center', va='center',
+                             transform=ax_mean.transAxes, fontsize=8, color='red')
+            ax_mean.text(0.03, 0.9, 'PCA mean (training mean)', transform=ax_mean.transAxes,
+                        fontsize=8, va='top')
+            ax_mean.grid(True, alpha=0.3)
+            ax_mean.tick_params(labelsize=8)
+            ax_mean.set_xticklabels([])
+
             # Components
             for i in range(n_components_show):
-                axi = fig.add_axes([padding, 0.90 - (2+i+1)*spectral_height, plot_width, spectral_height])
+                axi = _ax([padding, 0.90 - (3+i+1)*spectral_height, plot_width, spectral_height])
                 if len(x_axis) > 0 and len(components_to_plot[i]) == len(x_axis):
                     axi.plot(x_axis, components_to_plot[i], 'k-', lw=1)
                 elif len(x_axis) > 0:
@@ -2733,7 +2935,7 @@ class PCACorrector:
             # ==================================================================
             # COLUMN 2: WATERFALL + BEFORE HEATMAP (TOP-MID LEFT)
             # ==================================================================
-            ax_waterfall = fig.add_axes([2*padding + plot_width, 0.55, plot_width, 0.35])
+            ax_waterfall = _ax([2*padding + plot_width, 0.55, plot_width, 0.35])
             
             # Get the correct decomposition for this specific mission/telescope
             plot_decomposition = self.get_decomposition_for_mission(mission_id, telescope, mission_decompositions)
@@ -2808,7 +3010,7 @@ class PCACorrector:
                 else:
                     logger.debug(f"No thresholds found for mission_id={mission_str}, scan={scan_str}, telescope={telescope_str}")
             
-            ax_before = fig.add_axes([2*padding + plot_width, 0.05, plot_width, 0.45])
+            ax_before = _ax([2*padding + plot_width, 0.05, plot_width, 0.45])
             
             # Display original spectra as heatmap
             before_display = original_spectra_subset[:n_display].copy()
@@ -2926,7 +3128,7 @@ class PCACorrector:
             # COLUMN 3: DIFFERENCE + AFTER HEATMAP (TOP-MID)
             # ==================================================================
             # Difference heatmap
-            ax_diff = fig.add_axes([3*padding + 2*plot_width, 0.55, plot_width, 0.35])
+            ax_diff = _ax([3*padding + 2*plot_width, 0.55, plot_width, 0.35])
             difference = original_spectra_subset[:n_display] - corrected_spectra_subset[:n_display]
             if len(x_axis) > 0:
                 im_diff = ax_diff.imshow(difference, aspect='auto',
@@ -2943,7 +3145,7 @@ class PCACorrector:
             ax_diff.tick_params(labelsize=8)
             
             # After correction heatmap
-            ax_after = fig.add_axes([3*padding + 2*plot_width, 0.05, plot_width, 0.45])
+            ax_after = _ax([3*padding + 2*plot_width, 0.05, plot_width, 0.45])
             if len(x_axis) > 0:
                 im_after = ax_after.imshow(corrected_spectra_subset[:n_display], aspect='auto',
                                           extent=[x_axis[0], x_axis[-1], n_display, 0],
@@ -2963,7 +3165,7 @@ class PCACorrector:
             # ==================================================================
             # Masked array visualization: show science spectra with masks applied
             # This is the same science spectra as "Before Correction" but with masks shown
-            ax_masked = fig.add_axes([4*padding + 3*plot_width, 0.55, plot_width, 0.35])
+            ax_masked = _ax([4*padding + 3*plot_width, 0.55, plot_width, 0.35])
             
             # Use the same science spectra as the Before Correction plot
             masked_science_spectra = original_spectra_subset[:n_display].copy()
@@ -3060,7 +3262,7 @@ class PCACorrector:
             
             # Coefficients heatmap
             # Plot coefficient magnitudes heatmap
-            ax_coeff = fig.add_axes([4*padding + 3*plot_width, 0.05, plot_width, 0.45])
+            ax_coeff = _ax([4*padding + 3*plot_width, 0.05, plot_width, 0.45])
             all_coefficients = []
             used_mask = []
             for idx in usable_global_indices:
@@ -3176,20 +3378,52 @@ class PCACorrector:
                 telluric_only = None
             ex_telluric_spans = _mask_spans(~telluric_only if telluric_only is not None else None)
             
-            # Plot correction for each component (show all components)
+            # Plot correction for each component (progressive: each row shows
+            # the spectrum after subtracting components 1..N cumulatively)
             n_comp_show = len(components_to_plot)
-            # Allocate space evenly for all components (no separate title, use title area for first component)
             spec_height = 0.90 / n_comp_show
-            
+
+            # Pre-compute scaled components and build cumulative progression.
+            _cf = details.get('ch_first', None)
+            _cl = details.get('ch_last', None)
+            scaled_comps = []
+            for _ci in range(n_comp_show):
+                _info = comp_info.get(_ci, {})
+                _coeff_val = _info.get('coeff', coeffs[_ci] if _ci < len(coeffs) else 0.0)
+                _raw = _coeff_val * components_to_plot[_ci]
+                if len(_raw) == len(x_axis):
+                    _sc = _raw
+                elif _cf is not None and _cl is not None and len(_raw) == _cl - _cf + 1:
+                    _sc = np.zeros(len(x_axis))
+                    _sc[_cf:_cl + 1] = _raw
+                else:
+                    _sc = np.zeros(len(x_axis))
+                    _n = min(len(_raw), len(x_axis))
+                    _sc[:_n] = _raw[:_n]
+                scaled_comps.append(_sc)
+
+            # progressive[i] = spectrum after subtracting components 0..(i-1)
+            # Restricted to gcs_mask to match the real correction
+            # (corrected[good_channels_sub] -= ...) — channels excluded from
+            # subtraction (bad/science line) must stay untouched here too.
+            progressive = [original_ex.copy()]
+            for _ci in range(n_comp_show):
+                prev = progressive[-1].copy()
+                if comp_info.get(_ci, {}).get('used', False):
+                    if ex_gcs_mask is not None and len(ex_gcs_mask) == len(prev):
+                        prev[ex_gcs_mask] -= scaled_comps[_ci][ex_gcs_mask]
+                    else:
+                        prev -= scaled_comps[_ci]
+                progressive.append(prev)
+
             for comp_idx in range(n_comp_show):
-                # First component gets title above it
-                y_pos = 0.90 - (comp_idx + 1)*spec_height
-                
-                ax_ex_comp = fig.add_axes([5*padding + 4*plot_width, 
-                                          y_pos, 
+                y_pos = 0.90 - (comp_idx + 1) * spec_height
+
+                ax_ex_comp = _ax([5*padding + 4*plot_width,
+                                          y_pos,
                                           plot_width, spec_height])
-                
-                # Shade masked regions (same on every sub-panel for easy reading)
+
+                # Shade masked regions
                 for v0, v1 in ex_gcs_excluded:
                     ax_ex_comp.axvspan(v0, v1, color='red', alpha=0.15, zorder=0,
                                        label='excluded (bad/line)' if comp_idx == 0 and v0 == ex_gcs_excluded[0][0] else '_')
@@ -3197,42 +3431,21 @@ class PCACorrector:
                     ax_ex_comp.axvspan(v0, v1, color='blue', alpha=0.12, zorder=0,
                                        label='telluric (sub only)' if comp_idx == 0 and v0 == ex_telluric_spans[0][0] else '_')
 
-                # Plot original, corrected, and component contribution
-                ax_ex_comp.plot(x_axis, original_ex, 'k-', lw=1.5, alpha=0.8, label='Orig', zorder=1)
-                ax_ex_comp.plot(x_axis, corrected_ex, color='green', lw=1.5, alpha=0.8, label='Corr', zorder=2)
-                
-                # Use the coefficient that was actually applied during subtraction
-                # (re-fitted on surviving components for used ones), not the
-                # original full-set fit coefficient — otherwise the plotted
-                # "Comp" curve doesn't match what was subtracted from "Orig".
-                info = comp_info.get(comp_idx, {})
-                coeff_val = info.get('coeff', coeffs[comp_idx])
-                scaled_comp_raw = coeff_val * components_to_plot[comp_idx]
-                # Embed component into full channel range so it always plots against x_axis.
-                # Without this, a trimmed (shorter) component would be plotted at channel
-                # indices 0,1,2,... as x-values instead of velocities, appearing as a
-                # narrow compressed line in only part of the panel.
-                # Use the channel range actually used for THIS spectrum's correction
-                # (set by _pca_apply_correction_worker), not the corrector's default
-                # metadata — per-mission decompositions can use a different range.
-                _cf = details.get('ch_first', None)
-                _cl = details.get('ch_last', None)
-                if len(scaled_comp_raw) == len(x_axis):
-                    scaled_comp = scaled_comp_raw
-                elif _cf is not None and _cl is not None and len(scaled_comp_raw) == _cl - _cf + 1:
-                    scaled_comp = np.zeros(len(x_axis))
-                    scaled_comp[_cf:_cl + 1] = scaled_comp_raw
-                else:
-                    # Fallback: embed at start, zero-pad the rest
-                    scaled_comp = np.zeros(len(x_axis))
-                    n = min(len(scaled_comp_raw), len(x_axis))
-                    scaled_comp[:n] = scaled_comp_raw[:n]
-                ax_ex_comp.plot(x_axis, scaled_comp, 'b-', lw=1, label='Comp')
+                # Progressive: show state before and after this component
+                before = progressive[comp_idx]
+                after  = progressive[comp_idx + 1]
+                ax_ex_comp.plot(x_axis, before, 'k-', lw=1.5, alpha=0.6,
+                                label='Before' if comp_idx == 0 else '_', zorder=1)
+                ax_ex_comp.plot(x_axis, after, color='green', lw=1.5, alpha=0.9,
+                                label='After' if comp_idx == 0 else '_', zorder=2)
+                ax_ex_comp.plot(x_axis, scaled_comps[comp_idx], 'b-', lw=1,
+                                label='Comp' if comp_idx == 0 else '_')
 
-                used = info.get('used', False)
+                info = comp_info.get(comp_idx, {})
+                coeff_val = info.get('coeff', coeffs[comp_idx] if comp_idx < len(coeffs) else 0.0)
                 noise_ratio = info.get('noise_ratio', 0)
-                
-                # Create label
+                used = info.get('used', False)
+
                 label_text = f"C{comp_idx+1}: coeff={coeff_val:.2f}, NR={noise_ratio:.1f}"
                 if not used:
                     label_text += " (NOT USED)"
@@ -3241,33 +3454,25 @@ class PCACorrector:
                 else:
                     ax_ex_comp.text(0.03, 0.85, label_text, transform=ax_ex_comp.transAxes,
                                   fontsize=7, va='top', color='green', fontweight='bold')
-                
-                # Add title above first component
+
                 if comp_idx == 0:
-                    ax_ex_comp.text(0.5, 1.15, f'Example Spectrum #{example_global_idx}\n(Median Correction)',
+                    ax_ex_comp.text(0.5, 1.15, f'Example Spectrum #{example_global_idx}\n(Progressive correction)',
                                   transform=ax_ex_comp.transAxes, ha='center', va='bottom',
                                   fontsize=9, fontweight='bold')
-                
+
                 ax_ex_comp.grid(True, alpha=0.3)
                 ax_ex_comp.tick_params(labelsize=7)
-                
+
                 if comp_idx == 0:
                     ax_ex_comp.legend(fontsize=7, loc='upper right')
-                
+
                 if comp_idx == n_comp_show - 1:
                     ax_ex_comp.set_xlabel(x_label, fontsize=8)
-            
-            fig.suptitle(f'{mission_id} | Scan {scan} | Telescope {telescope} | {len(usable_global_indices)} Spectra', 
-                        fontsize=12, fontweight='bold')
-            
-            # Save plot - one plot per (mission_id, telescope, scan) group
-            plot_file = os.path.join(output_dir,
-                                    f'pca_correction_{mission_id}_scan{scan}_{telescope}.png')
-            fig.savefig(plot_file, dpi=100, bbox_inches='tight')
-            plt.close(fig)
 
-            # KDE noise ratio plot for this group (if available)
-            if kde_data:
+            # ==================================================================
+            # BOTTOM ROW: KDE noise-ratio diagnostics (one panel per component)
+            # ==================================================================
+            if _has_kde_row:
                 # kde_data keys are built from to_string()-normalized
                 # (mission_id, telescope, scan) in correct_fits_file's STEP 2.5;
                 # normalize the same way here, since `missions`/`telescopes`/`scans`
@@ -3280,15 +3485,39 @@ class PCACorrector:
                     (_to_string(mission_id), _to_string(telescope), _to_string(scan)))
                 if group_kde is not None:
                     kde_params_g, component_cutoffs_g = group_kde
-                    group_label = f"{mission_id}_{telescope}_scan{scan}"
-                    kde_dir = Path(output_dir) / "kde"
-                    kde_dir.mkdir(parents=True, exist_ok=True)
-                    kde_plot_path = kde_dir / f"pca_correction_{group_label}_kdeplot.png"
-                    try:
-                        _plot_kde_noise_ratios(
-                            kde_params_g, component_cutoffs_g, kde_plot_path, group_label)
-                    except Exception as e:
-                        logger.warning(f"  KDE plot failed for {group_label}: {e}")
+                    n_kde = len(kde_params_g)
+                    if n_kde > 0:
+                        kde_pad = 0.01
+                        kde_width = (1.0 - (n_kde + 1) * kde_pad) / n_kde
+                        kde_height = KDE_ROW_FRAC - 0.07
+                        for i in range(n_kde):
+                            ax_kde = fig.add_axes([
+                                kde_pad + i * (kde_width + kde_pad),
+                                0.02,
+                                kde_width,
+                                kde_height,
+                            ])
+                            cutoff = (component_cutoffs_g[i] if i < len(component_cutoffs_g)
+                                      else np.inf)
+                            try:
+                                _draw_kde_panel(ax_kde, kde_params_g[i], cutoff, i)
+                            except Exception as e:
+                                logger.warning(f"  KDE panel {i} failed: {e}")
+                        fig.text(0.5, KDE_ROW_FRAC - 0.005,
+                                 'Noise ratio KDE per component  '
+                                 '(red dashed = cutoff, red bg = globally rejected)',
+                                 ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+            fig.suptitle(f'{mission_id} | Scan {scan} | Telescope {telescope} | {len(usable_global_indices)} Spectra',
+                        fontsize=12, fontweight='bold')
+
+            # Save plot - one plot per (mission_id, telescope, scan) group, in a per-mission subdir
+            mission_subdir = os.path.join(output_dir, mission_id)
+            os.makedirs(mission_subdir, exist_ok=True)
+            plot_file = os.path.join(mission_subdir,
+                                    f'pca_correction_{mission_id}_scan{scan}_{telescope}.png')
+            fig.savefig(plot_file, dpi=100, bbox_inches='tight')
+            plt.close(fig)
         
         logger.info(f"✓ Generated {total_plots} diagnostic plots")
 
@@ -3534,7 +3763,8 @@ Examples:
         '--mission-id',
         type=str,
         default=None,
-        help='Only process spectra from this MISSION_ID (substring match, e.g. F373)'
+        help='Only process spectra whose MISSION_ID contains one of these substrings '
+             '(comma-separated, e.g. F367,F296)'
     )
     parser.add_argument(
         '--aor-id',
@@ -3551,6 +3781,14 @@ Examples:
         dest='filter_flight',
         help='Exclude all spectra whose MISSION_ID contains these strings '
              '(space-separated, e.g. F528 F299).'
+    )
+    parser.add_argument(
+        '--per-mission-parameters',
+        action='store_true',
+        default=False,
+        help='Apply per-mission PCA correction parameters from the file specified in '
+             'config [input][mission_pca_parameters]. If a mission is not in that file, '
+             'falls back to the config [pca] values, then to built-in defaults.'
     )
     
     # Output options (plot-dir default will be set from config)
@@ -3612,6 +3850,7 @@ Examples:
     config_line_cutoff_std = 2.0
     config_smoothing_kernel = None
     config_mission_params_file = None
+    config_mission_pca_params_file = None
     
     try:
         config_path = Path(args.config)
@@ -3704,6 +3943,8 @@ Examples:
             # Check [pca] then [input] then fall back to bundled file.
             config_mission_params_file = (pca_config.get('mission_parameters')
                                           or config.get('input', {}).get('mission_parameters'))
+
+            config_mission_pca_params_file = config.get('input', {}).get('mission_pca_parameters')
             
             logger.debug(f"PCA plots directory from config: {config_plot_dir}")
             if config_input_file:
@@ -3920,8 +4161,20 @@ Examples:
                 os.unlink(temp_decomp_path)
             mission_decompositions_to_use = mission_decompositions
 
+        # Load per-mission PCA parameters if flag is set
+        mission_pca_params = None
+        if args.per_mission_parameters:
+            if config_mission_pca_params_file:
+                mission_pca_params = load_mission_pca_parameters(config_mission_pca_params_file)
+                if mission_pca_params:
+                    logger.info(f"✓ Per-mission PCA parameters loaded from {config_mission_pca_params_file} ({len(mission_pca_params)} missions)")
+                else:
+                    logger.warning("  Per-mission PCA parameters file is empty or could not be read — using global config values")
+            else:
+                logger.warning("  --per-mission-parameters set but config[input][mission_pca_parameters] is not defined — ignoring")
+
         logger.info("Applying PCA correction...")
-        
+
         logger.info(f"Correction parameters:")
         logger.info(f"  Variance cutoff: {cutoff_variance}")
         logger.info(f"  Noise ratio cutoff: {cutoff_noise_ratio}")
@@ -3954,7 +4207,8 @@ Examples:
             aor_id_filter=args.aor_id,
             flight_filter=args.filter_flight,
             mission_decompositions=mission_decompositions_to_use,
-            n_jobs=args.n_jobs
+            n_jobs=args.n_jobs,
+            mission_pca_params=mission_pca_params,
         )
         # Print summary
         logger.info("\n=== Correction Summary ===")
