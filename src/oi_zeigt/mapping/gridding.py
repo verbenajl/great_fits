@@ -6,7 +6,7 @@ observations using cygrid for optimal gridding with Gaussian kernel weighting.
 Falls back to scipy griddata if cygrid is not available.
 """
 
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import os
 from pathlib import Path
 import numpy as np
@@ -529,11 +529,26 @@ def grid_to_map(ras: np.ndarray, decs: np.ndarray, values: np.ndarray,
     grid_map : ndarray, shape (naxis2, naxis1)
         Gridded 2D map as float32.
     """
+    # Default kernel FWHM = full beam. GILDAS's xy_map defaults to beam/3
+    # (xymap.f90: "fwhm = map%beam/3.0") to minimize resolution loss for
+    # densely/Nyquist-sampled, high-S/N data — but that trades sensitivity
+    # for resolution: fewer raw samples contribute to each output pixel, so
+    # noise per pixel goes up. Tried beam/3 here against real M51 [OI] data
+    # (faint, noise-limited, and not as densely cross-scan-sampled as GILDAS
+    # assumes): peak SNR dropped from 21.4 to 13.5. For this kind of
+    # noise-limited line, keeping the kernel >= beam (more smoothing, better
+    # sensitivity) beats GILDAS's resolution-preserving default. Pass
+    # --kernel-fwhm explicitly for the opposite tradeoff if a given dataset
+    # is instead resolution-limited (high S/N, well-sampled).
     effective_fwhm = kernel_fwhm_deg if kernel_fwhm_deg is not None else beamsize_deg
     kernelsize_sigma = effective_fwhm / 2.355
     kernel_type = 'gauss1d'
     kernel_params = (kernelsize_sigma,)
-    kernel_support = 3.0 * kernelsize_sigma
+    # Support (truncation radius) of 3*FWHM, matching GILDAS's xy_map
+    # convention exactly (Gaussian value there is ~1.45e-11, fully
+    # negligible) — wider than a naive 3*sigma (~3*FWHM/2.355), which would
+    # still retain ~1% of the peak at the truncation edge.
+    kernel_support = 3.0 * effective_fwhm
     hpx_maxres = kernelsize_sigma / 2.0
 
     if HAS_CYGRID:
@@ -943,16 +958,19 @@ def create_integrated_map(hdul: fits.HDUList,
             weight_values = weight_values[mask]
         
         # Calculate weights based on quality metric
-        # For RMSRATIO: optimal value is 1.0, so use Gaussian centered at 1.0
-        # weight = exp(-(RMSRATIO - 1.0)^2 / (2*sigma^2))
-        # sigma=0.5 gives reasonable falloff (0.6 at ±0.5, 0.14 at ±1.0)
+        # For RMSRATIO: 1.0 is the theoretical radiometer floor. Spectra at or
+        # below it (RMSRATIO <= 1) keep full weight 1.0; only excess noise
+        # (RMSRATIO > 1) is penalised via a one-sided Gaussian falloff.
+        # sigma=0.5 gives 0.61 at 1.5, 0.14 at 2.0. Deliberately NOT symmetric
+        # about 1.0 — quieter-than-theoretical spectra are never down-weighted.
         weights = np.zeros_like(weight_values, dtype=np.float64)
         valid_weights = np.isfinite(weight_values)
-        
+
         if 'RMSRATIO' in weight_column.upper():
-            # Gaussian weighting centered at 1.0 for RMSRATIO
+            # One-sided Gaussian weighting for RMSRATIO (penalise > 1 only)
             sigma = 0.5
-            weights[valid_weights] = np.exp(-((weight_values[valid_weights] - 1.0) ** 2) / (2 * sigma ** 2))
+            excess = np.clip(weight_values[valid_weights] - 1.0, 0.0, None)
+            weights[valid_weights] = np.exp(-(excess ** 2) / (2 * sigma ** 2))
         else:
             # Generic inverse weighting for other columns (lower is better)
             weights[valid_weights & (weight_values != 0)] = 1.0 / np.abs(weight_values[valid_weights & (weight_values != 0)])
@@ -1556,6 +1574,8 @@ def create_spectral_datacube(hdul: fits.HDUList,
     # --- Compute gridding weights ---
     # spectrum_weights: per-spectrum scalar (shape: nobs), or None
     spectrum_weights = None
+    spectrum_weight_kind = None  # provenance: which transform was applied
+    spectrum_weight_col = None   # provenance: actual column used (post-fallback)
     if weight_column is not None:
         col = weight_column
         if col not in table.names and col == 'RMSRATIOB' and 'RMSRATIO' in table.names:
@@ -1568,15 +1588,22 @@ def create_spectral_datacube(hdul: fits.HDUList,
             wvals = wvals[science_mask]
         if object_filter and has_object_col:
             wvals = wvals[mask]
+        spectrum_weight_col = col
         if 'RMSRATIO' in col.upper():
-            # Gaussian transform centred at 1.0: peak weight for ideal spectra,
-            # decaying for noisier ones (RMSRATIO > 1).
+            # One-sided Gaussian roll-off: spectra at or below the theoretical
+            # radiometer noise (RMSRATIO <= 1) are already as good as it gets and
+            # keep full weight 1.0; only excess noise (RMSRATIO > 1) is penalised,
+            # with a Gaussian falloff (0.61 at 1.5, 0.14 at 2.0). Deliberately NOT
+            # symmetric about 1.0 — a quieter-than-theoretical spectrum must never
+            # be down-weighted relative to an ideal one.
             sigma = 0.5
+            excess = np.clip(wvals - 1.0, 0.0, None)
             spectrum_weights = np.where(
                 np.isfinite(wvals),
-                np.exp(-((wvals - 1.0) ** 2) / (2 * sigma ** 2)),
+                np.exp(-(excess ** 2) / (2 * sigma ** 2)),
                 0.0,
             )
+            spectrum_weight_kind = 'exp(-max(w-1,0)^2/(2*0.5^2))'
         else:
             # Generic column: inverse-variance weighting (w = 1/value²).
             # Non-finite, zero, or negative values get weight 0.
@@ -1585,6 +1612,7 @@ def create_spectral_datacube(hdul: fits.HDUList,
                 1.0 / (wvals ** 2),
                 0.0,
             )
+            spectrum_weight_kind = '1/value^2'
 
     # channel_weight_matrix: per-spectrum per-channel (shape: nobs, nvel), or None
     # Unlike create_integrated_map (which collapses to scalar), we keep the full
@@ -1649,11 +1677,20 @@ def create_spectral_datacube(hdul: fits.HDUList,
     n_workers = os.cpu_count() if n_jobs == -1 else max(1, n_jobs)
     n_workers = min(n_workers, nvel)  # No point having more workers than channels
 
+    # Effective output resolution after convolving the (already beam-sized)
+    # data with the gridding kernel: sqrt(beam^2 + kernel_fwhm^2), same
+    # quantity GILDAS's xy_map tracks as map%reso (vs. map%beam) and writes
+    # to BMAJ/BMIN — see save_map_to_fits call below.
+    _grid_kernel_fwhm_deg = kernel_fwhm_deg if kernel_fwhm_deg is not None else beamsize_deg
+    effective_resolution_deg = float(np.sqrt(beamsize_deg**2 + _grid_kernel_fwhm_deg**2))
     if kernel_fwhm_deg is not None:
         print(f"Gridding kernel FWHM: {kernel_fwhm_arcsec:.1f}\" "
-              f"(beam: {beamsize_deg * 3600:.1f}\")")
+              f"(beam: {beamsize_deg * 3600:.1f}\", effective resolution: "
+              f"{effective_resolution_deg * 3600:.1f}\")")
     else:
-        print(f"Gridding kernel FWHM: {beamsize_deg * 3600:.1f}\" (= beam size)")
+        print(f"Gridding kernel FWHM: {_grid_kernel_fwhm_deg * 3600:.1f}\" (= beam; effective "
+              f"resolution: {effective_resolution_deg * 3600:.1f}\". Pass --kernel-fwhm "
+              f"<smaller value> for sharper-but-noisier resolution-limited cases.)")
     print(f"Creating datacube: {nvel} channels × {naxis2} × {naxis1} pixels "
           f"(n_jobs={n_workers})...")
 
@@ -1745,10 +1782,11 @@ def create_spectral_datacube(hdul: fits.HDUList,
     # Compute 2D coverage map (sum of kernel weights per pixel, independent of channel)
     coverage_map_2d = None
     if HAS_CYGRID:
+        # Must match grid_to_map's kernel exactly (beam default, 3*FWHM support).
         effective_fwhm = kernel_fwhm_deg if kernel_fwhm_deg is not None else beamsize_deg
         _ks = effective_fwhm / 2.355
         _cov_gridder = cygrid.WcsGrid(wcs_header_dict_ch)
-        _cov_gridder.set_kernel('gauss1d', (_ks,), 3.0 * _ks, _ks / 2.0)
+        _cov_gridder.set_kernel('gauss1d', (_ks,), 3.0 * effective_fwhm, _ks / 2.0)
         _valid = np.isfinite(ras) & np.isfinite(decs)
         _cov_gridder.grid(
             np.array(ras[_valid], dtype=np.float64),
@@ -1767,10 +1805,11 @@ def create_spectral_datacube(hdul: fits.HDUList,
     # variation it can't represent).
     weight_map_2d = None
     if HAS_CYGRID and spectrum_weights is not None and not need_weight_cube:
+        # Must match grid_to_map's kernel exactly (beam default, 3*FWHM support).
         _weff = kernel_fwhm_deg if kernel_fwhm_deg is not None else beamsize_deg
         _wks = _weff / 2.355
         _wm_gridder = cygrid.WcsGrid(wcs_header_dict_ch)
-        _wm_gridder.set_kernel('gauss1d', (_wks,), 3.0 * _wks, _wks / 2.0)
+        _wm_gridder.set_kernel('gauss1d', (_wks,), 3.0 * _weff, _wks / 2.0)
         _valid_w = np.isfinite(ras) & np.isfinite(decs)
         _wm_gridder.grid(
             np.array(ras[_valid_w], dtype=np.float64),
@@ -1798,7 +1837,31 @@ def create_spectral_datacube(hdul: fits.HDUList,
         object_name=object_filter or "",
         telescop=telescop,
     )
-    
+
+    # --- Gridding-provenance cards: make the cube self-documenting about how it
+    # was weighted, so channel-weighted and plain cubes can be told apart from
+    # the header alone (not just the filename). ---
+    chan_applied = bool(channel_weights and channel_weight_matrix is not None)
+    grid_method = 'cygrid' if HAS_CYGRID else 'scipy'
+    wcs_header.set('GRIDMETH', grid_method, 'gridding engine (cygrid or scipy)')
+    wcs_header.set('CHANWEI', chan_applied,
+                   'per-channel weighting actually applied')
+    if channel_weights and not chan_applied:
+        # requested but fell back to uniform (missing TSYS_INDEX/TAU_SIG_INDEX) —
+        # exactly the silent no-op we want on the record.
+        wcs_header.set('CHWEIREQ', True,
+                       'per-channel weighting requested but fell back to uniform')
+    if chan_applied:
+        wcs_header.set('CHWEIFRM', '(exp(-tau)/Tsys)^2',
+                       'per-channel weight formula (median-normalised)')
+    wcs_header.set('SPECWEI', spectrum_weight_col or 'NONE',
+                   'per-spectrum weight column')
+    if spectrum_weight_kind is not None:
+        wcs_header.set('SPECWFRM', spectrum_weight_kind,
+                       'per-spectrum weight transform')
+    wcs_header.set('WEICUBE', bool(need_weight_cube),
+                   '3D WEIGHT_CUBE HDU present')
+
     # Create visualization of a sample slice
     mid_channel = nvel // 2
     fig, axes = plt.subplots(1, 3, figsize=figsize)
@@ -1862,7 +1925,7 @@ def create_spectral_datacube(hdul: fits.HDUList,
             'restfreq': restfreq_from_table,
             'veldef': veldef,
         }
-        save_map_to_fits(datacube, wcs_header, output_file, beam_maj_deg=beamsize_deg,
+        save_map_to_fits(datacube, wcs_header, output_file, beam_maj_deg=effective_resolution_deg,
                         spectral_params=spectral_params,
                         coverage_map=coverage_map_2d,
                         weight_map=weight_map_2d,
@@ -1873,8 +1936,316 @@ def create_spectral_datacube(hdul: fits.HDUList,
 
 
 # ---------------------------------------------------------------------------
+# Peak-aligned stacking — visual aid for averaging spectra whose line centre
+# genuinely differs from spaxel to spaxel (e.g. a rotation curve), without
+# that velocity spread itself broadening the averaged line shape.
+# ---------------------------------------------------------------------------
+
+def _peak_aligned_mean_spectrum(spectra_2d: np.ndarray, channels_kms: np.ndarray,
+                                search_range: Optional[Tuple[float, float]] = None) -> np.ndarray:
+    """
+    Average a set of spectra after aligning each one's own peak to a common velocity.
+
+    For each input spectrum, the peak channel is located (within `search_range`
+    if given) and refined to sub-channel precision with a 3-point parabolic fit.
+    Every spectrum is then shifted, by linear interpolation, so its own peak
+    lands on the median peak velocity across all of them, before averaging.
+
+    This is purely a visual aid for inspecting line *shape* (width, asymmetry,
+    wings) from a stack of spectra that legitimately have different centroid
+    velocities — e.g. spaxels spanning a galaxy's rotation curve — where a
+    plain mean would smear the profile out by that velocity spread alone.
+    It is not appropriate for anything that needs the true per-spaxel velocity
+    preserved (use the un-aligned mean for that).
+
+    Parameters
+    ----------
+    spectra_2d : np.ndarray, shape (n_spectra, n_channels)
+        Spectra to align and average — already restricted to whichever pixels
+        are being stacked (zoom box, circular aperture, or the whole map).
+    channels_kms : np.ndarray, shape (n_channels,)
+        Velocity axis, assumed evenly spaced.
+    search_range : (float, float), optional
+        Velocity range to search for the peak in (e.g. the same window used
+        for the moment-0 integration). Defaults to the full axis, which risks
+        picking a noise spike in low-S/N spectra.
+
+    Returns
+    -------
+    np.ndarray, shape (n_channels,)
+        The peak-aligned mean spectrum.
+    """
+    spectra_2d = np.atleast_2d(spectra_2d)
+    n_spec, n_chan = spectra_2d.shape
+
+    if search_range is not None:
+        v_lo, v_hi = sorted(search_range)
+        search_idx = np.where((channels_kms >= v_lo) & (channels_kms <= v_hi))[0]
+    else:
+        search_idx = np.arange(n_chan)
+
+    if len(search_idx) < 3:
+        # Not enough channels to refine a peak — fall back to a plain mean.
+        return np.nanmean(spectra_2d, axis=0)
+
+    dv = float(channels_kms[1] - channels_kms[0])
+
+    peak_velocities = np.full(n_spec, np.nan)
+    for i in range(n_spec):
+        row = spectra_2d[i]
+        sub = row[search_idx]
+        if np.all(np.isnan(sub)):
+            continue
+        k = search_idx[int(np.nanargmax(sub))]
+        # 3-point parabolic refinement around the peak for sub-channel precision.
+        k_lo, k_hi = max(k - 1, 0), min(k + 1, n_chan - 1)
+        y_lo, y0, y_hi = row[k_lo], row[k], row[k_hi]
+        denom = y_lo - 2 * y0 + y_hi
+        if k_lo < k < k_hi and np.isfinite(denom) and denom != 0:
+            delta = float(np.clip(0.5 * (y_lo - y_hi) / denom, -1.0, 1.0))
+        else:
+            delta = 0.0
+        peak_velocities[i] = channels_kms[k] + delta * dv
+
+    valid = np.isfinite(peak_velocities)
+    if not np.any(valid):
+        return np.nanmean(spectra_2d, axis=0)
+    reference_v = float(np.nanmedian(peak_velocities[valid]))
+
+    chan_idx = np.arange(n_chan)
+    shifted = np.empty_like(spectra_2d, dtype=float)
+    for i in range(n_spec):
+        if not valid[i]:
+            shifted[i] = spectra_2d[i]
+            continue
+        shift_chan = (reference_v - peak_velocities[i]) / dv
+        shifted[i] = np.interp(chan_idx - shift_chan, chan_idx, spectra_2d[i],
+                               left=np.nan, right=np.nan)
+
+    return np.nanmean(shifted, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Interactive polygon selection for restricting the rendered area
+# ---------------------------------------------------------------------------
+
+def _interactive_polygon(display_map, colormap='rainbow', title=None):
+    """Let the user draw a polygon on a moment-0 map and return its vertices.
+
+    Interaction (as requested):
+      * MIDDLE mouse button  — drop a polygon vertex
+      * LEFT   mouse button  — close the polygon (finish; needs >= 3 vertices)
+      * RIGHT  mouse button  — undo the last vertex
+
+    Returns a list of (x, y) pixel-coordinate vertices (x = column, y = row),
+    or None if fewer than three vertices were placed. The window is drawn in
+    plain pixel space (origin='lower'), so the returned coordinates map directly
+    onto array indices.
+    """
+    import matplotlib.pyplot as plt
+
+    finite = np.isfinite(display_map)
+    if finite.any():
+        vmin, vmax = np.nanpercentile(display_map[finite], [1, 99])
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+            vmin, vmax = None, None
+    else:
+        vmin, vmax = None, None
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    ax.imshow(display_map, origin='lower', cmap=colormap, vmin=vmin, vmax=vmax)
+    ax.set_xlabel('X pixel')
+    ax.set_ylabel('Y pixel')
+    ax.set_title(title or
+                 'Middle-click: add vertex   |   Left-click: close   |   '
+                 'Right-click: undo')
+
+    verts = []
+    state = {'closed': False}
+    line, = ax.plot([], [], '-o', color='magenta', lw=1.5, ms=5, mfc='yellow')
+
+    def _redraw():
+        if verts:
+            xs = [v[0] for v in verts]
+            ys = [v[1] for v in verts]
+            if state['closed']:
+                xs = xs + [xs[0]]
+                ys = ys + [ys[0]]
+            line.set_data(xs, ys)
+        else:
+            line.set_data([], [])
+        fig.canvas.draw_idle()
+
+    def _on_click(event):
+        # Ignore clicks outside the axes or while a toolbar tool (zoom/pan) is active.
+        if event.inaxes is not ax or event.xdata is None:
+            return
+        tb = getattr(fig.canvas, 'toolbar', None)
+        if tb is not None and getattr(tb, 'mode', ''):
+            return
+        if event.button == 2:            # middle → add vertex
+            verts.append((float(event.xdata), float(event.ydata)))
+            _redraw()
+        elif event.button == 3:          # right → undo
+            if verts:
+                verts.pop()
+                _redraw()
+        elif event.button == 1:          # left → close/finish
+            if len(verts) >= 3:
+                state['closed'] = True
+                _redraw()
+                plt.close(fig)
+
+    cid = fig.canvas.mpl_connect('button_press_event', _on_click)
+    plt.show()
+    fig.canvas.mpl_disconnect(cid)
+
+    if len(verts) >= 3:
+        return verts
+    return None
+
+
+def _polygon_mask(vertices, ny, nx):
+    """Boolean (ny, nx) mask that is True OUTSIDE the given polygon.
+
+    Vertices are (x, y) pixel coordinates (x = column, y = row); pixel centres
+    are tested for containment.
+    """
+    from matplotlib.path import Path as _Path
+    path = _Path(np.asarray(vertices, dtype=float))
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    pts = np.column_stack([xx.ravel(), yy.ravel()])
+    inside = path.contains_points(pts).reshape(ny, nx)
+    return ~inside
+
+
+# ---------------------------------------------------------------------------
 # Collapse 3D datacube to 2D integrated map
 # ---------------------------------------------------------------------------
+
+def _spectral_smooth_nanaware(cube: np.ndarray, sigma_chan: float) -> np.ndarray:
+    """NaN-aware Gaussian smoothing of a cube along the velocity (axis-0) direction.
+
+    Convolves each spaxel's spectrum with a 1D Gaussian of standard deviation
+    ``sigma_chan`` channels, ignoring NaNs (each output channel is renormalised by
+    the summed kernel weight of the finite input channels, so map edges and blanked
+    voxels do not bleed zeros in). Vectorised over the spatial axes; loops only over
+    the ~6·sigma+1 kernel taps. Uses no scipy (see the spatial-smoothing path, which
+    likewise uses astropy) — the kernel is built explicitly here.
+
+    Parameters
+    ----------
+    cube : (nvel, ny, nx) ndarray
+    sigma_chan : float
+        Gaussian standard deviation in channels.
+
+    Returns
+    -------
+    (nvel, ny, nx) ndarray of float64; channels with no finite support are NaN.
+    """
+    if sigma_chan <= 0:
+        return cube
+    half = int(np.ceil(3.0 * sigma_chan))
+    taps = np.arange(-half, half + 1)
+    kernel = np.exp(-0.5 * (taps / sigma_chan) ** 2)
+    kernel /= kernel.sum()
+
+    finite = np.isfinite(cube)
+    c0 = np.where(finite, cube, 0.0).astype(np.float64)
+    wv = finite.astype(np.float64)
+    num = np.zeros_like(c0)
+    den = np.zeros_like(c0)
+    nvel = cube.shape[0]
+    for t, wgt in zip(taps, kernel):
+        if t == 0:
+            num += wgt * c0
+            den += wgt * wv
+        elif t > 0:
+            # output channel i pulls from input channel i+t (edges lose support → lower den)
+            num[:nvel - t] += wgt * c0[t:]
+            den[:nvel - t] += wgt * wv[t:]
+        else:  # t < 0
+            num[-t:] += wgt * c0[:nvel + t]
+            den[-t:] += wgt * wv[:nvel + t]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        out = np.where(den > 0, num / den, np.nan)
+    return out
+
+
+def _velocity_field_from_cube(cube, channels_kms, line_mask, deltav_kms,
+                              snr_min, smooth_pix):
+    """Build a smooth per-pixel line-velocity field v0(x,y) for shuffling.
+
+    Computes the intensity-weighted mean velocity (moment-1) within ``line_mask``,
+    keeps only pixels above ``snr_min`` (so faint/noise pixels don't contribute a
+    noisy centroid), then spatially smooths and gap-fills so a value is defined at
+    EVERY pixel — faint arm pixels inherit v0 from their bright neighbours. That
+    robust, smooth field is what lets the subsequent shuffle centre the line
+    correctly at low S/N without a per-pixel self-peak (unlike peak-range-int).
+
+    Returns (v0_raw, v0_field, snr_map): v0_raw = moment-1 on the good pixels only
+    (NaN elsewhere, for inspection); v0_field = smoothed+filled field used to shuffle.
+    """
+    from astropy.convolution import Gaussian2DKernel, convolve as _convolve
+
+    line = cube[line_mask, :, :]                       # (nline, ny, nx)
+    nline = int(line_mask.sum())
+    off = cube[~line_mask, :, :]
+    with np.errstate(invalid='ignore'):
+        sigma = np.nanstd(off, axis=0) if off.shape[0] >= 2 else np.full(cube.shape[1:], np.nan)
+
+    v = channels_kms[line_mask]
+    I = np.where(np.isfinite(line), line, 0.0)
+    Isum = I.sum(axis=0)                                # (ny, nx)
+    mom0 = Isum * deltav_kms
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mom1 = np.where(Isum != 0, (v[:, None, None] * I).sum(axis=0) / Isum, np.nan)
+        snr_map = np.where((sigma > 0) & np.isfinite(sigma),
+                           mom0 / (sigma * np.sqrt(nline) * deltav_kms), np.nan)
+
+    good = np.isfinite(mom1) & np.isfinite(snr_map) & (snr_map >= snr_min)
+    v0_raw = np.where(good, mom1, np.nan)
+
+    # Smooth + gap-fill: interpolate a smooth field into every pixel.
+    kernel = Gaussian2DKernel(x_stddev=smooth_pix)
+    v0_field = _convolve(v0_raw, kernel, nan_treatment='interpolate',
+                         preserve_nan=False, boundary='extend')
+    # Any pixel still without support falls back to the global median velocity
+    # (near-systemic → ~no shift; these are empty/edge pixels anyway).
+    if np.any(np.isfinite(v0_raw)):
+        v0_field = np.where(np.isfinite(v0_field), v0_field, np.nanmedian(v0_raw))
+    return v0_raw, v0_field.astype(np.float64), snr_map
+
+
+def _shuffle_cube(cube, channels_kms, v0_field, ref_v):
+    """Shift every spaxel's spectrum so its line at v0(x,y) lands at ``ref_v``.
+
+    new[v] = old[v + (v0 - ref_v)]  →  the feature at v0 appears at ref_v.
+    Vectorised fractional-channel shift via linear interpolation between the two
+    bracketing integer shifts (no scipy). Channels shifted past the band edge, and
+    NaN source voxels, become NaN in the aligned cube.
+    """
+    nvel, ny, nx = cube.shape
+    dv_per_index = channels_kms[1] - channels_kms[0]    # signed km/s per channel
+    shift_ch = (v0_field - ref_v) / dv_per_index         # (ny, nx), signed, fractional
+    i0 = np.floor(shift_ch).astype(np.int64)             # (ny, nx)
+    w = (shift_ch - i0)[None, :, :]                      # (1, ny, nx) fractional part
+
+    idx = np.arange(nvel)[:, None, None]
+    src0 = idx + i0[None, :, :]                          # (nvel, ny, nx)
+    src1 = src0 + 1
+    valid0 = (src0 >= 0) & (src0 < nvel)
+    valid1 = (src1 >= 0) & (src1 < nvel)
+    v0v = np.take_along_axis(cube, np.clip(src0, 0, nvel - 1), axis=0)
+    v1v = np.take_along_axis(cube, np.clip(src1, 0, nvel - 1), axis=0)
+    v0v = np.where(valid0, v0v, np.nan)
+    v1v = np.where(valid1, v1v, np.nan)
+    out = (1.0 - w) * v0v + w * v1v
+    # If one neighbour is out of range but the other is in, keep the in-range one.
+    out = np.where(valid0 & ~valid1, v0v, out)
+    out = np.where(valid1 & ~valid0, v1v, out)
+    return out.astype(cube.dtype)
+
 
 def collapse_cube(
     cube_fits: str,
@@ -1899,16 +2270,30 @@ def collapse_cube(
     mask_ra: Optional[float] = None,
     mask_dec: Optional[float] = None,
     mask_radius_arcmin: Optional[float] = None,
+    trim_edges: Optional[str] = None,
     suppress_negative: bool = False,
     suppress_high: Optional[float] = None,
     mode: str = 'moment0',
     peak_range_channels: int = 5,
+    peak_smooth_channels: Optional[float] = None,
+    shuffle: bool = False,
+    shuffle_snr: float = 5.0,
+    shuffle_field_smooth: float = 6.0,
+    shuffle_window_kms: float = 20.0,
+    shuffle_ref_velocity: Optional[float] = None,
+    shuffle_field_output: Optional[str] = None,
     hex_plot: bool = False,
     contour: bool = False,
     stretch: str = 'linear',
+    gamma: float = 1.0,
     smooth_sigma: Optional[float] = None,
     percentile_clip: Optional[Tuple[float, float]] = None,
     snr_threshold: Optional[float] = None,
+    drop_rms: Optional[float] = None,
+    drop_window: Optional[Tuple[float, float]] = None,
+    align_peaks: bool = False,
+    select_polygon: bool = False,
+    polygon: Optional[List[Tuple[float, float]]] = None,
 ) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
@@ -1952,6 +2337,14 @@ def collapse_cube(
     region_radius_arcmin : float, optional
         Radius in arcmin of a circular aperture for spectrum extraction.
         Triggers an extra spectrum panel and a circle overlay on the map(s).
+    align_peaks : bool, optional
+        Before averaging spectra into the zoom/region/full-map spectrum
+        panel(s), shift each one (sub-channel, by interpolation) so its own
+        peak — found within `velocity_range` if given, else the full axis —
+        lands on the median peak velocity of the stack. A visual aid for
+        inspecting line shape from spaxels whose true centroid velocity
+        differs (e.g. a rotation curve), without that spread itself
+        broadening the averaged profile. Default False (plain mean).
     use_wcs : bool
         If True, display map axes in RA/Dec instead of pixel indices.
         Default False.
@@ -2012,17 +2405,92 @@ def collapse_cube(
     # 4. Collapse
     # ------------------------------------------------------------------
     deltav_kms = abs(cdelt3) / 1e3
+
+    # --- Optional velocity-field SHUFFLE (align lines, then integrate narrow) ---
+    # Build a smooth per-pixel line-velocity field from the cube itself (moment-1
+    # on high-S/N pixels, smoothed+filled), shift every spectrum so its line lands
+    # at a common ref velocity, then reset the integration to a NARROW window
+    # around that ref velocity. This removes galaxy rotation from the *velocity
+    # axis* so a tight moment-0 window catches the line everywhere → far less
+    # integrated noise → faint extended/spiral structure survives. The field is
+    # smooth (not a per-pixel self-peak), so faint pixels get the right shift and
+    # need no snr-threshold. Meant for mode=moment0.
+    if shuffle:
+        if velocity_range is None:
+            raise ValueError("--shuffle requires --velocity-range (the line window "
+                             "used to measure the velocity field).")
+        line_mask0 = chan_mask.copy()
+        v0_raw, v0_field, snr_field = _velocity_field_from_cube(
+            cube, channels_kms, line_mask0, deltav_kms, shuffle_snr, shuffle_field_smooth)
+        n_good = int(np.sum(np.isfinite(v0_raw)))
+        if n_good == 0:
+            raise ValueError(f"--shuffle: no pixels reached S/N ≥ {shuffle_snr} in "
+                             f"[{v_min:.0f}, {v_max:.0f}] km/s — cannot build a velocity "
+                             f"field. Lower --shuffle-snr or widen --velocity-range.")
+        ref_v = (float(shuffle_ref_velocity) if shuffle_ref_velocity is not None
+                 else float(np.nanmedian(v0_raw)))
+        print(f"  Shuffle: velocity field from {n_good} pixels (S/N ≥ {shuffle_snr}), "
+              f"v0 range {np.nanmin(v0_raw):.1f}–{np.nanmax(v0_raw):.1f} km/s, "
+              f"field-smooth {shuffle_field_smooth:.1f} px")
+        print(f"  Shuffle: aligning lines to ref velocity {ref_v:.1f} km/s")
+
+        # Optionally write the velocity field for inspection (bad field = main risk).
+        _vf_out = shuffle_field_output
+        if _vf_out is None:
+            _base = (plot_output or fits_output or cube_fits)
+            _vf_out = str(Path(_base).with_suffix('')) + '_vfield.fits'
+        try:
+            _vf_hdr = WCS(header).dropaxis(2).to_header()
+            _vf_hdr['BUNIT'] = 'km/s'
+            _vf_hdr['OBJECT'] = header.get('OBJECT', '').strip()
+            _vf_hdr['REFV'] = (ref_v, '[km/s] shuffle reference velocity')
+            fits.writeto(_vf_out, v0_field.astype(np.float32), _vf_hdr, overwrite=True)
+            print(f"  Shuffle: velocity field written → {_vf_out}")
+        except Exception as _e:
+            print(f"  Shuffle: could not write velocity field ({_e})")
+
+        cube = _shuffle_cube(cube, channels_kms, v0_field, ref_v)
+
+        # Reset integration to a narrow window around the common ref velocity.
+        v_min = ref_v - shuffle_window_kms
+        v_max = ref_v + shuffle_window_kms
+        velocity_range = (v_min, v_max)
+        chan_mask = (channels_kms >= v_min) & (channels_kms <= v_max)
+        print(f"  Shuffle: integrating aligned window {v_min:.1f} – {v_max:.1f} km/s "
+              f"({int(chan_mask.sum())} channels)")
+
+    # --- Optional spectral (velocity-axis) smoothing used only to LOCATE the
+    #     per-pixel peak, never to set the reported intensity. A narrow residual
+    #     spike (e.g. an un-refilled telluric wing) can win a raw np.nanmax, but a
+    #     Gaussian-smoothed spectrum discriminates by width: the broad real line
+    #     survives while a 1–2 channel spike is crushed. We take argmax on the
+    #     smoothed cube, then read the RAW cube at that channel so the map keeps
+    #     true Kelvin amplitudes. astropy (not scipy) convolution to match the
+    #     spatial-smoothing path and the codebase's cygrid/astropy convention.
+    cube_peakfind = cube
+    if peak_smooth_channels is not None and peak_smooth_channels > 0 \
+            and mode in ('peak-intensity', 'peak-range-int'):
+        cube_peakfind = _spectral_smooth_nanaware(cube, float(peak_smooth_channels))
+        print(f"  Peak location via spectral smoothing: sigma = "
+              f"{peak_smooth_channels:.1f} channels ({peak_smooth_channels*deltav_kms:.1f} km/s); "
+              f"reported intensities are raw (unsmoothed)")
+
     if mode == 'peak-intensity':
-        collapsed = np.nanmax(cube, axis=0).astype(np.float32)
+        # Locate the peak channel on the (optionally smoothed) cube, report raw value there.
+        peak_idx = np.argmax(np.where(np.isnan(cube_peakfind), -np.inf, cube_peakfind), axis=0)
+        _ry = np.arange(ny)[:, None]
+        _rx = np.arange(nx)[None, :]
+        collapsed = cube[peak_idx, _ry, _rx].astype(np.float32)
         _map_units = 'K'
         _map_label = 'Peak intensity (K)'
         print(f"  Peak-intensity: full spectrum ({nvel} channels, "
               f"{channels_kms.min():.1f} – {channels_kms.max():.1f} km/s)")
     elif mode == 'peak-range-int':
         sub = cube[chan_mask, :, :]          # (nchan_sel, ny, nx)
+        sub_pf = cube_peakfind[chan_mask, :, :]
         nchan_sel = sub.shape[0]
         # Per-pixel peak channel: replace NaN with -inf so argmax works on all-NaN pixels
-        peak_idx = np.argmax(np.where(np.isnan(sub), -np.inf, sub), axis=0)  # (ny, nx)
+        peak_idx = np.argmax(np.where(np.isnan(sub_pf), -np.inf, sub_pf), axis=0)  # (ny, nx)
         n = peak_range_channels
         print(f"  Peak-range: ±{n} channels around per-pixel peak "
               f"(window up to {2*n+1} ch)")
@@ -2089,6 +2557,92 @@ def collapse_cube(
         print(f"  Circular mask: blanking outside r={mask_radius_arcmin:.1f}′ "
               f"(centre pixel {cx_m:.1f}, {cy_m:.1f})")
 
+    # --- Edge trim: erode the irregular data footprint inward ---
+    # Unlike a rectangular crop, this follows the (irregular) telescope-coverage
+    # boundary and peels a border of uniform thickness off it, so the map keeps
+    # its general shape. trim_edges is a string: a bare number or "N%" peels a
+    # border of N% of the smaller map axis; "Narcsec"/"Narcmin" (or ", ') peels
+    # a fixed angular border.
+    if trim_edges is not None:
+        s = str(trim_edges).strip().lower()
+        pixel_scale_arcsec = abs(float(header.get('CDELT2', 1.0))) * 3600.0
+        try:
+            if s.endswith('arcmin') or s.endswith('am') or s.endswith("'"):
+                val = float(s.rstrip("'").replace('arcmin', '').replace('am', ''))
+                border_px = int(round(val * 60.0 / pixel_scale_arcsec))
+                desc = f"{val:g}′ ({border_px}px)"
+            elif s.endswith('arcsec') or s.endswith('as') or s.endswith('"'):
+                val = float(s.rstrip('"').replace('arcsec', '').replace('as', ''))
+                border_px = int(round(val / pixel_scale_arcsec))
+                desc = f"{val:g}″ ({border_px}px)"
+            else:  # percent (bare number or trailing %) of the smaller map axis
+                pct = float(s.rstrip('%'))
+                border_px = int(round(min(nx, ny) * pct / 100.0))
+                desc = f"{pct:g}% of map ({border_px}px)"
+        except ValueError:
+            border_px = 0
+            desc = None
+            print(f"  Warning: could not parse --trim-edges '{trim_edges}'; ignoring")
+
+        if desc is not None and border_px > 0:
+            # Base footprint: pixels that actually hold integrated data. Coverage,
+            # if present, refines the true telescope footprint.
+            footprint = ~np.all(np.isnan(cube[chan_mask, :, :]), axis=0)
+            if coverage_map is not None:
+                footprint &= (coverage_map > 0)
+
+            # Fill interior holes so we trim ONLY the outer boundary, not rings
+            # around interior masked pixels. "Exterior" = background reachable
+            # from the array border via a 4-connected flood fill.
+            from collections import deque
+            bg = ~footprint
+            exterior = np.zeros_like(footprint)
+            dq = deque()
+            for x in range(nx):
+                for yb in (0, ny - 1):
+                    if bg[yb, x] and not exterior[yb, x]:
+                        exterior[yb, x] = True; dq.append((yb, x))
+            for y in range(ny):
+                for xb in (0, nx - 1):
+                    if bg[y, xb] and not exterior[y, xb]:
+                        exterior[y, xb] = True; dq.append((y, xb))
+            while dq:
+                y, x = dq.popleft()
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    yy2, xx2 = y + dy, x + dx
+                    if 0 <= yy2 < ny and 0 <= xx2 < nx and bg[yy2, xx2] \
+                            and not exterior[yy2, xx2]:
+                        exterior[yy2, xx2] = True; dq.append((yy2, xx2))
+            filled = ~exterior
+
+            # 8-connected erosion by border_px: a pixel survives only if all of
+            # its neighbours are inside the filled footprint. Pixels outside the
+            # array count as background, so a footprint touching the array edge
+            # is trimmed there too.
+            eroded = filled
+            for _ in range(border_px):
+                e = eroded.copy()
+                e[:-1, :] &= eroded[1:, :]
+                e[1:, :] &= eroded[:-1, :]
+                e[:, :-1] &= eroded[:, 1:]
+                e[:, 1:] &= eroded[:, :-1]
+                e[:-1, :-1] &= eroded[1:, 1:]
+                e[:-1, 1:] &= eroded[1:, :-1]
+                e[1:, :-1] &= eroded[:-1, 1:]
+                e[1:, 1:] &= eroded[:-1, :-1]
+                e[0, :] = False; e[-1, :] = False
+                e[:, 0] = False; e[:, -1] = False
+                eroded = e
+
+            trim_ring = footprint & ~eroded
+            if eroded.sum() == 0:
+                print(f"  Warning: --trim-edges {trim_edges} would blank the whole "
+                      f"footprint ({border_px}px erosion); ignoring")
+            else:
+                display_mask |= trim_ring
+                print(f"  Edge trim: peeled {desc} off the coverage footprint "
+                      f"following its shape ({int(trim_ring.sum())} pixels)")
+
     # Pixels where every channel in the integration range is NaN have no data.
     # np.nansum returns 0 for those, so we mask them explicitly here so they
     # show as white in the plot rather than as the colormap colour for zero.
@@ -2141,6 +2695,37 @@ def collapse_cube(
               "(need --velocity-range to identify line-free channels)")
 
     # ------------------------------------------------------------------
+    # 4c2b. Drop-RMS: blank pixels whose per-pixel spectral RMS in a chosen
+    #       velocity window exceeds a limit. RMS is measured directly on the
+    #       gridded/convolved cube (sqrt of the mean square over the window's
+    #       channels), so it flags noisy spaxels an SNR cut can miss.
+    # ------------------------------------------------------------------
+    if drop_rms is not None:
+        if drop_window is not None:
+            dw_min, dw_max = float(drop_window[0]), float(drop_window[1])
+            drop_chan_mask = (channels_kms >= dw_min) & (channels_kms <= dw_max)
+            drop_win_desc = f"{dw_min:.1f}–{dw_max:.1f} km/s"
+        else:
+            # Fall back to the line-free channels (outside --velocity-range).
+            drop_chan_mask = noise_chan_mask
+            drop_win_desc = "line-free channels (outside --velocity-range)"
+        if drop_chan_mask.sum() < 2:
+            print("  Warning: --drop-rms ignored — need >=2 channels in the drop "
+                  "window (give --drop-window, or --velocity-range for the default)")
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                rms_map = np.sqrt(np.nanmean(
+                    cube[drop_chan_mask, :, :] ** 2, axis=0))
+            # Only drop pixels not already masked, with a finite RMS above LIMIT.
+            drop_mask = np.isfinite(rms_map) & (rms_map > drop_rms) & ~display_mask
+            display_mask |= drop_mask
+            collapsed_display[drop_mask] = np.nan
+            print(f"  Drop-RMS: RMS over {drop_win_desc} "
+                  f"({int(drop_chan_mask.sum())} channels) > {drop_rms:g} K "
+                  f"-> masked {int(drop_mask.sum())} additional pixels")
+
+    # ------------------------------------------------------------------
     # 4c3. Suppress negative values: set to 0 rather than NaN so they
     #      show as the zero colour rather than white (no-data).
     # ------------------------------------------------------------------
@@ -2170,6 +2755,35 @@ def collapse_cube(
                                       nan_treatment='interpolate',
                                       preserve_nan=True).astype(np.float32)
         print(f"  Gaussian smoothing applied: sigma = {smooth_sigma:.1f} pixels")
+
+    # ------------------------------------------------------------------
+    # 4e. Restrict the rendered area to a polygon (interactive or explicit)
+    # ------------------------------------------------------------------
+    # Interactive selection draws the current display map and lets the user
+    # enclose the region of interest; explicit `polygon` vertices reuse a
+    # previous selection headlessly. Everything outside the polygon is blanked
+    # in the display, the noise map, and any spectrum extraction (same as the
+    # circular mask). The FITS output keeps the full raw map.
+    if select_polygon and polygon is None:
+        polygon = _interactive_polygon(
+            collapsed_display, colormap=colormap,
+            title=(f"{header.get('OBJECT', '').strip()}  "
+                   "— Middle-click: add vertex | Left-click: close | "
+                   "Right-click: undo"))
+        if polygon is None:
+            print("  Polygon selection: fewer than 3 vertices placed — no polygon applied")
+        else:
+            print("  Polygon selection: "
+                  + " ".join(f"{x:.1f},{y:.1f}" for x, y in polygon))
+
+    if polygon is not None and len(polygon) >= 3:
+        outside_poly = _polygon_mask(polygon, ny, nx)
+        display_mask |= outside_poly
+        collapsed_display[outside_poly] = np.nan
+        if noise_map is not None:
+            noise_map[outside_poly] = np.nan
+        print(f"  Polygon mask: {int(outside_poly.sum())} pixels blanked "
+              f"outside the {len(polygon)}-vertex polygon")
 
     # ------------------------------------------------------------------
     # 5. Build 2D WCS header (drop spectral axis)
@@ -2254,7 +2868,13 @@ def collapse_cube(
         x0 = max(0, cx - zoom_pix // 2)
         x1 = min(nx,  cx + zoom_pix // 2)
         zoomed    = collapsed_display[y0:y1, x0:x1]
-        zoom_spec = np.nanmean(cube[:, y0:y1, x0:x1], axis=(1, 2))
+        zoom_cube_slice = cube[:, y0:y1, x0:x1]
+        if align_peaks:
+            zoom_spec = _peak_aligned_mean_spectrum(
+                zoom_cube_slice.reshape(zoom_cube_slice.shape[0], -1).T,
+                channels_kms, search_range=velocity_range)
+        else:
+            zoom_spec = np.nanmean(zoom_cube_slice, axis=(1, 2))
     else:
         y0 = y1 = x0 = x1 = None
         zoomed = zoom_spec = None
@@ -2281,7 +2901,12 @@ def collapse_cube(
         if n_reg_pix == 0:
             raise ValueError("Region aperture contains no map pixels — "
                              "check pixel coordinates and radius.")
-        region_spec = np.nanmean(cube[:, region_mask], axis=1)
+        region_cube_slice = cube[:, region_mask]  # shape (nvel, n_reg_pix)
+        if align_peaks:
+            region_spec = _peak_aligned_mean_spectrum(
+                region_cube_slice.T, channels_kms, search_range=velocity_range)
+        else:
+            region_spec = np.nanmean(region_cube_slice, axis=1)
         print(f"  Region aperture: {n_reg_pix} pixels, "
               f"centre ({cx_reg:.1f}, {cy_reg:.1f}), r = {radius_pix:.1f} px")
     else:
@@ -2291,8 +2916,28 @@ def collapse_cube(
     # ------------------------------------------------------------------
     # If neither zoom nor region: use full-map mean spectrum
     # ------------------------------------------------------------------
+    # The spectrum is averaged only over the pixels actually rendered
+    # (~display_mask), so a polygon (--select-polygon/--polygon) or circular
+    # aperture (--mask-radius), and any coverage/trim/SNR cut, restrict the
+    # spectrum to the same area shown in the map.
+    full_spec_label = "Mean spectrum — full map"
     if zoom_size_arcmin is None and region_radius_arcmin is None:
-        full_spec = np.nanmean(cube, axis=(1, 2))
+        keep_pix = ~display_mask                         # (ny, nx) rendered pixels
+        n_keep = int(keep_pix.sum())
+        restricted = bool(
+            polygon is not None or mask_radius_arcmin is not None
+            or trim_edges is not None or snr_threshold is not None)
+        if n_keep == 0:
+            full_spec = np.full(cube.shape[0], np.nan)
+        else:
+            sel = cube.reshape(cube.shape[0], -1)[:, keep_pix.ravel()]
+            if align_peaks:
+                full_spec = _peak_aligned_mean_spectrum(
+                    sel.T, channels_kms, search_range=velocity_range)
+            else:
+                full_spec = np.nanmean(sel, axis=1)
+        if restricted:
+            full_spec_label = f"Mean spectrum — selected region ({n_keep} px)"
     else:
         full_spec = None
 
@@ -2329,17 +2974,25 @@ def collapse_cube(
     has_zoom   = zoom_size_arcmin is not None
     has_region = region_radius_arcmin is not None
 
-    fig = plt.figure(figsize=(14, 11))
+    fig = plt.figure(figsize=(16, 11))
 
-    def _add_map_subplot(pos, wcs_proj=None):
+    # Give the map row more height than the spectra row. The maps are square
+    # (equal sky aspect) and share their cell with a colorbar, so they need a
+    # wide, tall top row to grow; the spectra are naturally wide-and-short, so
+    # the smaller bottom row costs them little. The 16"-wide figure + 1.75:1
+    # height split renders maps ≈5.7" (vs ≈4.5" at the old 14"/1:1 layout) and
+    # keeps the spectra ≈3.4" tall. tight_layout() (below) preserves the ratio.
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.75, 1])
+
+    def _add_map_subplot(cell, wcs_proj=None):
         if wcs_proj is not None:
-            return fig.add_subplot(2, 2, pos, projection=wcs_proj)
-        return fig.add_subplot(2, 2, pos)
+            return fig.add_subplot(cell, projection=wcs_proj)
+        return fig.add_subplot(cell)
 
-    ax_full      = _add_map_subplot(1, wcs2d_obj)
-    ax_zoom      = _add_map_subplot(2, wcs2d_zoom) if has_zoom else fig.add_subplot(2, 2, 2)
-    ax_spec_zoom = fig.add_subplot(2, 2, 3)
-    ax_spec_reg  = fig.add_subplot(2, 2, 4)
+    ax_full      = _add_map_subplot(gs[0, 0], wcs2d_obj)
+    ax_zoom      = _add_map_subplot(gs[0, 1], wcs2d_zoom) if has_zoom else fig.add_subplot(gs[0, 1])
+    ax_spec_zoom = fig.add_subplot(gs[1, 0])
+    ax_spec_reg  = fig.add_subplot(gs[1, 1])
 
     # fig.colorbar() shrinks the host axes to make room for the colorbar.
     # When a map panel is redrawn (cla() + _plot_map), repeating that on an
@@ -2379,14 +3032,27 @@ def collapse_cube(
         vmax_p = np.nanpercentile(data, hi)
         return vmin_p, vmax_p
 
-    def _make_norm(vmin_p, vmax_p):
+    def _make_norm(vmin_p, vmax_p, data=None):
         from matplotlib import colors as mcolors
         if stretch == 'sqrt':
             # shift so vmin maps to 0, then apply power 0.5
             return mcolors.PowerNorm(gamma=0.5, vmin=vmin_p, vmax=vmax_p)
+        elif stretch == 'power':
+            # user-tunable power law: gamma<1 lifts faint detail, gamma>1
+            # emphasises bright peaks; gamma=1 is linear, gamma=0.5 is sqrt.
+            return mcolors.PowerNorm(gamma=gamma, vmin=vmin_p, vmax=vmax_p)
         elif stretch == 'log':
             safe_vmin = max(vmin_p, 1e-6 * vmax_p) if vmax_p > 0 else 1e-6
             return mcolors.LogNorm(vmin=safe_vmin, vmax=vmax_p)
+        elif stretch == 'symlog':
+            # linear within +-linthresh of zero, logarithmic beyond — same
+            # colourbar shape as asinh but with an explicit linear threshold,
+            # and it compresses negative noise dips symmetrically. linthresh is
+            # set to ~10% of the colour scale (the noise-level regime).
+            linthresh = max(abs(vmax_p), abs(vmin_p)) * 0.1
+            if linthresh <= 0:
+                linthresh = 1e-6
+            return mcolors.SymLogNorm(linthresh=linthresh, vmin=vmin_p, vmax=vmax_p)
         elif stretch == 'asinh':
             # AsinhNorm available from matplotlib 3.2+; fall back to sqrt if missing
             if hasattr(mcolors, 'AsinhNorm'):
@@ -2397,12 +3063,33 @@ def collapse_cube(
                 import warnings
                 warnings.warn("AsinhNorm requires matplotlib >= 3.2, falling back to sqrt")
                 return mcolors.PowerNorm(gamma=0.5, vmin=vmin_p, vmax=vmax_p)
+        elif stretch == 'histeq':
+            # Histogram equalisation: maps the value distribution to a flat
+            # histogram, maximising displayed contrast at the expense of a
+            # non-uniform (non-quantitative) colourbar. Built from the finite
+            # data within the clip range so it respects --percentile-clip.
+            try:
+                from astropy.visualization import ImageNormalize, HistEqStretch
+                if data is None:
+                    raise ValueError("histeq needs the data array")
+                fin = np.asarray(data)[np.isfinite(data)]
+                sel = fin[(fin >= vmin_p) & (fin <= vmax_p)] if vmax_p > vmin_p else fin
+                if sel.size < 2:
+                    sel = fin
+                if sel.size < 2:
+                    return mcolors.Normalize(vmin=vmin_p, vmax=vmax_p)
+                return ImageNormalize(vmin=vmin_p, vmax=vmax_p,
+                                      stretch=HistEqStretch(sel), clip=False)
+            except Exception as _e:
+                import warnings
+                warnings.warn(f"histeq stretch unavailable ({_e}); falling back to linear")
+                return mcolors.Normalize(vmin=vmin_p, vmax=vmax_p)
         else:  # linear
             return mcolors.Normalize(vmin=vmin_p, vmax=vmax_p)
 
     def _imshow_map(ax, data, title, wcs_proj=None, cmap=colormap):
         vmin_p, vmax_p = _vminmax(data)
-        norm = _make_norm(vmin_p, vmax_p)
+        norm = _make_norm(vmin_p, vmax_p, data)
         cmap_obj = plt.colormaps[cmap].copy() if isinstance(cmap, str) else cmap.copy()
         cmap_obj.set_bad('white')
         im = ax.imshow(data, origin='lower', cmap=cmap_obj,
@@ -2436,7 +3123,7 @@ def collapse_cube(
         finite = np.isfinite(vals)
         xs, ys, vals = xs[finite], ys[finite], vals[finite]
         vmin_p, vmax_p = _vminmax(vals)
-        norm = _make_norm(vmin_p, vmax_p)
+        norm = _make_norm(vmin_p, vmax_p, vals)
         ax.set_xlim(-0.5, _nx - 0.5)
         ax.set_ylim(-0.5, _ny - 0.5)
         tf = ax.get_transform('pixel') if wcs_proj is not None else ax.transData
@@ -2480,7 +3167,7 @@ def collapse_cube(
         return _spec_ylims[ax]
 
     def _plot_spec(ax, vel, spec, title, color='steelblue'):
-        ax.plot(vel, spec, color=color, linewidth=1.0)
+        ax.plot(vel, spec, color=color, linewidth=1.0, drawstyle='steps-mid')
         ax.set_xlabel('Velocity (km/s)')
         ax.set_ylabel('Mean T$_A^*$ (K)')
         ax.set_title(title, fontsize=10)
@@ -2491,8 +3178,32 @@ def collapse_cube(
             ax.legend(fontsize=8)
         ax.set_ylim(_fixed_ylim(ax, spec))
 
+    # When something restricts the rendered area — a polygon or circular aperture
+    # selection, or --trim-edges peeling the outer border — shrink the map view to
+    # the surviving data's bounding box (plus a small margin) so it fills the frame
+    # instead of sitting as a small blob ringed by the blanked border. Cropping to
+    # collapsed_display's finite pixels naturally excludes the trimmed ring, so the
+    # frame follows the map rather than leaving the trimmed-away space blank.
+    crop_to_selection = ((polygon is not None and len(polygon) >= 3)
+                         or mask_radius_arcmin is not None
+                         or trim_edges is not None)
+
+    def _crop_axes_to_data(ax):
+        finite = np.isfinite(collapsed_display)
+        if not finite.any():
+            return
+        ys, xs = np.where(finite)
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        pad_x = max(2.0, 0.05 * (x1 - x0))
+        pad_y = max(2.0, 0.05 * (y1 - y0))
+        ax.set_xlim(x0 - pad_x, x1 + pad_x)
+        ax.set_ylim(y0 - pad_y, y1 + pad_y)
+
     # Full map
     _cb_full = [_plot_map(ax_full, collapsed_display, title_base, wcs_proj=wcs2d_obj)]
+    if crop_to_selection:
+        _crop_axes_to_data(ax_full)
     _cb_zoom = [None]
 
     # Zoom box on full map + zoom panel
@@ -2527,7 +3238,7 @@ def collapse_cube(
                    f"Mean spectrum — zoom {zoom_size_arcmin:.1f}′")
     else:
         _plot_spec(ax_spec_zoom, channels_kms, full_spec,
-                   "Mean spectrum — full map")
+                   full_spec_label)
 
     if has_region:
         _plot_spec(ax_spec_reg, channels_kms, region_spec,
@@ -2676,7 +3387,7 @@ def collapse_cube(
             ax_spec_reg.set_visible(True)
             ax_spec_reg.cla()
             ax_spec_reg.set_axis_on()
-            ax_spec_reg.plot(channels_kms, spec, color='tomato', linewidth=1.0)
+            ax_spec_reg.plot(channels_kms, spec, color='tomato', linewidth=1.0, drawstyle='steps-mid')
             ax_spec_reg.set_xlabel('Velocity (km/s)')
             ax_spec_reg.set_ylabel('T$_A^*$ (K)')
             ax_spec_reg.axhline(0, color='gray', linewidth=0.5, linestyle=':')
@@ -2770,8 +3481,13 @@ def collapse_cube(
                     _zb['y1'] = new_y1
 
                     new_zoomed    = collapsed_display[new_y0:new_y1, new_x0:new_x1]
-                    new_zoom_spec = np.nanmean(cube[:, new_y0:new_y1, new_x0:new_x1],
-                                               axis=(1, 2))
+                    _new_zoom_slice = cube[:, new_y0:new_y1, new_x0:new_x1]
+                    if align_peaks:
+                        new_zoom_spec = _peak_aligned_mean_spectrum(
+                            _new_zoom_slice.reshape(_new_zoom_slice.shape[0], -1).T,
+                            channels_kms, search_range=velocity_range)
+                    else:
+                        new_zoom_spec = np.nanmean(_new_zoom_slice, axis=(1, 2))
 
                     if _zoom_rect[0] is not None:
                         _zoom_rect[0].remove()
@@ -2851,6 +3567,8 @@ def collapse_cube(
             ax_full.cla()
             ax_full.set_position(_ax_full_pos)
             _cb_full[0] = _plot_map(ax_full, new_col_disp, new_title, wcs_proj=wcs2d_obj)
+            if crop_to_selection:
+                _crop_axes_to_data(ax_full)
             pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
             _zoom_rect[0] = ax_full.add_patch(Rectangle(
                 (_zb['x0'] - 0.5, _zb['y0'] - 0.5),
@@ -2888,10 +3606,15 @@ def collapse_cube(
                 _click_circle[0] = cz
 
             # Redraw zoom mean spectrum with updated velocity range
-            new_zoom_spec = np.nanmean(
-                cube[:, _zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']], axis=(1, 2))
+            _zb_slice = cube[:, _zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
+            if align_peaks:
+                new_zoom_spec = _peak_aligned_mean_spectrum(
+                    _zb_slice.reshape(_zb_slice.shape[0], -1).T,
+                    channels_kms, search_range=velocity_range)
+            else:
+                new_zoom_spec = np.nanmean(_zb_slice, axis=(1, 2))
             ax_spec_zoom.cla()
-            ax_spec_zoom.plot(channels_kms, new_zoom_spec, color='steelblue', linewidth=1.0)
+            ax_spec_zoom.plot(channels_kms, new_zoom_spec, color='steelblue', linewidth=1.0, drawstyle='steps-mid')
             ax_spec_zoom.set_xlabel('Velocity (km/s)')
             ax_spec_zoom.set_ylabel('Mean T$_A^*$ (K)')
             ax_spec_zoom.set_title('Mean spectrum — zoom', fontsize=10)

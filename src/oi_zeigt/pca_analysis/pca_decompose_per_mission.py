@@ -359,35 +359,43 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
     logger.info(f"  ✓ Baseline-subtracted {len(spectra)} spectra "
                 f"(order=1, excluded channels {baseline_window})")
 
-    # Apply telluric line masking (from mission-specific parameters)
+    # Exclude the telluric line window from the PCA fit entirely (from mission-
+    # specific parameters), instead of injecting a mean-filled placeholder.
+    # Matches legacy pyclass, which physically trims the channel range before
+    # fitting (apply_pca_exclude_range) so the components never encode anything
+    # about that region. Implemented as a boolean mask rather than a physical
+    # trim so the rest of the pipeline (correction, plotting) keeps working
+    # with full-length, fixed-shape arrays — the excluded channels are
+    # zero-filled back in below, after fitting/smoothing.
+    telluric_mask = None
     if line_window_kms is not None and velocity_axis is not None:
-        logger.info(f"Masking telluric line window {line_window_kms[0]:.1f}-{line_window_kms[1]:.1f} km/s for decomposition")
+        logger.info(f"Excluding telluric line window {line_window_kms[0]:.1f}-{line_window_kms[1]:.1f} km/s from PCA fit")
         logger.info(f"  Velocity axis range: {velocity_axis[0]:.1f} to {velocity_axis[-1]:.1f} km/s ({len(velocity_axis)} channels)")
-        # Find channels in the telluric line window
         v_min, v_max = line_window_kms
-        line_mask = (velocity_axis >= v_min) & (velocity_axis <= v_max)
-        line_channels = np.where(line_mask)[0]
-        
-        if len(line_channels) > 0:
+        candidate_mask = (velocity_axis >= v_min) & (velocity_axis <= v_max)
+        line_channels = np.where(candidate_mask)[0]
+
+        if len(line_channels) == 0:
+            logger.warning(f"  ⚠ No channels found in line window {v_min:.1f}-{v_max:.1f} km/s!")
+        elif len(line_channels) >= spectra.shape[1]:
+            logger.warning(f"  ⚠ Telluric window covers the entire spectrum — ignoring exclusion")
+        else:
             logger.info(f"  Mapped to {len(line_channels)} channels: indices {line_channels[0]}-{line_channels[-1]}")
             logger.info(f"  Actual velocity range in data: {velocity_axis[line_channels[0]]:.1f} to {velocity_axis[line_channels[-1]]:.1f} km/s")
-            # Mask out line regions by setting to mean of continuum
-            for ch in line_channels:
-                if ch < spectra.shape[1]:
-                    # Set masked channels to mean of unmasked channels
-                    continuum = spectra[:, ~np.isin(np.arange(spectra.shape[1]), line_channels)]
-                    spectra[:, ch] = np.mean(continuum, axis=1) if continuum.size > 0 else 0
-            logger.info(f"  ✓ Masked {len(line_channels)} channels in line region")
-        else:
-            logger.warning(f"  ⚠ No channels found in line window {v_min:.1f}-{v_max:.1f} km/s!")
-    
-    # Fit PCA
-    logger.info(f"Fitting PCA with {n_components} components...")
+            telluric_mask = candidate_mask
+            logger.info(f"  ✓ Excluding {len(line_channels)} channels from PCA fit (never mean-filled or otherwise faked)")
+
+    # Fit PCA on the non-telluric channels only
+    fit_spectra = spectra[:, ~telluric_mask] if telluric_mask is not None else spectra
+    logger.info(f"Fitting PCA with {n_components} components on {fit_spectra.shape[1]}/{spectra.shape[1]} channels...")
     decomposer = PCADecomposer(n_components=n_components, scale=False)
-    decomposer.fit(spectra)
+    decomposer.fit(fit_spectra)
 
     # Smooth PCA components with a boxcar kernel (matches legacy smooth_pca_components()
-    # in pca_decompose.py, which used np.convolve with mode='same').
+    # in pca_decompose.py, which used np.convolve with mode='same'). Smoothing runs on
+    # the fitted (possibly telluric-excluded) array, so channels immediately either
+    # side of an excluded window become smoothing neighbours of each other — the same
+    # "stitching" legacy gets from smoothing/baselining a physically trimmed array.
     if smoothing_kernel_size:
         kernel_size = int(smoothing_kernel_size)
         kernel = np.ones(kernel_size) / kernel_size
@@ -397,15 +405,32 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
         decomposer.pca_model.components_ = np.array(smoothed)
         logger.info(f"Smoothed {len(smoothed)} components with boxcar kernel size {kernel_size}")
 
+    components_fit = decomposer.get_components()   # (n_comp, n_channels_fit)
+    mean_fit = decomposer.pca_model.mean_           # (n_channels_fit,)
+
+    # Pad components/mean back to the full channel length, with zero at the
+    # excluded telluric channels — they were never part of the fit, so there is
+    # no eigenvector value to report there. Matches legacy's zero-insertion in
+    # prepare_spectrum_for_plot()/plot_pca_decomposition().
+    if telluric_mask is not None:
+        n_channels_full = spectra.shape[1]
+        components_full = np.zeros((components_fit.shape[0], n_channels_full), dtype=components_fit.dtype)
+        components_full[:, ~telluric_mask] = components_fit
+        mean_full = np.zeros(n_channels_full, dtype=mean_fit.dtype)
+        mean_full[~telluric_mask] = mean_fit
+    else:
+        components_full = components_fit
+        mean_full = mean_fit
+
     # Create result
     if spectrum_indices is not None:
         logger.info(f"Creating DecompositionResult with {len(spectrum_indices)} spectrum indices")
     else:
         logger.info(f"Creating DecompositionResult with NO spectrum indices (spectrum_indices is None)")
-    
+
     result = DecompositionResult(
-        mean_spectrum=decomposer.pca_model.mean_,
-        components=decomposer.get_components(),
+        mean_spectrum=mean_full,
+        components=components_full,
         explained_variance=decomposer.get_explained_variance(),
         explained_variance_ratio=decomposer.get_explained_variance_ratio(),
         config=DecompositionConfig(n_components=n_components),
@@ -417,6 +442,7 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
             'source': pca_source,
             'mission_id': mission_id,
             'velocity_axis_kms': velocity_axis,
+            'telluric_mask': telluric_mask,
         },
         reference_spectrum_indices=spectrum_indices  # Store indices to retrieve spectra from original FITS
     )
@@ -738,7 +764,25 @@ def main_cli():
         logger.info(f"\n{'='*80}")
         logger.info(f"PROCESSING {len(mission_data)} MISSION/TELESCOPE COMBINATIONS")
         logger.info(f"{'='*80}\n")
-        
+
+        # Per-mission n_components: reuse the SAME per-mission YAML + key matching
+        # that pca_correct --per-mission-parameters uses (config[input][mission_pca_parameters]).
+        # Precedence for n_components: CLI --n-components  >  per-mission YAML  >
+        # config [pca][n_components]  >  default. `n_components` computed above is
+        # the base/fallback; a CLI value overrides the YAML globally.
+        from oi_zeigt.pca_analysis.pca_correct_fits import (
+            load_mission_pca_parameters, _resolve_mission_param)
+        mission_pca_params = {}
+        _pca_yaml = config.get('input', {}).get('mission_pca_parameters')
+        if args.n_components is not None:
+            logger.info(f"--n-components given on CLI ({n_components}); "
+                        f"per-mission n_components in the YAML will be ignored")
+        elif _pca_yaml:
+            mission_pca_params = load_mission_pca_parameters(_pca_yaml)
+            if mission_pca_params:
+                logger.info(f"✓ Loaded per-mission PCA parameters from {_pca_yaml} "
+                            f"({len(mission_pca_params)} missions) — honouring per-mission n_components")
+
         # Decompose each mission/telescope combination
         results = {}
         output_files = []
@@ -750,14 +794,23 @@ def main_cli():
             spectrum_indices = data.get('indices')
             if spectrum_indices is not None:
                 logger.info(f"Using {len(spectrum_indices)} spectrum indices for {mission_id}/{telescop}")
-            
+
+            # Resolve per-mission n_components (CLI override already handled above:
+            # when --n-components is given, mission_pca_params is empty so this
+            # returns the base value).
+            eff_n_components = int(_resolve_mission_param(
+                mission_id, 'n_components', mission_pca_params, n_components))
+            if eff_n_components != n_components:
+                logger.info(f"  {mission_id}: n_components={eff_n_components} "
+                            f"(per-mission YAML override; base {n_components})")
+
             # Decompose with velocity axis and line masking if available
             result = decompose_mission_spectra(
                 mission_id,
                 telescop,
                 data['spectra'],
                 data['date'],
-                n_components=n_components,
+                n_components=eff_n_components,
                 velocity_axis=velocity_axis,
                 line_window_kms=mission_line_windows.get(mission_id),
                 spectrum_indices=spectrum_indices,

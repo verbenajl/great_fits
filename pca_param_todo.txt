@@ -53,23 +53,37 @@ PCA parameter behaviour — deferred fixes
       In _pca_apply_correction() and _compute_group_noise_ratios(), apply
       np.convolve to the full spectrum before indexing with good_channels_fit.
 
-[ ] [LOW PRIORITY] Restore rolling_noise_window diagnostic in component plots.
+[ ] rolling_noise_window — INERT in the active pipeline; decide revive vs. remove.
 
-    Problem:
-      The legacy pca_decompose.py computes a per-component "global structure"
-      score (component.std() / mean(rolling_rms_noise)) using rolling_noise_window
-      and displays it as a label on each component panel in the correction plots.
-      In the new fits-based path, rolling_noise_window is read from config in
-      decompose.py (line 118) but never used — the diagnostic is absent from
-      the new component plots.
-      Note: this parameter has no effect on the correction itself in either
-      path (scale_to_running_noise(), which would use it, is commented out in
-      the legacy code).
+    Checked (2026-07-02): traced every use in src/. Confirmed the parameter has
+    NO effect on the current fits-based pipeline:
+      - pca_decompose (= pca_decompose_per_mission.main_cli) applies only
+        smoothing_kernel_size; it never calls rolling_window().
+      - decompose.py SpectrumPreparator reads it into self.rolling_window
+        (line 118) and never reads that attribute again — a dead assignment.
+      - pca_correct_fits.py does the signal-vs-noise gating at CORRECTION time
+        via a KDE-based per-component global-noise-ratio (_compute_group_noise_ratios
+        + _derive_component_cutoffs, driven by gnr + smoothing_kernel_size), NOT
+        rolling_noise_window.
+      Its only real historical use is the legacy pca_decompose.py
+      evaluate_global_structure(): component.std() / mean(rolling_rms_noise),
+      the per-component "global structure" score — the conceptual ancestor of
+      today's gnr / KDE global gate.
 
-    Fix:
-      Compute the global structure score in pca_decompose_per_mission.py or
-      DecompositionResult and carry it through to the component plot labels
-      in pca_correct_fits.py, mirroring pca_correct.py lines 179-193.
+    Decision (2026-07-02): did NOT expose it. An `rw` token was briefly added to
+    the PCAPARAM provenance string + print_pca_parameters, then dropped, because
+    reporting a configured-but-unapplied value is misleading. print_pca_parameters
+    now records nc (number of components) and sk (smoothing kernel), both real.
+
+    Open question — pick one:
+      a) REMOVE the dead config key + decompose.py:118 assignment and drop
+         rolling_noise_window from config.toml / M51_pca_reduction.toml so nobody
+         tunes an inert knob.
+      b) REVIVE it: compute the global-structure score in
+         pca_decompose_per_mission.py / DecompositionResult and either (i) surface
+         it as a per-component plot label (mirroring pca_correct.py lines 179-193),
+         or (ii) feed it into the gnr gate as an alternative to the KDE.
+      Prefer (a) unless the structure-ratio gate is wanted back — then (b).
 
 [ ] [MARGINAL] noise_cutoff — parameter present in new code but is a no-op.
 
@@ -226,3 +240,51 @@ PCA parameter behaviour — deferred fixes
       without normalisation, matching legacy pca_correct.py:
         abs(coeff[i]) < float(cut_coefficients)
       The original pyclass default value is 0.1 (in antenna temperature units).
+
+[x] use_lstsq — dot-product fitting produced a much weaker correction than
+    least-squares on the same data; least-squares is now the default.
+
+    Context:
+      Observed in practice (2026-06-23): switching --least-squares on for a
+      PCA correction run made the subtracted pattern clearly visible, while
+      the dot-product default left the spectrum looking barely corrected.
+      Coefficient fitting happens in two places — PCACorrector.fit_coefficients()
+      (pca_correct_fits.py ~line 1289) and the pure-function
+      _pca_apply_correction() (~line 421) — both branch on use_lstsq the same
+      way: when channels are masked, dot product projects onto the masked
+      (no-longer-orthonormal) components directly, while least-squares solves
+      the proper deconvolution. The existing docstring already predicts dot
+      product *underestimates* coefficients in this case, but the size of the
+      gap observed is bigger than that argument alone would suggest.
+
+    Resolution (2026-06-23):
+      use_lstsq now defaults to True everywhere: PCACorrector.__init__,
+      fit_coefficients, _pca_apply_correction, _init_pca_worker, and the CLI's
+      config_use_lstsq fallback. The CLI's --least-squares/--no-least-squares
+      are now a proper tristate pair (default=None on both, shared dest) so an
+      explicit choice (CLI or config [pca] least_squares) still overrides the
+      new default in either direction — see main_correct_cli().
+
+    Root cause + fix (2026-07-01):
+      The gap was pure missing normalization, not anything subtle. The dot
+      product <comp[gcf], spec[gcf]> only equals the projection coefficient when
+      comp has UNIT NORM over the fit channels. PCA eigenvectors start unit-norm,
+      but (a) smoothing shrinks the norm (e.g. C1 ||full||=0.833) and (b)
+      restricting to baseline channels shrinks it further (||C1[gcf]||^2=0.61).
+      So the bare dot product underestimates every coefficient by exactly
+      ||comp[gcf]||^2 — measured raw-dot/lstsq = 0.606 = ||C1[gcf]||^2 on F367 —
+      and worse for weaker/edge components, hence "barely corrected".
+
+      Fix: new helper _normalized_dot_coeff() divides each coefficient by
+      ||comp[gcf]||^2 (per-component normalized projection). Wired into the
+      use_lstsq=False branch of PCACorrector.fit_coefficients(),
+      _pca_apply_correction() pass-1 fit, and its survivor re-fit. Verified
+      end-to-end: false now tracks lstsq (ratio ~1.00 central, ~1.0-1.1 on the
+      worst-conditioned edge spectra) instead of ~0. Because it has no matrix
+      inversion, each coefficient is Cauchy-Schwarz-bounded, so it stays stable
+      where lstsq can swing on ill-conditioned (few-gcf) edge spectra.
+
+      Not touched: _compute_group_noise_ratios() (the KDE global-gate pre-pass)
+      still uses a bare dot product. Left as-is to avoid changing lstsq=True
+      behaviour; its underestimate is applied uniformly so the gate stays roughly
+      self-consistent. Revisit if the global gate is ever retuned.

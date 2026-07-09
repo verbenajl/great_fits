@@ -231,6 +231,7 @@ def combine_fits_files(fits_file_list: list, output_hdul: fits.HDUList = None,
         primary_hdu = None
         first_table_header = None
         dtype = None
+        first_file = None
         total_rows = 0
 
         for fits_file_path in fits_file_list:
@@ -242,6 +243,34 @@ def combine_fits_files(fits_file_list: list, output_hdul: fits.HDUList = None,
                     primary_hdu = hdul[0].copy()
                     first_table_header = hdul[1].header.copy()
                     dtype = hdul[1].data.dtype
+                    first_file = fits_path
+                else:
+                    # All inputs are copied into one array sized by the first
+                    # file's dtype, so their columns must match exactly. A common
+                    # cause of a mismatch is stale artifacts from before a schema
+                    # change (e.g. some flights rebuilt with TSYS_INDEX /
+                    # TAU_SIG_INDEX and others not). Fail here with an actionable
+                    # message rather than letting numpy raise a cryptic multi-page
+                    # "Cannot cast array data" traceback at the copy step.
+                    this_names = set(hdul[1].data.dtype.names)
+                    first_names = set(dtype.names)
+                    if this_names != first_names:
+                        only_first = sorted(first_names - this_names)
+                        only_this  = sorted(this_names - first_names)
+                        parts = []
+                        if only_first:
+                            parts.append(f"columns in '{first_file.name}' but not "
+                                         f"'{fits_path.name}': {only_first}")
+                        if only_this:
+                            parts.append(f"columns in '{fits_path.name}' but not "
+                                         f"'{first_file.name}': {only_this}")
+                        raise ValueError(
+                            "Cannot combine FITS files with mismatched columns.\n  "
+                            + "\n  ".join(parts)
+                            + "\n  All inputs must share the same schema. If this "
+                              "followed a pipeline change, rebuild every flight from "
+                              "the same stage (e.g. `make from-postprocess`) so they "
+                              "all carry the same columns.")
                 for hdu in hdul[1:]:
                     if hdu.data is not None:
                         total_rows += len(hdu.data)
@@ -255,6 +284,16 @@ def combine_fits_files(fits_file_list: list, output_hdul: fits.HDUList = None,
         try:
             combined = np.memmap(tmp_path, dtype=dtype, mode='w+', shape=(total_rows,))
 
+            # Absolute row-index columns must be shifted when files are
+            # concatenated into one table: each file's rows start at the running
+            # `offset`, so a within-file index i becomes i+offset in the combined
+            # table. -1 (unlinked) is preserved. This keeps TSYS_INDEX /
+            # TAU_SIG_INDEX valid through the combine — filter_fits already remaps
+            # them on row drops, but combine only appended (never remapped) before,
+            # which would have silently mis-pointed every file after the first.
+            index_cols = [c for c in ('TSYS_INDEX', 'TAU_SIG_INDEX')
+                          if dtype.names is not None and c in dtype.names]
+
             # ── Phase 3: fill one file at a time ────────────────────────────
             offset = 0
             for fits_file_path in fits_file_list:
@@ -263,6 +302,13 @@ def combine_fits_files(fits_file_list: list, output_hdul: fits.HDUList = None,
                         if hdu.data is not None:
                             n = len(hdu.data)
                             combined[offset:offset + n] = hdu.data[:]
+                            if offset and index_cols:
+                                for col in index_cols:
+                                    seg = np.array(combined[col][offset:offset + n])
+                                    linked = seg >= 0
+                                    if linked.any():
+                                        seg[linked] += offset
+                                        combined[col][offset:offset + n] = seg
                             offset += n
                 combined.flush()
 

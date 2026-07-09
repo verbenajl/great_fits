@@ -633,7 +633,12 @@ def filter_and_save_fits(hdul: fits.HDUList,
                         filter_flights: Optional[list] = None,
                         filter_object_exact: Optional[list] = None,
                         filter_out_object_exact: Optional[list] = None,
-                        exclude_obsmode: Optional[list] = None) -> Tuple[Path, Path]:
+                        exclude_obsmode: Optional[list] = None,
+                        filter_mission_ids: Optional[list] = None,
+                        filter_aor_ids: Optional[list] = None,
+                        velocity_resample_km_s: Optional[float] = None,
+                        velocity_resample_range_km_s: Optional[Tuple[float, float]] = None
+                        ) -> Tuple[Path, Path]:
     """
     Filter FITS data by object and NaN content, with optional column value removal and zero-spectrum filtering.
     
@@ -686,7 +691,39 @@ def filter_and_save_fits(hdul: fits.HDUList,
         Rows with non-finite values in the filter column always pass.
         All conditions are ANDed together.
         Example: ``[('RMSRATIOB', 'below', 2.0), ('RMSRATIOB', 'above', 0.5)]``
-    
+    filter_mission_ids : list of str, optional
+        Keep only rows whose MISSION_ID contains one of these substrings
+        (e.g. ``['F528']``). Applied before any other filter, so it also
+        shrinks the working set for the rest of the pipeline when pulling
+        a single flight out of a large, multi-mission file. Non-matching
+        rows are dropped entirely — they are not written to the rejected
+        file (same behavior as --filter-object-exact).
+    filter_aor_ids : list of str, optional
+        Keep only rows whose AOR_ID contains one of these substrings.
+        Same behavior as filter_mission_ids: applied early, non-matching
+        rows are dropped entirely (not written to the rejected file).
+    velocity_resample_km_s : float, optional
+        If given, resample the surviving (clean) spectra onto a single,
+        shared velocity grid at this channel spacing (km/s), via linear
+        interpolation. Applied last, after all row filtering, so filter
+        statistics (NaN fraction, peak threshold, etc.) are computed on the
+        original-resolution data. The new grid is anchored to exact
+        multiples of velocity_resample_km_s relative to 0 km/s (not to any
+        one row's own reference velocity) so that channel N means the same
+        velocity in every row — required for combine_fits/gridding to work
+        correctly across rows whose native VELOCITY/DELTAV differ slightly
+        (e.g. different missions). Channels outside a row's original
+        coverage become NaN. Not applied to the rejected file.
+    velocity_resample_range_km_s : (float, float), optional
+        Fixes the resampled grid's extent (v_min, v_max) instead of deriving
+        it from this file's own data. Needed when running filter_fits
+        separately per flight/mission *before* combining them later
+        (combine_fits requires every input file to have the same SPECTRUM
+        column shape) — without a fixed range, each flight's grid would only
+        span whatever velocities that flight happens to cover, which can
+        differ flight to flight even though they all share the same 0 km/s
+        phase anchor. Only meaningful together with velocity_resample_km_s.
+
     Returns
     -------
     tuple
@@ -759,6 +796,66 @@ def filter_and_save_fits(hdul: fits.HDUList,
     # that TSYS_INDEX / TAU_SIG_INDEX can be remapped to the new positions in
     # the output file.
     orig_idx = np.arange(len(data), dtype=np.int64)
+
+    # --filter-tau links each science row to its TAU_SIG calibration row via the
+    # TAU_SIG_INDEX column. That column is created by prepare_for_pca, so files
+    # from pipelines that skip PCA (e.g. the no-PCA controls) never have it and
+    # --filter-tau would otherwise be a silent no-op. Build it on the fly here so
+    # the flag is self-sufficient. Values are positions in this same `data` array
+    # (i.e. aligned with orig_idx), so they stay valid through the row filtering
+    # below — where the surviving science rows' indices are recovered via
+    # built_tau_sig_index[target_orig_idx].
+    built_tau_sig_index = None
+    if filter_tau and 'TAU_SIG_INDEX' not in data.dtype.names:
+        try:
+            from ..pca_analysis.prepare_for_pca import build_tau_tsys_indices
+            _, built_tau_sig_index = build_tau_tsys_indices(data, object_name)
+            n_linked = int(np.sum(np.asarray(built_tau_sig_index) >= 0))
+            print(f"  --filter-tau: TAU_SIG_INDEX column absent — built it on the "
+                  f"fly ({n_linked} science rows linked to a TAU_SIG spectrum)")
+        except Exception as e:
+            print(f"  Warning: --filter-tau requested but TAU_SIG_INDEX could not "
+                  f"be built ({e}); tau filtering will be skipped")
+            built_tau_sig_index = None
+
+    # Apply mission-ID keep filter first: keep only rows whose MISSION_ID
+    # contains one of the given strings. Applied before everything else so
+    # the rest of the pipeline (and its RAM/CPU use) only ever sees the
+    # requested mission(s). Non-matching rows are dropped entirely (not
+    # written to the rejected file) — same as --filter-object-exact.
+    mission_id_removed_count = 0
+    if filter_mission_ids:
+        if 'MISSION_ID' not in data.dtype.names:
+            raise ValueError("MISSION_ID column not found in FITS data — cannot use --mission-id")
+        mid_col = np.array([
+            s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+            for s in data['MISSION_ID']
+        ])
+        keep_mask = np.zeros(len(data), dtype=bool)
+        for mid in filter_mission_ids:
+            keep_mask |= np.array([mid in m for m in mid_col])
+        mission_id_removed_count = int(np.sum(~keep_mask))
+        data     = data[keep_mask]
+        orig_idx = orig_idx[keep_mask]
+
+    # Apply AOR-ID keep filter: keep only rows whose AOR_ID contains one of
+    # the given strings. Same behavior as the mission-ID filter above —
+    # applied early, non-matching rows dropped entirely (not written to the
+    # rejected file).
+    aor_id_removed_count = 0
+    if filter_aor_ids:
+        if 'AOR_ID' not in data.dtype.names:
+            raise ValueError("AOR_ID column not found in FITS data — cannot use --aor-id")
+        aor_col = np.array([
+            s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+            for s in data['AOR_ID']
+        ])
+        keep_mask = np.zeros(len(data), dtype=bool)
+        for aor in filter_aor_ids:
+            keep_mask |= np.array([aor in a for a in aor_col])
+        aor_id_removed_count = int(np.sum(~keep_mask))
+        data     = data[keep_mask]
+        orig_idx = orig_idx[keep_mask]
 
     param_rejected_data = np.array([])
     param_rejected_count = 0
@@ -991,7 +1088,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
     tau_rejected_data = np.array([])
     tau_filter_details = []  # list of (tau_original_index, n_science_removed)
 
-    if filter_tau and len(other_data) > 0 and 'TAU_SIG_INDEX' in target_data.dtype.names:
+    _has_tau_col = 'TAU_SIG_INDEX' in target_data.dtype.names
+    if filter_tau and len(other_data) > 0 and (_has_tau_col or built_tau_sig_index is not None):
         # Identify TAU_SIG rows within other_data
         def _to_str(v):
             return v.decode().strip() if isinstance(v, bytes) else str(v).strip()
@@ -1021,8 +1119,16 @@ def filter_and_save_fits(hdul: fits.HDUList,
             if np.any(bad_tau_mask):
                 bad_tau_orig_set = set(int(v) for v in tau_orig_subset[bad_tau_mask])
 
-                # Remove linked science spectra
-                sci_tau_idx = np.array(target_data['TAU_SIG_INDEX'], dtype=np.int64)
+                # Remove linked science spectra. The TAU_SIG_INDEX values come
+                # from the column when present, otherwise from the on-the-fly
+                # index looked up by each surviving science row's original
+                # position (target_orig_idx), which is how the built array is
+                # keyed.
+                if _has_tau_col:
+                    sci_tau_idx = np.array(target_data['TAU_SIG_INDEX'], dtype=np.int64)
+                else:
+                    sci_tau_idx = np.asarray(
+                        built_tau_sig_index, dtype=np.int64)[target_orig_idx]
                 sci_bad_mask = np.isin(sci_tau_idx, list(bad_tau_orig_set))
 
                 # Build per-tau reporting details
@@ -1122,6 +1228,49 @@ def filter_and_save_fits(hdul: fits.HDUList,
         if has_tau:
             _remap_index_column(clean_combined, 'TAU_SIG_INDEX', row_mapping)
 
+    # Resample the surviving spectra onto one shared velocity grid, if
+    # requested. Must happen last (after all row filtering above, so filter
+    # statistics like NaN fraction/peak threshold are computed at the
+    # original resolution), and only ever touches clean_combined — the
+    # rejected file keeps its original resolution.
+    new_crpix1 = None
+    if velocity_resample_km_s is not None:
+        if 'VELOCITY' not in clean_combined.dtype.names or 'DELTAV' not in clean_combined.dtype.names:
+            raise ValueError("VELOCITY/DELTAV columns not found in FITS data — "
+                             "cannot use --velocity-resample")
+        crpix1_orig = float(matrix_hdus[0][1].header.get('CRPIX1', 1.0))
+        velo_ref_per_row = np.asarray(clean_combined['VELOCITY'], dtype=np.float64)
+        deltav_per_row   = np.asarray(clean_combined['DELTAV'],   dtype=np.float64)
+        original_spectrum_dtype = clean_combined['SPECTRUM'].dtype
+        original_nchans = clean_combined['SPECTRUM'].shape[1]
+
+        resampled, grid_velo_ref, grid_deltav = _resample_spectra_to_grid(
+            np.asarray(clean_combined['SPECTRUM'], dtype=np.float64),
+            velo_ref_per_row, deltav_per_row, crpix1_orig, velocity_resample_km_s,
+            fixed_range_km_s=velocity_resample_range_km_s)
+        new_nchans = resampled.shape[1]
+
+        new_dtype = []
+        for name in clean_combined.dtype.names:
+            if name == 'SPECTRUM':
+                new_dtype.append((name, original_spectrum_dtype, (new_nchans,)))
+            else:
+                new_dtype.append((name, clean_combined.dtype[name]))
+        resampled_combined = np.recarray(len(clean_combined), dtype=new_dtype)
+        for name in clean_combined.dtype.names:
+            if name == 'SPECTRUM':
+                resampled_combined[name] = resampled.astype(original_spectrum_dtype)
+            elif name == 'VELOCITY':
+                resampled_combined[name] = grid_velo_ref
+            elif name == 'DELTAV':
+                resampled_combined[name] = grid_deltav
+            else:
+                resampled_combined[name] = clean_combined[name]
+        clean_combined = resampled_combined
+        new_crpix1 = 1.0
+        print(f"Resampled {len(clean_combined)} spectra to {velocity_resample_km_s} km/s/channel "
+              f"({original_nchans} -> {new_nchans} channels)")
+
     # Set default output paths
     if output_clean is None:
         output_clean = Path("clean_data.fits")
@@ -1147,7 +1296,12 @@ def filter_and_save_fits(hdul: fits.HDUList,
                 hdu_clean.header[key] = matrix_hdus[0][1].header[key]
             except (ValueError, KeyError):
                 pass
-    
+
+    # If resampling ran, every row now starts at the same VELOCITY with
+    # CRPIX1=1 — overrides whatever CRPIX1 the original header had.
+    if new_crpix1 is not None:
+        hdu_clean.header['CRPIX1'] = new_crpix1
+
     # Create FITS file for clean data
     n_clean = len(clean_combined)
     hdul_clean = fits.HDUList([primary_hdu, hdu_clean])
@@ -1183,6 +1337,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
         'rejected_removed': removed_count,
         'rejected_flights': flight_removed_count,
         'flight_removed_missions': flight_removed_missions,
+        'rejected_mission_id': mission_id_removed_count,
+        'rejected_aor_id': aor_id_removed_count,
         'rejected_param': param_rejected_count,
         'param_filter_details': param_filter_details,
         'rejected_peaks': peaks_rejected_count,
@@ -1200,7 +1356,8 @@ def baseline_subtract(spectrum: np.ndarray,
                       sigma_clip: bool = True,
                       niter: int = 3,
                       clip_sigma: float = 3.0,
-                      window: Optional[Tuple[int, int]] = None) -> np.ndarray:
+                      window: Optional[Tuple[int, int]] = None,
+                      exclude_mask: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Subtract a polynomial baseline from a 1D spectrum.
 
@@ -1229,6 +1386,11 @@ def baseline_subtract(spectrum: np.ndarray,
         Channel/pixel range [start, end) to exclude from baseline fitting.
         Useful to ignore strong emission lines or absorption features.
         Default: None (no exclusion).
+    exclude_mask : np.ndarray of bool, optional
+        Additional per-channel mask of pixels to exclude from the fit
+        (True = excluded), combined with `window`. Useful for a
+        mission-specific telluric line whose channel position doesn't line
+        up with a single fixed `window` shared by every spectrum.
 
     Returns
     -------
@@ -1266,6 +1428,10 @@ def baseline_subtract(spectrum: np.ndarray,
         start = max(0, int(start))
         end = min(len(y), int(end))
         good[start:end] = False
+
+    # Exclude any additional (e.g. mission-specific telluric) pixels
+    if exclude_mask is not None:
+        good &= ~np.asarray(exclude_mask, dtype=bool)
 
     # If nothing to fit, return input
     if np.sum(good) <= order:
@@ -1650,6 +1816,131 @@ def _velocity_to_channel_index(velocity: float, velo_ref: float, deltav: float,
     return channel_index
 
 
+def _resample_spectra_to_grid(spectra: np.ndarray, velo_ref_per_row: np.ndarray,
+                              deltav_per_row: np.ndarray, crpix1_orig: float,
+                              resolution_km_s: float,
+                              fixed_range_km_s: Optional[Tuple[float, float]] = None
+                              ) -> Tuple[np.ndarray, float, float]:
+    """
+    Resample every row onto one shared, uniformly-spaced velocity grid.
+
+    Each row keeps its own native VELOCITY/DELTAV (which can vary slightly
+    row to row, e.g. between missions/flights — these are not perfectly
+    identical in practice) for computing where its own channels actually
+    sit, but every row's spectrum is bin-averaged (every native channel
+    whose velocity falls within an output bin is averaged into it — not
+    interpolated) onto the SAME output grid, anchored to exact multiples of
+    `resolution_km_s` relative to 0 km/s — not to each row's own reference
+    velocity. Real averaging (not interpolation) matters here beyond
+    smoothness: downstream noise accounting (post_process_data's
+    RMS_THEORETICAL) derives the expected noise from DELTAV, assuming
+    whatever DELTAV reports reflects a genuine average over that many native
+    channels — interpolating instead would leave the true noise close to
+    the native per-channel level while DELTAV claims a much wider,
+    lower-noise channel, inflating RMSRATIOB. The grid anchor matters too:
+    without a common anchor, two rows could end up on grids with the same
+    spacing but offset from each other (e.g. channel 42 at a different
+    velocity in each), which would silently misalign data once multiple
+    files are combined (combine_fits) or gridded together. With a shared
+    anchor, "channel N" means the same velocity in every row, matching what
+    the rest of the codebase (e.g. reconstruct_velocity_axis) assumes: one
+    VELOCITY/DELTAV/CRPIX1 for the whole table.
+
+    Channels outside a row's own original velocity coverage are filled with NaN.
+
+    Parameters
+    ----------
+    spectra : np.ndarray, shape (n_rows, n_channels_orig)
+        Original spectra.
+    velo_ref_per_row : np.ndarray, shape (n_rows,)
+        Each row's own VELOCITY (m/s), i.e. velocity at channel `crpix1_orig`.
+    deltav_per_row : np.ndarray, shape (n_rows,)
+        Each row's own DELTAV (m/s/channel). May be negative.
+    crpix1_orig : float
+        Reference pixel (1-indexed) shared by all rows' original grid.
+    resolution_km_s : float
+        Target channel spacing, in km/s. Must be positive.
+    fixed_range_km_s : (float, float), optional
+        If given, use this (v_min, v_max) — in km/s — as the grid extent
+        instead of deriving it from this batch's own data. Required for the
+        output to have a consistent channel count/VELOCITY[0] across
+        separate calls (e.g. one per flight, processed before it's known
+        what else will eventually be combined with combine_fits) — without
+        it, each call's grid only spans whatever that call's own data
+        happens to cover, which can differ row-batch to row-batch even
+        though they all share the same phase anchor.
+
+    Returns
+    -------
+    resampled : np.ndarray, shape (n_rows, n_channels_new)
+        Resampled spectra, all rows on the identical new grid.
+    grid_velo_ref_m_s : float
+        VELOCITY of the new grid's channel 0 (m/s) — use with CRPIX1=1 for
+        every row in the output.
+    grid_deltav_m_s : float
+        DELTAV of the new grid (m/s) — always positive (velocity increases
+        with channel index), regardless of the sign of the original DELTAV.
+    """
+    if resolution_km_s <= 0:
+        raise ValueError("resolution_km_s must be positive")
+
+    n_rows, n_chans_orig = spectra.shape
+    res_m_s = resolution_km_s * 1000.0
+    ch = np.arange(n_chans_orig, dtype=np.float64)
+
+    if fixed_range_km_s is not None:
+        v_min_global = min(fixed_range_km_s) * 1000.0
+        v_max_global = max(fixed_range_km_s) * 1000.0
+    else:
+        # Global velocity extent across all rows, regardless of each row's
+        # own DELTAV sign — derived from this batch's own data only.
+        v_min_global = np.inf
+        v_max_global = -np.inf
+        for i in range(n_rows):
+            v0 = velo_ref_per_row[i] + (ch[0] - (crpix1_orig - 1.0)) * deltav_per_row[i]
+            v1 = velo_ref_per_row[i] + (ch[-1] - (crpix1_orig - 1.0)) * deltav_per_row[i]
+            v_min_global = min(v_min_global, v0, v1)
+            v_max_global = max(v_max_global, v0, v1)
+
+    # Snapped outward to whole multiples of res_m_s relative to 0 — the
+    # shared anchor every row's (and every separate call's) new grid agrees on.
+    v_min_snapped = np.floor(v_min_global / res_m_s) * res_m_s
+    v_max_snapped = np.ceil(v_max_global / res_m_s) * res_m_s
+    n_chans_new = int(round((v_max_snapped - v_min_snapped) / res_m_s)) + 1
+    target_velocities = v_min_snapped + np.arange(n_chans_new, dtype=np.float64) * res_m_s
+
+    # Bin-average rather than interpolate: this is normally a large downsample
+    # (e.g. ~38 m/s native -> 500 m/s here, ~13 channels per output bin), and
+    # interpolation would only blend the 1-2 nearest native samples per output
+    # point instead of averaging all of them. That matters beyond smoothness —
+    # downstream code (post_process_data's RMS_THEORETICAL) derives the
+    # expected noise from DELTAV, assuming whatever DELTAV reports reflects a
+    # real average over that many native channels. Interpolating instead of
+    # averaging leaves the true per-channel noise close to the native level
+    # while DELTAV claims a much wider, lower-noise channel — inflating
+    # RMSRATIOB well above 1 even for otherwise-clean data. Bin-averaging here
+    # keeps that assumption true.
+    resampled = np.full((n_rows, n_chans_new), np.nan, dtype=np.float64)
+    for i in range(n_rows):
+        row_velocities = velo_ref_per_row[i] + (ch - (crpix1_orig - 1.0)) * deltav_per_row[i]
+        row_spectrum = spectra[i]
+
+        bin_idx = np.round((row_velocities - v_min_snapped) / res_m_s).astype(np.int64)
+        valid = (bin_idx >= 0) & (bin_idx < n_chans_new) & ~np.isnan(row_spectrum)
+        if not np.any(valid):
+            continue
+
+        sums = np.zeros(n_chans_new, dtype=np.float64)
+        counts = np.zeros(n_chans_new, dtype=np.int64)
+        np.add.at(sums, bin_idx[valid], row_spectrum[valid])
+        np.add.at(counts, bin_idx[valid], 1)
+
+        has_data = counts > 0
+        resampled[i, has_data] = sums[has_data] / counts[has_data]
+
+    return resampled, float(v_min_snapped), float(res_m_s)
+
+
 def _extract_velocity_range(spectra: np.ndarray, velocity_axis: np.ndarray,
                            velo_min: float, velo_max: float) -> Tuple[np.ndarray, int, int]:
     """
@@ -1716,11 +2007,27 @@ def reduce_spectra(hdul: fits.HDUList,
         Name of the spectrum column (default: 'SPECTRUM').
     methods : dict, optional
         Dictionary specifying which reduction methods to apply and their parameters.
-        Format: {'unblank': {}, 'baseline': {...}, 'smooth': {...}, ...}
-        Methods are applied in order: unblank → baseline → smooth
+        Format: {'unblank': {}, 'extract': [...], 'fill_telluric_noise': {...}, 'baseline': {...}, 'smooth': {...}, ...}
+        Methods are applied in order: unblank → extract → fill_telluric_noise → baseline → smooth → decimate
         Supported methods:
         - 'unblank': Fill NaN values using linear interpolation.
           Parameters: {} (no parameters needed)
+        - 'fill_telluric_noise': Overwrite each mission's telluric line window with
+          Gaussian noise before any baseline fit — for every science spectrum
+          EXCEPT SKYCHOPDIFF, which is the source PCA decomposes to characterize
+          the telluric feature and so must keep it real. The noise level is the
+          RMS of a quick per-spectrum baseline fit (same order as the 'baseline'
+          step, telluric window excluded from the fit) measured outside that
+          window — not the raw std of the un-baselined spectrum, which is biased
+          by continuum slope/offset and underestimates the true channel-to-channel
+          noise. Also records each mission's telluric channel window so the
+          'baseline' step below excludes it from every spectrum's own fit
+          (including SKYCHOPDIFF's, which is never noise-filled but still must
+          not have its real telluric feature bias its baseline). Must run before
+          'baseline' — a real, un-excluded telluric feature would otherwise bias the
+          polynomial fit for missions whose telluric position falls outside a single
+          fixed baseline-exclusion window.
+          Parameters: {'mission_parameters': str or Path or None}
         - 'baseline': Apply polynomial baseline subtraction.
           Parameters: {'order': int, 'window': (int, int) or None}
         - 'smooth': Apply boxcar smoothing.
@@ -1781,6 +2088,7 @@ def reduce_spectra(hdul: fits.HDUList,
             obj_strs = np.array([str(v).strip() for v in raw_obj])
         science_mask = ~np.isin(obj_strs, list(NON_SCIENCE))
     else:
+        obj_strs = np.full(len(spectra), '', dtype='<U1')
         science_mask = np.ones(len(spectra), dtype=bool)
 
     # Apply each reduction method in sequence
@@ -1798,6 +2106,12 @@ def reduce_spectra(hdul: fits.HDUList,
         nan_fractions = np.array(nan_fractions)
         keep_mask = nan_fractions < nan_threshold
         spectra = filtered_spectra
+        # Re-align every full-length, per-row array to the now-shorter spectra —
+        # without this, science_mask's True/False positions no longer correspond
+        # to spectra's rows once any row gets dropped (everything after a dropped
+        # row shifts by one), silently misapplying baseline/smooth/etc. downstream.
+        science_mask = science_mask[keep_mask]
+        obj_strs = obj_strs[keep_mask]
 
     # Extract velocity range BEFORE baseline (so baseline window uses extracted channels)
     if 'extract' in methods:
@@ -1829,6 +2143,110 @@ def reduce_spectra(hdul: fits.HDUList,
         except Exception as e:
             import warnings
             warnings.warn(f"Could not extract spectrum range: {e}", UserWarning)
+
+    # Per-mission telluric channel window, e.g. {mission_id: (ch_start, ch_end)}.
+    # Populated below whenever 'fill_telluric_noise' is configured, and reused
+    # by the main 'baseline' step further down so that *every* spectrum's own
+    # telluric line — including SKYCHOPDIFF, which is never noise-filled — is
+    # kept out of its baseline fit, even though telluric position varies by
+    # mission and so isn't covered by a single fixed baseline window.
+    telluric_windows_by_mission = {}
+    mission_ids = None
+
+    # Fill each mission's telluric line window with Gaussian noise BEFORE baselining.
+    # Must run before 'baseline' below: a real, un-excluded telluric feature would
+    # otherwise bias the polynomial fit for any mission whose telluric position falls
+    # outside a single fixed baseline-exclusion window (missions differ in velocity
+    # calibration, so one fixed channel window doesn't necessarily cover all of them).
+    # SKYCHOPDIFF is excluded from the fill itself (see noise_fill_mask below): it's
+    # the source PCA decomposes to characterize the telluric feature, so overwriting
+    # its telluric window with noise would destroy the very signal PCA needs.
+    if 'fill_telluric_noise' in methods:
+        params = methods['fill_telluric_noise']
+        mission_params_file = params.get('mission_parameters')
+        if 'MISSION_ID' not in data.dtype.names:
+            import warnings
+            warnings.warn("fill_telluric_noise requested but MISSION_ID column not found — skipping", UserWarning)
+        else:
+            from oi_zeigt.pca_analysis.prepare_for_pca import load_mission_parameters, _default_mission_params_file
+            mission_yml = Path(mission_params_file) if mission_params_file else _default_mission_params_file()
+
+            spectral_params = _extract_spectral_params(hdul)
+            velocity_axis_full = _create_velocity_axis(
+                spectral_params['velo_ref'],
+                spectral_params['deltav'],
+                spectral_params['crpix1_spec'],
+                spectral_params['nchans']
+            )
+            # Align to the (possibly extracted) current channel range
+            if '_extract_ch_min' in methods:
+                velocity_axis = velocity_axis_full[methods['_extract_ch_min']:methods['_extract_ch_max'] + 1]
+            else:
+                velocity_axis = velocity_axis_full
+            velocity_axis_kms = velocity_axis / 1000.0
+
+            # data['MISSION_ID'] is always full-length (data itself is never
+            # re-sliced); apply keep_mask to align with spectra/science_mask,
+            # which may have been shortened by an earlier 'unblank' step.
+            mission_ids = np.array([
+                s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                for s in data['MISSION_ID']
+            ])[keep_mask]
+            # Use the broad science_mask (includes SKYCHOPDIFF) here: even rows
+            # that won't be noise-filled still need their telluric window known,
+            # so the baseline step below can exclude it from their fit too.
+            unique_missions = set(mission_ids[science_mask])
+            mission_params_cache = {mid: load_mission_parameters(mid, yaml_file=mission_yml)
+                                    for mid in unique_missions}
+
+            for mid, mparams in mission_params_cache.items():
+                if not mparams or 'telluric_line_center' not in mparams:
+                    continue
+                center_km_s = mparams['telluric_line_center']
+                width_km_s = mparams.get('telluric_line_width', 30)
+                v_min = center_km_s - width_km_s / 2.0
+                v_max = center_km_s + width_km_s / 2.0
+                telluric_mask = (velocity_axis_kms >= v_min) & (velocity_axis_kms <= v_max)
+                tel_channels = np.where(telluric_mask)[0]
+                if len(tel_channels) == 0:
+                    continue
+                telluric_windows_by_mission[mid] = (int(tel_channels.min()), int(tel_channels.max()) + 1)
+
+            # Noise level for the fill must come from a baseline-subtracted
+            # residual, not the raw spectrum: the raw std over everything
+            # outside the telluric window is biased by the continuum
+            # slope/offset (and is not representative of the true
+            # channel-to-channel noise), which made the filled-in noise
+            # come out far too low. So fit & subtract a quick baseline first
+            # (excluding the telluric window from the fit, same convention
+            # as the main 'baseline' step below) and measure the RMS on
+            # that residual, outside the telluric window.
+            baseline_order = methods.get('baseline', {}).get('order', 1)
+
+            # Never overwrite SKYCHOPDIFF's telluric line with noise — it's the
+            # actual signal PCA decomposes, so it must stay real.
+            noise_fill_mask = science_mask & (obj_strs != 'SKYCHOPDIFF')
+
+            n_filled = 0
+            for mid, (ch_start, ch_end) in telluric_windows_by_mission.items():
+                idx = np.where(noise_fill_mask & (mission_ids == mid))[0]
+                if len(idx) == 0:
+                    continue
+                n_tel = ch_end - ch_start
+                tel_bool = np.zeros(spectra.shape[1], dtype=bool)
+                tel_bool[ch_start:ch_end] = True
+                batch = spectra[idx]
+                residual = _reduce_baseline(batch.astype(np.float64), order=baseline_order, window=(ch_start, ch_end))
+                with np.errstate(invalid='ignore'):
+                    noise_levels = np.nanstd(residual[:, ~tel_bool], axis=1)
+                for j, row_idx in enumerate(idx):
+                    nl = noise_levels[j]
+                    if np.isfinite(nl) and nl > 0:
+                        spectra[row_idx, ch_start:ch_end] = np.random.normal(0, nl, n_tel)
+                        n_filled += 1
+            print(f"Filled telluric line with noise (per-mission window) in "
+                  f"{n_filled}/{int(np.sum(noise_fill_mask))} science spectra "
+                  f"(SKYCHOPDIFF excluded), before baselining")
 
     # Calculate RMS outside baseline window (after baseline subtraction)
     rms_baseline_values = None
@@ -1887,7 +2305,13 @@ def reduce_spectra(hdul: fits.HDUList,
                 max(0, window[0]),
                 min(spectra.shape[1] - 1, window[1])
             )
-        
+
+        if telluric_windows_by_mission:
+            windows_str = ', '.join(f"{mid}: channels [{ch_start}, {ch_end}]"
+                                     for mid, (ch_start, ch_end) in telluric_windows_by_mission.items())
+            print(f"Baseline fit also excludes each mission's own telluric window "
+                  f"(from the .yaml file, applied per row including SKYCHOPDIFF): {windows_str}")
+
         # Process baseline in chunks: convert each chunk to float64 for numerical
         # precision, store result back as float32.  Avoids a full float64 copy.
         _CHUNK = 1000
@@ -1900,10 +2324,25 @@ def reduce_spectra(hdul: fits.HDUList,
         for start in range(0, len(sci_indices), _CHUNK):
             idx = sci_indices[start:start + _CHUNK]
             chunk = spectra[idx].astype(np.float64)
-            spectra[idx] = _reduce_baseline(chunk, order=order, window=window).astype(np.float32)
+            # Each row's own mission-specific telluric window (if known) is kept
+            # out of its baseline fit too — telluric position varies by mission,
+            # so this can't be captured by the single, shared `window` above.
+            # This applies regardless of whether that row was noise-filled, so
+            # it also protects SKYCHOPDIFF rows (never noise-filled) from having
+            # their real telluric feature bias their own baseline fit.
+            chunk_exclude = None
+            if telluric_windows_by_mission:
+                chunk_mission_ids = mission_ids[idx]
+                chunk_exclude = np.zeros(chunk.shape, dtype=bool)
+                for mid, (ch_start, ch_end) in telluric_windows_by_mission.items():
+                    row_sel = chunk_mission_ids == mid
+                    if np.any(row_sel):
+                        chunk_exclude[row_sel, ch_start:ch_end] = True
+            spectra[idx] = _reduce_baseline(chunk, order=order, window=window, exclude_mask=chunk_exclude).astype(np.float32)
             if baseline_window_info is not None:
                 for j, i in enumerate(idx):
-                    outside_channels = spectra[i][outside_mask]
+                    row_outside_mask = outside_mask if chunk_exclude is None else (outside_mask & ~chunk_exclude[j])
+                    outside_channels = spectra[i][row_outside_mask]
                     n_valid = int(np.sum(~np.isnan(outside_channels)))
                     if n_valid >= 2:
                         rms_baseline_values[i] = np.nanstd(outside_channels.astype(np.float64))
@@ -2050,7 +2489,8 @@ def _reduce_unblank(spectra: np.ndarray,
 
 def _reduce_baseline(spectra: np.ndarray,
                      order: int = 1,
-                     window: Optional[Tuple[int, int]] = None) -> np.ndarray:
+                     window: Optional[Tuple[int, int]] = None,
+                     exclude_mask: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Apply baseline subtraction to an array of spectra (2D array).
 
@@ -2061,7 +2501,11 @@ def _reduce_baseline(spectra: np.ndarray,
     order : int, optional
         Polynomial order (default: 1).
     window : tuple of (int, int), optional
-        Channel range to exclude from fitting.
+        Channel range to exclude from fitting, shared by every row.
+    exclude_mask : np.ndarray of bool, optional
+        2D array of shape (nspectra, nchannel), True where that row should
+        additionally exclude that channel from the fit (e.g. a row-specific
+        telluric window that varies per mission, unlike `window`).
 
     Returns
     -------
@@ -2070,7 +2514,8 @@ def _reduce_baseline(spectra: np.ndarray,
     """
     result = np.zeros_like(spectra)
     for i, spec in enumerate(spectra):
-        result[i] = baseline_subtract(spec, order=order, window=window)
+        row_exclude = exclude_mask[i] if exclude_mask is not None else None
+        result[i] = baseline_subtract(spec, order=order, window=window, exclude_mask=row_exclude)
     return result
 
 
@@ -2155,7 +2600,15 @@ def reduce_spectra_from_config(config_path: Optional[Union[str, Path]] = None,
     if methods is None:
         methods = {}
         reduction_config = cfg.get('reduction', {})
-        
+
+        # Parse fill_telluric_noise — must be inserted before 'baseline' is parsed
+        # below so reduce_spectra() (which checks dict keys, not insertion order)
+        # still runs it first; the actual ordering is enforced inside reduce_spectra().
+        if reduction_config.get('fill_telluric_noise'):
+            mission_params_file = (cfg.get('pca', {}).get('mission_parameters')
+                                   or cfg.get('input', {}).get('mission_parameters'))
+            methods['fill_telluric_noise'] = {'mission_parameters': mission_params_file}
+
         # Parse baseline parameters
         # window: [velo_min, velo_max] in km/s (absolute velocities)
         # Example: window=[450, 500] → 450,000 to 500,000 m/s

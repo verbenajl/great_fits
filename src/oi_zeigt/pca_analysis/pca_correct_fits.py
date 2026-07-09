@@ -313,7 +313,7 @@ def load_mission_pca_parameters(yaml_path):
     Returns a dict mapping mission_id keys to dicts of correction parameters.
     Supported keys per mission: global_noise_ratio_cutoff, noise_ratio_cutoff,
     cutoff_variance (alias variance_cutoff), cut_coefficients, line_kernel_size,
-    line_cutoff_std.
+    line_cutoff_std, least_squares.
     """
     import yaml
     path = Path(yaml_path)
@@ -418,10 +418,31 @@ def _pca_get_decomp(mission_id, telescope, mission_decompositions):
     return None
 
 
+def _normalized_dot_coeff(components, spectrum, good_channels):
+    """Per-component normalized projection coefficient over ``good_channels``.
+
+        coeff_i = <comp_i, spec> / <comp_i, comp_i>   (all restricted to good_channels)
+
+    This is the projection a plain dot product is *meant* to approximate. It is
+    exact for unit-norm components, which PCA eigenvectors are — but only over
+    the full channel range and before smoothing. Once the components are smoothed
+    (norm < 1) and then restricted to the baseline/fit channels, they are no
+    longer unit-norm, so a bare dot product underestimates each coefficient by
+    ||comp_i[good]||**2 and the resulting correction nearly vanishes. Dividing by
+    that squared norm restores the true amplitude (equals least-squares for
+    orthogonal components) without the matrix inversion that inflates
+    coefficients where few baseline channels remain (i.e. at the map edges).
+    """
+    sub = components[:, good_channels]
+    num = sub @ spectrum[good_channels]
+    den = np.einsum('ij,ij->i', sub, sub)
+    return np.divide(num, den, out=np.zeros_like(num), where=den > 1e-12)
+
+
 def _pca_apply_correction(spectrum, components, variance_ratio,
                           good_channels_fit, good_channels_sub,
                           cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size,
-                          use_lstsq=False,
+                          use_lstsq=True,
                           cut_coefficients=0,
                           per_component_cutoffs=None):
     """
@@ -431,12 +452,18 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
     explicitly so it can run in worker processes without a class instance.
     """
     # Fit coefficients
+    # The bare dot product (use_lstsq=False) previously left barely any visible
+    # correction: after smoothing + restriction to baseline channels the
+    # components are no longer unit-norm, so <comp, spec> underestimates each
+    # coefficient by ||comp[gcf]||**2. _normalized_dot_coeff divides that out,
+    # recovering the true projection amplitude (== least-squares for orthogonal
+    # components) without the edge-inflating matrix inversion of lstsq.
     if not np.all(good_channels_fit):
         if use_lstsq:
             A = components[:, good_channels_fit].T  # [n_good, n_comp]
             coeff, _, _, _ = np.linalg.lstsq(A, spectrum[good_channels_fit], rcond=None)
         else:
-            coeff = np.dot(components[:, good_channels_fit], spectrum[good_channels_fit])
+            coeff = _normalized_dot_coeff(components, spectrum, good_channels_fit)
     else:
         coeff = np.dot(components, spectrum)
 
@@ -532,7 +559,7 @@ def _pca_apply_correction(spectrum, components, variance_ratio,
             A = surv_comps[:, good_channels_fit].T
             refit_coeff, _, _, _ = np.linalg.lstsq(A, spectrum[good_channels_fit], rcond=None)
         else:
-            refit_coeff = np.dot(surv_comps[:, good_channels_fit], spectrum[good_channels_fit])
+            refit_coeff = _normalized_dot_coeff(surv_comps, spectrum, good_channels_fit)
 
         # Pass 2: subtract using re-fitted coefficients.
         for j, (i, comp, var_ratio, noise_ratio) in enumerate(survivors):
@@ -767,7 +794,7 @@ def _plot_kde_noise_ratios(kde_params, component_cutoffs, output_path, group_lab
 
 def _init_pca_worker(mission_decompositions, default_components, default_variance_ratio,
                      cutoff_variance, cutoff_noise_ratio, smoothing_kernel_size,
-                     use_lstsq=False, cut_coefficients=0):
+                     use_lstsq=True, cut_coefficients=0):
     """Initializer for PCA correction worker processes."""
     global _pca_worker_state
     _pca_worker_state = {
@@ -790,11 +817,26 @@ def _pca_spectrum_worker(args):
       - details is None           → no decomposition found for this spectrum
       - details['status']=='ok'   → successful correction
       - details['status']!='ok'   → skip (bad channels or exception), corrected=original
+
+    args[7]/args[8]/args[9], when provided, are per-spectrum cutoff_variance/
+    cut_coefficients/use_lstsq overrides (resolved per-mission by the caller) —
+    they take priority over the single global value baked into the pool's
+    initargs, so per-mission YAML overrides are respected in parallel mode
+    too, matching the sequential code paths.
     """
     args_base = args[:6]
     idx, spectrum, gcf, gcs, mission_id, telescope = args_base
     per_component_cutoffs = args[6] if len(args) > 6 else None
+    cutoff_variance_override = args[7] if len(args) > 7 else None
+    cut_coefficients_override = args[8] if len(args) > 8 else None
+    use_lstsq_override = args[9] if len(args) > 9 else None
     s = _pca_worker_state
+    effective_cutoff_variance = (cutoff_variance_override if cutoff_variance_override is not None
+                                 else s['cutoff_variance'])
+    effective_cut_coefficients = (cut_coefficients_override if cut_coefficients_override is not None
+                                  else s.get('cut_coefficients', 0))
+    effective_use_lstsq = (use_lstsq_override if use_lstsq_override is not None
+                           else s.get('use_lstsq', False))
     try:
         if s['mission_decompositions'] and mission_id is not None:
             decomp = _pca_get_decomp(mission_id, telescope, s['mission_decompositions'])
@@ -835,9 +877,9 @@ def _pca_spectrum_worker(args):
 
         corrected_slice, details = _pca_apply_correction(
             spec_slice, components, variance_ratio, gcf_slice, gcs_slice,
-            s['cutoff_variance'], s['cutoff_noise_ratio'], s['smoothing_kernel_size'],
-            use_lstsq=s.get('use_lstsq', False),
-            cut_coefficients=s.get('cut_coefficients', 0),
+            effective_cutoff_variance, s['cutoff_noise_ratio'], s['smoothing_kernel_size'],
+            use_lstsq=effective_use_lstsq,
+            cut_coefficients=effective_cut_coefficients,
             per_component_cutoffs=per_component_cutoffs,
         )
 
@@ -874,7 +916,7 @@ class PCACorrector:
                  n_components=None,
                  line_kernel_size=51, line_cutoff_std=2.0,
                  smoothing_kernel_size=None, line_window_velocities=None,
-                 use_lstsq=False, force_line_window=False,
+                 use_lstsq=True, force_line_window=False,
                  mission_params_file=None):
         """
         Initialize PCA corrector with decomposition results.
@@ -1004,34 +1046,56 @@ class PCACorrector:
             return None
     
     @staticmethod
-    def load_decompositions_from_dir(decomp_dir):
+    def load_decompositions_from_dir(decomp_dir, name_filter=None):
         """
         Load all decomposition files from a directory.
-        
+
         Looks for files matching pattern: decomposition_*_components.pkl
         Returns dict mapping (mission_id, telescop) -> decomposition
         Falls back to mapping mission_id -> decomposition for single-mission files
-        
+
         Parameters
         ----------
         decomp_dir : str
             Directory containing decomposition files
-        
+        name_filter : str or list of str, optional
+            If given, only load files whose basename contains one of these
+            substrings (comma-separated if a single string). Lets a per-mission
+            run skip unpickling every other mission's components — the mission is
+            knowable straight from the filename (e.g. "F296"), so there's no point
+            loading and discarding the rest.
+
         Returns
         -------
         dict
             Dict mapping (mission_id, telescop) or mission_id -> PCACorrector instance
         """
         import glob
-        
+
         decomp_dir = Path(decomp_dir)
         if not decomp_dir.exists():
             logger.warning(f"Decomposition directory not found: {decomp_dir}")
             return {}
-        
+
         decompositions = {}
         decomp_files = sorted(glob.glob(str(decomp_dir / "decomposition_*_components.pkl")))
-        
+
+        # Optional filename-substring filter: drop files that can't belong to the
+        # mission(s) being corrected before we pay to unpickle them.
+        if name_filter:
+            if isinstance(name_filter, str):
+                terms = [t.strip() for t in name_filter.split(',') if t.strip()]
+            else:
+                terms = [str(t).strip() for t in name_filter if str(t).strip()]
+            if terms:
+                n_before = len(decomp_files)
+                decomp_files = [f for f in decomp_files
+                                if any(t in os.path.basename(f) for t in terms)]
+                logger.info(
+                    f"Filename filter {terms}: keeping {len(decomp_files)} of "
+                    f"{n_before} decomposition files (skipped unpickling the rest)"
+                )
+
         logger.info(f"Found {len(decomp_files)} decomposition files in {decomp_dir}")
         
         if len(decomp_files) == 0:
@@ -1271,7 +1335,7 @@ class PCACorrector:
         noise_ratio = spectrum_std / component_std
         return noise_ratio if np.isfinite(noise_ratio) else 1e10
     
-    def fit_coefficients(self, spectrum, good_channels=None, use_lstsq=False):
+    def fit_coefficients(self, spectrum, good_channels=None, use_lstsq=True):
         """
         Fit PCA coefficients to a spectrum.
 
@@ -1295,12 +1359,19 @@ class PCACorrector:
         if good_channels is None:
             good_channels = np.ones(len(spectrum), dtype=bool)
 
+        # The "barely visible correction" seen with use_lstsq=False was the bare
+        # dot product failing to normalize: after smoothing + channel masking the
+        # components are no longer unit-norm, so <comp, spec> underestimates each
+        # coefficient by ||comp[good]||**2 (the gap that looked larger than
+        # expected). _normalized_dot_coeff divides that out, recovering the true
+        # projection amplitude (== least-squares for orthogonal components)
+        # without the matrix inversion that inflates coefficients at map edges.
         if not np.all(good_channels):
             if use_lstsq:
                 A = self.components[:, good_channels].T  # [n_good, n_comp]
                 coeff, _, _, _ = np.linalg.lstsq(A, spectrum[good_channels], rcond=None)
             else:
-                coeff = np.dot(self.components[:, good_channels], spectrum[good_channels])
+                coeff = _normalized_dot_coeff(self.components, spectrum, good_channels)
         else:
             # Full channel set: components are orthonormal, dot product is exact.
             coeff = np.dot(self.components, spectrum)
@@ -1308,7 +1379,8 @@ class PCACorrector:
         return coeff
     
     def apply_correction(self, spectrum, good_channels=None, good_channels_for_subtraction=None,
-                         cutoff_variance=None, cutoff_noise_ratio=None, verbose=False, smoothing_kernel_size=None):
+                         cutoff_variance=None, cutoff_noise_ratio=None, verbose=False, smoothing_kernel_size=None,
+                         use_lstsq=None):
         """
         Apply PCA correction to a single spectrum.
         
@@ -1339,7 +1411,11 @@ class PCACorrector:
         smoothing_kernel_size : int, optional
             Kernel size for box-car smoothing in noise_ratio calculation.
             If None, no smoothing applied.
-        
+        use_lstsq : bool, optional
+            Override for whether to fit coefficients via least-squares instead
+            of a plain dot product (e.g. a per-mission override resolved by the
+            caller). If None, falls back to self.use_lstsq.
+
         Returns
         -------
         ndarray
@@ -1349,13 +1425,15 @@ class PCACorrector:
         """
         if good_channels is None:
             good_channels = np.ones(len(spectrum), dtype=bool)
-        
+
         # If not specified, use the same channels for subtraction as for fitting
         if good_channels_for_subtraction is None:
             good_channels_for_subtraction = good_channels.copy()
-        
+
+        effective_use_lstsq = use_lstsq if use_lstsq is not None else self.use_lstsq
+
         # Fit coefficients
-        coeff = self.fit_coefficients(spectrum, good_channels, use_lstsq=self.use_lstsq)
+        coeff = self.fit_coefficients(spectrum, good_channels, use_lstsq=effective_use_lstsq)
         
         if verbose:
             logger.info(f"  Fitted coefficients: {coeff}")
@@ -1764,8 +1842,26 @@ class PCACorrector:
                     gcs = ~bad_channels
                     gcf = gcs.copy()
                     if telluric_line_mask is not None:
-                        gcf = gcf & ~telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
-                    phase1_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s))
+                        tel = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
+                        gcf = gcf & ~tel
+                        # Never fit OR subtract in the telluric window: apply_correction
+                        # copies spectrum->corrected and only touches gcs channels, so
+                        # excluding telluric from gcs leaves the original value there.
+                        gcs = gcs & ~tel
+                    # Resolve cutoff_variance per-mission (matches sequential Phase 1
+                    # below) instead of relying on the single global value baked into
+                    # the worker pool's initargs. cut_coefficients is intentionally
+                    # fixed at 0 (disabled) here: legacy's equivalent preliminary pass
+                    # (derive_noise_ratio_and_windows) never checks it either — it's
+                    # only applied in the final Phase 3 correction.
+                    _eff1_vc = (_resolve_mission_param(to_string(data['MISSION_ID'][idx]),
+                                                       'cutoff_variance', mission_pca_params, cutoff_variance)
+                               if mission_pca_params else cutoff_variance)
+                    _eff1_ls = (_resolve_mission_param(to_string(data['MISSION_ID'][idx]),
+                                                       'least_squares', mission_pca_params, self.use_lstsq)
+                               if mission_pca_params else self.use_lstsq)
+                    phase1_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s,
+                                        None, _eff1_vc, 0, _eff1_ls))
                 from multiprocessing import Pool
                 chunk = max(1, len(phase1_args) // (n_workers * 4))
                 with Pool(processes=n_workers, initializer=_init_pca_worker,
@@ -1815,8 +1911,11 @@ class PCACorrector:
                         good_channels_for_subtraction = ~bad_channels
                         good_channels_for_fitting = good_channels_for_subtraction.copy()
                         if telluric_line_mask is not None:
-                            good_channels_for_fitting = good_channels_for_fitting & \
-                                ~telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
+                            tel = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
+                            good_channels_for_fitting = good_channels_for_fitting & ~tel
+                            # Never fit OR subtract in the telluric window — see parallel
+                            # path above for why this leaves the original value there.
+                            good_channels_for_subtraction = good_channels_for_subtraction & ~tel
 
                         if not np.any(good_channels_for_fitting):
                             correction_details[idx] = {'n_components_used': 0, 'skipped': True}
@@ -1832,9 +1931,11 @@ class PCACorrector:
                             _eff_cc = _resolve_mission_param(_mid, 'cut_coefficients', mission_pca_params, cut_coefficients)
                             _eff_gnr = _resolve_mission_param(_mid, 'global_noise_ratio_cutoff', mission_pca_params, global_noise_ratio_cutoff)
                             _eff_nr = _resolve_mission_param(_mid, 'noise_ratio_cutoff', mission_pca_params, cutoff_noise_ratio) if _eff_gnr else None
+                            _eff_ls = _resolve_mission_param(_mid, 'least_squares', mission_pca_params, self.use_lstsq)
                         else:
                             _eff_vc, _eff_cc = cutoff_variance, cut_coefficients
                             _eff_nr = effective_cutoff_noise_ratio
+                            _eff_ls = self.use_lstsq
                         corrected, details = self.apply_correction(
                             spectrum,
                             good_channels=good_channels_for_fitting,
@@ -1842,7 +1943,8 @@ class PCACorrector:
                             cutoff_variance=_eff_vc,
                             cutoff_noise_ratio=_eff_nr,
                             verbose=False,
-                            smoothing_kernel_size=self.smoothing_kernel_size
+                            smoothing_kernel_size=self.smoothing_kernel_size,
+                            use_lstsq=_eff_ls
                         )
 
                         prelim_corrected_spectra[idx] = corrected
@@ -2002,8 +2104,19 @@ class PCACorrector:
                             gcs = ~bad_channels & ~detected_lines_mask[spec_idx]
                             gcf = gcs.copy()
                             if telluric_line_mask is not None:
-                                gcf = gcf & ~telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
-                            recorr_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s))
+                                tel = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
+                                gcf = gcf & ~tel
+                                gcs = gcs & ~tel
+                            # Per-mission cutoff_variance (matches sequential below); cut_coefficients
+                            # stays disabled here, matching legacy's derive_noise_ratio_and_windows.
+                            _eff2_vc = (_resolve_mission_param(to_string(data['MISSION_ID'][idx]),
+                                                               'cutoff_variance', mission_pca_params, cutoff_variance)
+                                       if mission_pca_params else cutoff_variance)
+                            _eff2_ls = (_resolve_mission_param(to_string(data['MISSION_ID'][idx]),
+                                                               'least_squares', mission_pca_params, self.use_lstsq)
+                                       if mission_pca_params else self.use_lstsq)
+                            recorr_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s,
+                                                None, _eff2_vc, 0, _eff2_ls))
                         chunk = max(1, len(recorr_args) // (n_workers * 4))
                         with Pool(processes=n_workers, initializer=_init_pca_worker,
                                   initargs=(mission_decompositions, self.components,
@@ -2037,8 +2150,9 @@ class PCACorrector:
                                 gcs = ~bad_channels & ~detected_lines_mask[spec_idx]
                                 good_channels_for_fitting = gcs.copy()
                                 if telluric_line_mask is not None:
-                                    good_channels_for_fitting = good_channels_for_fitting & \
-                                        ~telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
+                                    tel = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
+                                    good_channels_for_fitting = good_channels_for_fitting & ~tel
+                                    gcs = gcs & ~tel
 
                                 if not np.any(good_channels_for_fitting):
                                     if mission_decompositions:
@@ -2051,9 +2165,11 @@ class PCACorrector:
                                     _eff_vc = _resolve_mission_param(_mid, 'cutoff_variance', mission_pca_params, cutoff_variance)
                                     _eff_gnr = _resolve_mission_param(_mid, 'global_noise_ratio_cutoff', mission_pca_params, global_noise_ratio_cutoff)
                                     _eff_nr = _resolve_mission_param(_mid, 'noise_ratio_cutoff', mission_pca_params, cutoff_noise_ratio) if _eff_gnr else None
+                                    _eff_ls = _resolve_mission_param(_mid, 'least_squares', mission_pca_params, self.use_lstsq)
                                 else:
                                     _eff_vc = cutoff_variance
                                     _eff_nr = effective_cutoff_noise_ratio
+                                    _eff_ls = self.use_lstsq
                                 corrected, details = self.apply_correction(
                                     spectrum,
                                     good_channels=good_channels_for_fitting,
@@ -2061,7 +2177,8 @@ class PCACorrector:
                                     cutoff_variance=_eff_vc,
                                     cutoff_noise_ratio=_eff_nr,
                                     verbose=False,
-                                    smoothing_kernel_size=self.smoothing_kernel_size
+                                    smoothing_kernel_size=self.smoothing_kernel_size,
+                                    use_lstsq=_eff_ls
                                 )
 
                                 prelim_corrected_spectra[idx] = corrected
@@ -2179,9 +2296,24 @@ class PCACorrector:
                     if telluric_line_mask is not None:
                         telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
                         gcf = gcf & ~telluric_regions
-                        # gcs NOT modified (telluric excluded from fitting only)
+                        # Unlike detected science lines (still corrected above), the
+                        # telluric window is excluded from subtraction too:
+                        # apply_correction copies spectrum->corrected and only touches
+                        # gcs channels, so this leaves the genuine original value there.
+                        gcs = gcs & ~telluric_regions
+                    # Per-mission cutoff_variance/cut_coefficients (matches sequential
+                    # Phase 3's _eff3_vc/_eff3_cc) instead of the single global value
+                    # baked into the pool's initargs below.
+                    if mission_pca_params:
+                        _mid3p = to_string(data['MISSION_ID'][idx])
+                        _eff3p_vc = _resolve_mission_param(_mid3p, 'cutoff_variance', mission_pca_params, cutoff_variance)
+                        _eff3p_cc = _resolve_mission_param(_mid3p, 'cut_coefficients', mission_pca_params, cut_coefficients)
+                        _eff3p_ls = _resolve_mission_param(_mid3p, 'least_squares', mission_pca_params, self.use_lstsq)
+                    else:
+                        _eff3p_vc, _eff3p_cc = cutoff_variance, cut_coefficients
+                        _eff3p_ls = self.use_lstsq
                     phase3_args.append((idx, spectrum, gcf, gcs, mission_id_s, telescope_s,
-                                        per_spectrum_cutoffs[spec_idx]))
+                                        per_spectrum_cutoffs[spec_idx], _eff3p_vc, _eff3p_cc, _eff3p_ls))
                 from multiprocessing import Pool
                 chunk = max(1, len(phase3_args) // (n_workers * 4))
                 with Pool(processes=n_workers, initializer=_init_pca_worker,
@@ -2248,10 +2380,18 @@ class PCACorrector:
                             n_line = np.sum(line_regions)
                             stats['lines_detected'] = True
 
-                        # Exclude telluric lines from fitting only (not subtraction), matching legacy behaviour
+                        # Exclude telluric lines from BOTH fitting and subtraction (unlike the
+                        # detected science lines above) — this is what actually matches legacy
+                        # pyclass, which physically trims the telluric window before fitting/
+                        # correction and restores the genuine original data afterward
+                        # (apply_pca_exclude_range / refill_pca_exclude_range). Excluding it from
+                        # good_channels_for_subtraction has the same effect here: apply_correction
+                        # never subtracts within the window, so the original spectrum value
+                        # passes through untouched — no separate refill step needed.
                         if telluric_line_mask is not None:
                             telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask)-1)]
                             good_channels_for_fitting = good_channels_for_fitting & ~telluric_regions
+                            good_channels_for_subtraction = good_channels_for_subtraction & ~telluric_regions
 
                         if not np.any(good_channels_for_fitting):
                             logger.warning(f"Spectrum {idx}: no good channels for fitting (had {n_good} good, {n_line if detected_lines_mask is not None else 0} lines), skipping")
@@ -2291,9 +2431,11 @@ class PCACorrector:
                             _mid3 = to_string(data['MISSION_ID'][idx])
                             _eff3_vc = _resolve_mission_param(_mid3, 'cutoff_variance', mission_pca_params, cutoff_variance)
                             _eff3_cc = _resolve_mission_param(_mid3, 'cut_coefficients', mission_pca_params, cut_coefficients)
+                            _eff3_ls = _resolve_mission_param(_mid3, 'least_squares', mission_pca_params, self.use_lstsq)
                         else:
                             _eff3_vc = cutoff_variance
                             _eff3_cc = cut_coefficients
+                            _eff3_ls = self.use_lstsq
                         corrected_slice, details = _pca_apply_correction(
                             _spec_in,
                             self.components,
@@ -2303,7 +2445,7 @@ class PCACorrector:
                             _eff3_vc,
                             effective_cutoff_noise_ratio,
                             self.smoothing_kernel_size,
-                            use_lstsq=self.use_lstsq,
+                            use_lstsq=_eff3_ls,
                             cut_coefficients=_eff3_cc,
                             per_component_cutoffs=per_spectrum_cutoffs[spec_idx],
                         )
@@ -2364,28 +2506,25 @@ class PCACorrector:
             # Preserve calibration objects (TSYS, TAU_SIG) even when filtering
             # These are needed for downstream analysis and pairing with M51CENTER
             if object_filter:
-                # When aor_id_filter is also active, preserve only calibration rows
-                # actually referenced by the selected spectra — not all rows in the file.
-                # Without aor_id_filter, fall back to all TSYS/TAU_SIG rows.
-                if aor_id_filter:
-                    referenced_cal = set()
-                    if 'TSYS_INDEX' in data.dtype.names:
-                        for i in indices:
-                            ref = data['TSYS_INDEX'][i]
-                            if ref >= 0:
-                                referenced_cal.add(int(ref))
-                    if 'TAU_SIG_INDEX' in data.dtype.names:
-                        for i in indices:
-                            ref = data['TAU_SIG_INDEX'][i]
-                            if ref >= 0:
-                                referenced_cal.add(int(ref))
-                    calibration_indices = np.array(sorted(referenced_cal), dtype=int)
-                else:
-                    calibration_mask = np.array([
-                        _obj_str(s) in ('TSYS', 'TAU_SIG')
-                        for s in data['OBJECT']
-                    ])
-                    calibration_indices = np.where(calibration_mask)[0]
+                # Preserve only calibration rows actually referenced (via TSYS_INDEX /
+                # TAU_SIG_INDEX) by the surviving science spectra in `indices` — not
+                # every TSYS/TAU_SIG row in the file. Pulling in *all* calibration rows
+                # regardless of `indices` would silently reintroduce every other
+                # mission's calibration data any time a narrowing filter (--mission-id,
+                # --scan, --telescope, ...) was used without --aor-id, since those
+                # filters only narrow `indices` and were never consulted here.
+                referenced_cal = set()
+                if 'TSYS_INDEX' in data.dtype.names:
+                    for i in indices:
+                        ref = data['TSYS_INDEX'][i]
+                        if ref >= 0:
+                            referenced_cal.add(int(ref))
+                if 'TAU_SIG_INDEX' in data.dtype.names:
+                    for i in indices:
+                        ref = data['TAU_SIG_INDEX'][i]
+                        if ref >= 0:
+                            referenced_cal.add(int(ref))
+                calibration_indices = np.array(sorted(referenced_cal), dtype=int)
 
                 # Combine filtered science object indices with calibration indices
                 all_indices_to_keep = np.concatenate([indices, calibration_indices])
@@ -2535,16 +2674,23 @@ class PCACorrector:
                 eff_gnr = _resolve_mission_param(mission_id_val, 'global_noise_ratio_cutoff',mission_pca_params, global_noise_ratio_cutoff)
                 eff_lk  = _resolve_mission_param(mission_id_val, 'line_kernel_size',         mission_pca_params, self.line_kernel_size)
                 eff_ls  = _resolve_mission_param(mission_id_val, 'line_cutoff_std',          mission_pca_params, self.line_cutoff_std)
-                return (f"vc={_fmt(eff_vc)} nr={_fmt(eff_nr)} sk={_fmt(self.smoothing_kernel_size)} "
-                        f"cc={_fmt(eff_cc)} gnr={_fmt(eff_gnr)} lk={eff_lk} ls={eff_ls} lstsq={int(self.use_lstsq)}")
+                eff_lstsq = _resolve_mission_param(mission_id_val, 'least_squares',          mission_pca_params, self.use_lstsq)
+                # nc/sk are decompose-time settings recorded here for provenance:
+                # nc (n_components) is per-mission (YAML), falling back to the number of
+                # components actually loaded; sk comes from the [pca] config.
+                eff_nc  = _resolve_mission_param(mission_id_val, 'n_components',             mission_pca_params, len(self.components))
+                return (f"nc={_fmt(eff_nc)} vc={_fmt(eff_vc)} nr={_fmt(eff_nr)} "
+                        f"sk={_fmt(self.smoothing_kernel_size)} "
+                        f"cc={_fmt(eff_cc)} gnr={_fmt(eff_gnr)} lk={eff_lk} ls={eff_ls} lstsq={int(eff_lstsq)}")
 
             n_rows = len(output_table.data)
             if mission_pca_params and 'MISSION_ID' in output_table.data.dtype.names:
                 row_strings = [_row_param_str(to_string(output_table.data['MISSION_ID'][i]))
                                for i in range(n_rows)]
             else:
-                single = (f"vc={_fmt(cutoff_variance)} nr={_fmt(cutoff_noise_ratio)} "
-                          f"sk={_fmt(self.smoothing_kernel_size)} cc={_fmt(cut_coefficients)} "
+                single = (f"nc={_fmt(len(self.components))} vc={_fmt(cutoff_variance)} "
+                          f"nr={_fmt(cutoff_noise_ratio)} sk={_fmt(self.smoothing_kernel_size)} "
+                          f"cc={_fmt(cut_coefficients)} "
                           f"gnr={_fmt(global_noise_ratio_cutoff)} lk={self.line_kernel_size} "
                           f"ls={self.line_cutoff_std} lstsq={int(self.use_lstsq)}")
                 row_strings = [single] * n_rows
@@ -2575,7 +2721,37 @@ class PCACorrector:
             if stats['components_used']:
                 logger.info(f"  Components used: {np.mean(stats['components_used']):.1f} ± "
                            f"{np.std(stats['components_used']):.1f}")
-            
+
+            # Per-mission breakdown of why components were skipped — helps diagnose
+            # whether variance/coefficient/noise-ratio cutoffs are the actual
+            # bottleneck, independent of which one you happen to be tuning.
+            reason_counts = {}  # mission_id -> {reason: count}
+            used_counts = {}    # mission_id -> count of (spectrum, component) pairs used
+            for idx, det in correction_details.items():
+                comp_info = det.get('component_info') if det else None
+                if not comp_info:
+                    continue
+                try:
+                    mid = to_string(data['MISSION_ID'][idx])
+                except Exception:
+                    mid = 'unknown'
+                for info in comp_info.values():
+                    if info.get('used'):
+                        used_counts[mid] = used_counts.get(mid, 0) + 1
+                    else:
+                        reason = info.get('reason', 'unknown')
+                        mid_reasons = reason_counts.setdefault(mid, {})
+                        mid_reasons[reason] = mid_reasons.get(reason, 0) + 1
+
+            if reason_counts or used_counts:
+                logger.info("  Component skip-reason breakdown (per mission):")
+                for mid in sorted(set(reason_counts) | set(used_counts)):
+                    reasons = reason_counts.get(mid, {})
+                    reasons_str = ', '.join(f"{r}={c}" for r, c in
+                                            sorted(reasons.items(), key=lambda kv: -kv[1]))
+                    logger.info(f"    {mid}: used={used_counts.get(mid, 0)}"
+                               + (f", skipped: {reasons_str}" if reasons_str else ""))
+
             # Generate plots if requested
             # Use only the corrected spectra for plotting (filtered indices)
             if generate_plots:
@@ -2854,7 +3030,9 @@ class PCACorrector:
                     if in_span:
                         ax.axvspan(v0, x_axis[-1], color='red', alpha=0.15, zorder=0)
                 if mean_gcf is not None and mean_gcs is not None and len(mean_gcf) == len(x_axis):
-                    # Channels in gcs but not gcf (telluric region) → blue shade
+                    # Channels in gcs but not gcf → blue shade. Telluric channels are now
+                    # excluded from gcs too (see correct_fits_file), so this only catches
+                    # detected science lines: fit-excluded but still subtracted.
                     tel_only = (mean_gcs >= 0.5) & (mean_gcf < 0.5)
                     in_span = False
                     for ch, val in enumerate(tel_only):
@@ -2874,7 +3052,8 @@ class PCACorrector:
                     f"  Plot mask summary for {mission_id}/{telescope}/scan{scan}: "
                     f"gcf={frac_gcf*100:.1f}% of channels used for fitting, "
                     f"gcs={frac_gcs*100:.1f}% used for subtraction "
-                    f"(red shade=excluded from subtraction, blue shade=telluric only)"
+                    f"(red shade=excluded from subtraction incl. telluric, "
+                    f"blue shade=detected line, fit-excl. only)"
                 )
 
             # Original mean
@@ -2891,7 +3070,7 @@ class PCACorrector:
             _shade_masks(ax2)
             ax2.plot(x_axis, original_mean, 'r-', lw=1, alpha=0.5, label='Orig')
             ax2.plot(x_axis, corrected_mean, 'g-', lw=1.5, label='Corr')
-            ax2.set_title('Corrected Mean  [red=excl. subtraction | blue=telluric fit-excl.]', fontsize=9)
+            ax2.set_title('Corrected Mean  [red=excl. subtraction (incl. telluric) | blue=line fit-excl.]', fontsize=9)
             ax2.set_ylim(min_val, max_val)
             ax2.legend(fontsize=8, loc='upper right')
             ax2.grid(True, alpha=0.3)
@@ -3371,12 +3550,12 @@ class PCACorrector:
                     spans.append((span_start, x_axis[-1]))
                 return spans
 
-            ex_gcs_excluded = _mask_spans(ex_gcs_mask)   # bad + science line → no subtraction
+            ex_gcs_excluded = _mask_spans(ex_gcs_mask)   # bad + telluric → no subtraction
             if ex_gcf_mask is not None and ex_gcs_mask is not None:
-                telluric_only = ex_gcs_mask & ~ex_gcf_mask   # in gcs but excluded from gcf
+                line_fit_excl_only = ex_gcs_mask & ~ex_gcf_mask   # in gcs but excluded from gcf (detected line)
             else:
-                telluric_only = None
-            ex_telluric_spans = _mask_spans(~telluric_only if telluric_only is not None else None)
+                line_fit_excl_only = None
+            ex_line_fit_excl_spans = _mask_spans(~line_fit_excl_only if line_fit_excl_only is not None else None)
             
             # Plot correction for each component (progressive: each row shows
             # the spectrum after subtracting components 1..N cumulatively)
@@ -3426,10 +3605,10 @@ class PCACorrector:
                 # Shade masked regions
                 for v0, v1 in ex_gcs_excluded:
                     ax_ex_comp.axvspan(v0, v1, color='red', alpha=0.15, zorder=0,
-                                       label='excluded (bad/line)' if comp_idx == 0 and v0 == ex_gcs_excluded[0][0] else '_')
-                for v0, v1 in ex_telluric_spans:
+                                       label='excluded (bad/telluric)' if comp_idx == 0 and v0 == ex_gcs_excluded[0][0] else '_')
+                for v0, v1 in ex_line_fit_excl_spans:
                     ax_ex_comp.axvspan(v0, v1, color='blue', alpha=0.12, zorder=0,
-                                       label='telluric (sub only)' if comp_idx == 0 and v0 == ex_telluric_spans[0][0] else '_')
+                                       label='line (sub only)' if comp_idx == 0 and v0 == ex_line_fit_excl_spans[0][0] else '_')
 
                 # Progressive: show state before and after this component
                 before = progressive[comp_idx]
@@ -3643,11 +3822,24 @@ Examples:
     )
     parser.add_argument(
         '--least-squares',
+        dest='least_squares',
         action='store_true',
-        default=False,
-        help='Use least-squares fitting for PCA coefficients instead of dot product. '
-             'More accurate when channels are masked (bad channels + science line), '
-             'because masked PCA components are no longer orthonormal.'
+        default=None,
+        help='Use least-squares fitting for PCA coefficients instead of dot product '
+             '(this is now the default — dot product alone was observed to leave '
+             'barely any visible correction; see pca_param_todo.txt). More accurate '
+             'when channels are masked (bad channels + science line), because masked '
+             'PCA components are no longer orthonormal. Can be overridden per mission '
+             'via the least_squares key in --per-mission-parameters\' YAML file, or '
+             'disabled entirely with --no-least-squares.'
+    )
+    parser.add_argument(
+        '--no-least-squares',
+        dest='least_squares',
+        action='store_false',
+        default=None,
+        help='Force dot-product fitting instead of least-squares, overriding the '
+             'default and any config [pca] least_squares setting.'
     )
     parser.add_argument(
         '--variance-cutoff',
@@ -3767,6 +3959,18 @@ Examples:
              '(comma-separated, e.g. F367,F296)'
     )
     parser.add_argument(
+        '--separate-mission-id',
+        action='store_true',
+        default=False,
+        help='When --mission-id lists several missions (comma-separated), run the '
+             'correction once per mission instead of combining them into one output: '
+             'each mission gets its own run and its own output file, with its ID '
+             'inserted into the filename (e.g. --output corrected.fits --mission-id '
+             'F296,F298 -> corrected_F296.fits, corrected_F298.fits). Without this '
+             'flag, --mission-id still selects those missions but writes a single '
+             'combined output file, as before.'
+    )
+    parser.add_argument(
         '--aor-id',
         type=str,
         default=None,
@@ -3781,6 +3985,17 @@ Examples:
         dest='filter_flight',
         help='Exclude all spectra whose MISSION_ID contains these strings '
              '(space-separated, e.g. F528 F299).'
+    )
+    parser.add_argument(
+        '--filter-by-filename',
+        type=str,
+        default=None,
+        dest='filter_by_filename',
+        help='Only load decomposition pickles from components_dir whose filename '
+             'contains one of these substrings (comma-separated, e.g. F367). '
+             'Speeds up per-mission runs by skipping the unpickling of every '
+             'other mission\'s components, which would otherwise be loaded and '
+             'discarded.'
     )
     parser.add_argument(
         '--per-mission-parameters',
@@ -3841,7 +4056,7 @@ Examples:
     config_output_file = None
     config_line_window = None
     config_n_components = None
-    config_use_lstsq = False
+    config_use_lstsq = True  # default: least-squares fitting unless explicitly disabled
     config_variance_cutoff = None
     config_noise_ratio_cutoff = None
     config_global_noise_ratio_cutoff = None
@@ -3883,9 +4098,11 @@ Examples:
                 except (ValueError, TypeError):
                     config_n_components = None
 
-            # Read least_squares
-            ls_val = pca_config.get('least_squares', False)
-            if ls_val and ls_val is not False:
+            # Read least_squares — only overrides the (now-True) default if the
+            # key is actually present in config, so an explicit `false` is
+            # respected rather than being indistinguishable from "not set".
+            ls_val = pca_config.get('least_squares', None)
+            if ls_val is not None:
                 config_use_lstsq = bool(ls_val)
 
             # Read cutoff parameters (can be False, float, or int)
@@ -4016,14 +4233,21 @@ Examples:
         logger.info(f"✓ Components directory = {decomp_dir} (from config [output][components_dir])")
         if decomp_dir.exists():
             # Try to load per-mission decompositions
-            mission_decompositions = PCACorrector.load_decompositions_from_dir(decomp_dir)
+            mission_decompositions = PCACorrector.load_decompositions_from_dir(
+                decomp_dir, name_filter=args.filter_by_filename)
 
             if mission_decompositions:
                 logger.info(f"✓ Loaded {len(mission_decompositions)} per-mission decompositions")
             else:
-                # Fall back to single decomposition file
+                # Fall back to single decomposition file (honour the same
+                # filename filter, so we never silently pick another mission's).
                 import glob
                 decomp_files = sorted(glob.glob(str(decomp_dir / "decomposition_*_components.pkl")))
+                if args.filter_by_filename:
+                    _terms = [t.strip() for t in args.filter_by_filename.split(',') if t.strip()]
+                    if _terms:
+                        decomp_files = [f for f in decomp_files
+                                        if any(t in os.path.basename(f) for t in _terms)]
                 if decomp_files:
                     decomposition_file = decomp_files[-1]  # Use most recent
                     logger.info(f"✓ Decomposition = {decomposition_file} (from {decomp_dir})")
@@ -4054,7 +4278,21 @@ Examples:
         logger.error("  1. Command line: pca_correct --output /path/to/output.fits ...")
         logger.error("  2. Config [output][pcad_fits]")
         sys.exit(1)
-    
+
+    # --separate-mission-id: when --mission-id lists several missions, run the
+    # correction once per mission instead of once for all of them combined,
+    # each writing to its own output file (mission id inserted into the
+    # filename). Without the flag, --mission-id (single or comma-separated)
+    # is still applied as one combined run into a single output file.
+    mission_id_runs = [args.mission_id]
+    if args.separate_mission_id:
+        if args.mission_id:
+            split_missions = [m.strip() for m in args.mission_id.split(',') if m.strip()]
+            if split_missions:
+                mission_id_runs = split_missions
+        else:
+            logger.warning("--separate-mission-id given but --mission-id is not set — ignoring")
+
     # Set plot directory: explicit CLI arg > config > fallback
     if args.plot_dir is None:
         args.plot_dir = config_plot_dir
@@ -4095,7 +4333,9 @@ Examples:
         # This must happen BEFORE constructing PCACorrector so the corrector receives
         # the correct values (previously these merges were done after construction).
         n_components = args.n_components if args.n_components is not None else config_n_components
-        use_lstsq = args.least_squares or config_use_lstsq  # CLI flag overrides; config sets default
+        # --least-squares/--no-least-squares (tristate, default=None) wins when given;
+        # otherwise fall back to config (which itself defaults to True — see above).
+        use_lstsq = args.least_squares if args.least_squares is not None else config_use_lstsq
         cutoff_variance = args.variance_cutoff if args.variance_cutoff is not None else config_variance_cutoff
         cutoff_noise_ratio = args.noise_ratio_cutoff if args.noise_ratio_cutoff is not None else config_noise_ratio_cutoff
         global_noise_ratio_cutoff = (args.global_noise_ratio_cutoff
@@ -4173,8 +4413,6 @@ Examples:
             else:
                 logger.warning("  --per-mission-parameters set but config[input][mission_pca_parameters] is not defined — ignoring")
 
-        logger.info("Applying PCA correction...")
-
         logger.info(f"Correction parameters:")
         logger.info(f"  Variance cutoff: {cutoff_variance}")
         logger.info(f"  Noise ratio cutoff: {cutoff_noise_ratio}")
@@ -4184,47 +4422,56 @@ Examples:
         logger.info(f"  Least-squares fitting: {use_lstsq}")
         logger.info(f"  Cut coefficients: {cut_coefficients}")
 
-        stats = corrector.correct_fits_file(
-            input_fits=str(input_path),
-            output_fits=output_file,
-            cutoff_variance=cutoff_variance,
-            cutoff_noise_ratio=cutoff_noise_ratio,
-            global_noise_ratio_cutoff=global_noise_ratio_cutoff,
-            cut_coefficients=cut_coefficients,
-            hdu_index=args.hdu,
-            spectrum_col=args.spectrum_column,
-            object_filter=object_filter,
-            overwrite=not args.no_overwrite,
-            generate_plots=args.plot,
-            generate_kde_plots=not args.no_kde_plots,
-            output_dir=args.plot_dir,
-            config_window=config_line_window if config_line_window else (tuple(args.config_window) if args.config_window else None),
-            detect_science_lines=args.detect_science_lines,
-            scan_filter=args.scan,
-            subscan_filter=args.subscan,
-            telescope_filter=args.telescope,
-            mission_id_filter=args.mission_id,
-            aor_id_filter=args.aor_id,
-            flight_filter=args.filter_flight,
-            mission_decompositions=mission_decompositions_to_use,
-            n_jobs=args.n_jobs,
-            mission_pca_params=mission_pca_params,
-        )
-        # Print summary
-        logger.info("\n=== Correction Summary ===")
-        logger.info(f"Total spectra: {stats['total']}")
-        logger.info(f"Successfully corrected: {stats['corrected']}")
-        logger.info(f"Failed: {stats['failed']}")
-        
-        if stats['components_used']:
-            avg_comp = np.mean(stats['components_used'])
-            std_comp = np.std(stats['components_used'])
-            logger.info(f"Components used: {avg_comp:.1f} ± {std_comp:.1f}")
-        
-        logger.info(f"\n✓ Corrected FITS saved to: {output_file}")
-        if args.plot:
-            logger.info(f"✓ Diagnostic plots saved to: {args.plot_dir}")
-        
+        for mission_id_run in mission_id_runs:
+            if args.separate_mission_id and args.mission_id:
+                output_path = Path(output_file)
+                run_output_file = str(output_path.with_name(f"{output_path.stem}_{mission_id_run}{output_path.suffix}"))
+                logger.info(f"\nApplying PCA correction for MISSION_ID={mission_id_run} -> {run_output_file} ...")
+            else:
+                run_output_file = output_file
+                logger.info("Applying PCA correction...")
+
+            stats = corrector.correct_fits_file(
+                input_fits=str(input_path),
+                output_fits=run_output_file,
+                cutoff_variance=cutoff_variance,
+                cutoff_noise_ratio=cutoff_noise_ratio,
+                global_noise_ratio_cutoff=global_noise_ratio_cutoff,
+                cut_coefficients=cut_coefficients,
+                hdu_index=args.hdu,
+                spectrum_col=args.spectrum_column,
+                object_filter=object_filter,
+                overwrite=not args.no_overwrite,
+                generate_plots=args.plot,
+                generate_kde_plots=not args.no_kde_plots,
+                output_dir=args.plot_dir,
+                config_window=config_line_window if config_line_window else (tuple(args.config_window) if args.config_window else None),
+                detect_science_lines=args.detect_science_lines,
+                scan_filter=args.scan,
+                subscan_filter=args.subscan,
+                telescope_filter=args.telescope,
+                mission_id_filter=mission_id_run,
+                aor_id_filter=args.aor_id,
+                flight_filter=args.filter_flight,
+                mission_decompositions=mission_decompositions_to_use,
+                n_jobs=args.n_jobs,
+                mission_pca_params=mission_pca_params,
+            )
+            # Print summary
+            logger.info("\n=== Correction Summary ===")
+            logger.info(f"Total spectra: {stats['total']}")
+            logger.info(f"Successfully corrected: {stats['corrected']}")
+            logger.info(f"Failed: {stats['failed']}")
+
+            if stats['components_used']:
+                avg_comp = np.mean(stats['components_used'])
+                std_comp = np.std(stats['components_used'])
+                logger.info(f"Components used: {avg_comp:.1f} ± {std_comp:.1f}")
+
+            logger.info(f"\n✓ Corrected FITS saved to: {run_output_file}")
+            if args.plot:
+                logger.info(f"✓ Diagnostic plots saved to: {args.plot_dir}")
+
     except Exception as e:
         logger.error(f"Error: {e}")
         if args.debug:

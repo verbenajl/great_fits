@@ -4,14 +4,14 @@ Command-line interface for OI ZEIGT.
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import click
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
 
-from .basic_io import read_fits_from_config, read_fits, get_config, combine_fits_from_list
+from .basic_io import read_fits_from_config, read_fits, get_config, combine_fits_from_list, combine_fits_files
 from .reduction.core import (analyze_spectrum_values, detect_blank_channels,
                             detect_nan_channels, filter_and_save_fits,
                             apply_baseline_from_config, reduce_spectra_from_config,
@@ -1410,7 +1410,7 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     type=(str, float),
     multiple=True,
     metavar="COLUMN VALUE",
-    help="Keep rows where COLUMN >= VALUE (filter out below). "
+    help="Keep rows where COLUMN <= VALUE (filter out above). "
          "Rows with NaN in the column always pass. Can be repeated."
 )
 @click.option(
@@ -1418,8 +1418,39 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     type=(str, float),
     multiple=True,
     metavar="COLUMN VALUE",
-    help="Keep rows where COLUMN <= VALUE (filter out above). "
+    help="Keep rows where COLUMN >= VALUE (filter out below). "
          "Rows with NaN in the column always pass. Can be repeated."
+)
+@click.option(
+    "--filter-below-adaptive-rmsratio",
+    "filter_below_adaptive_rmsratio",
+    type=float,
+    default=None,
+    metavar="PERCENT",
+    help="Adaptive per-file RMSRATIOB cut: instead of a fixed --filter-below "
+         "RMSRATIOB value, keep the lowest-noise PERCENT% of the spectra. It uses "
+         "the smallest RMSRATIOB threshold that still retains at least PERCENT% of "
+         "the rows with a finite RMSRATIOB (i.e. the PERCENT-th percentile of "
+         "RMSRATIOB, keeping rows <= that), dropping only the noisiest tail. "
+         "Computed independently for each input file, so every flight gets its own "
+         "cut — useful when a fixed threshold discards too many spectra on the "
+         "noisier flights. Rows with NaN RMSRATIOB always pass. Example: "
+         "--filter-below-adaptive-rmsratio 80 keeps ~80% of spectra."
+)
+@click.option(
+    "--filter-below-adaptive-rmsratio-limit",
+    "filter_below_adaptive_rmsratio_limit",
+    type=float,
+    default=None,
+    metavar="VALUE",
+    help="Hard cap on the --filter-below-adaptive-rmsratio threshold: the "
+         "effective RMSRATIOB cut is min(adaptive percentile, VALUE), so spectra "
+         "with RMSRATIOB > VALUE are always discarded even when a flight is so "
+         "noisy that keeping PERCENT% would otherwise retain them (in that case "
+         "fewer than PERCENT% are kept). Used together with "
+         "--filter-below-adaptive-rmsratio; if given on its own it acts as a plain "
+         "hard RMSRATIOB <= VALUE cut. Rows with NaN RMSRATIOB always pass. "
+         "Example: --filter-below-adaptive-rmsratio 80 --filter-below-adaptive-rmsratio-limit 1.7."
 )
 @click.option(
     "--filter-spectrum-peaks",
@@ -1444,6 +1475,25 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     multiple=True,
     help="Remove all rows whose MISSION_ID contains this string (e.g. F528). "
          "Can be specified multiple times to remove several flights."
+)
+@click.option(
+    "--mission-id",
+    "mission_id",
+    type=str,
+    multiple=True,
+    help="Keep only rows whose MISSION_ID contains one of these substrings "
+         "(comma-separated, e.g. F296,F528 — or repeat the flag). Applied "
+         "before any other filter, so it also reduces memory/time use on "
+         "large multi-mission files."
+)
+@click.option(
+    "--aor-id",
+    "aor_id",
+    type=str,
+    multiple=True,
+    help="Keep only rows whose AOR_ID contains one of these substrings "
+         "(comma-separated, e.g. 04_0116,04_0117 — or repeat the flag). "
+         "Applied before any other filter, same as --mission-id."
 )
 @click.option(
     "--filter-object-exact",
@@ -1477,15 +1527,46 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
     help="Add TSYS_INDEX and TAU_SIG_INDEX columns to the clean output if they are not already "
          "present (same pairing logic used by prepare_for_pca)."
 )
+@click.option(
+    "--velocity-resample",
+    "velocity_resample",
+    type=float,
+    default=None,
+    metavar="KM_S",
+    help="Resample the clean output spectra onto a single shared velocity grid at this "
+         "channel spacing (km/s), via linear interpolation. Applied last, after all other "
+         "filters. The grid is anchored to exact multiples of this value relative to 0 km/s "
+         "(not to any one row's own reference velocity), so rows with slightly different "
+         "native VELOCITY/DELTAV (e.g. different missions) end up on exactly the same grid — "
+         "required for combine_fits/gridding to work correctly across them. Channels outside "
+         "a row's original coverage become NaN. Does not apply to the rejected file."
+)
+@click.option(
+    "--velocity-resample-range",
+    "velocity_resample_range",
+    type=(float, float),
+    default=None,
+    metavar="MIN MAX",
+    help="Fix the resampled grid's extent (km/s) instead of deriving it from this file's "
+         "own data. Required when running filter_fits separately per flight/mission before "
+         "combining them later with combine_fits, since that requires every input file to "
+         "have the same SPECTRUM column shape — without a fixed range, each flight's grid "
+         "would only span whatever velocities that flight happens to cover. Only meaningful "
+         "together with --velocity-resample."
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
                 nan_threshold: float, output_clean: Optional[str],
                 output_rejected: Optional[str], remove: Optional[str],
                 remove_values: tuple, apply_only_to_object: bool, filter_zero: bool,
                 filter_below: tuple, filter_above: tuple,
+                filter_below_adaptive_rmsratio: Optional[float],
+                filter_below_adaptive_rmsratio_limit: Optional[float],
                 spectrum_peak_threshold: Optional[float], filter_tau: bool,
-                filter_flight: tuple, filter_object_exact: Optional[str],
+                filter_flight: tuple, mission_id: tuple, aor_id: tuple, filter_object_exact: Optional[str],
                 filter_out_object_exact: Optional[str],
-                exclude_obsmode: Optional[str], couple_tau_tsys: bool):
+                exclude_obsmode: Optional[str], couple_tau_tsys: bool,
+                velocity_resample: Optional[float],
+                velocity_resample_range: Optional[Tuple[float, float]]):
     """
     Filter FITS data by object, NaN content, all-zero spectra, and/or column values.
     
@@ -1530,11 +1611,11 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             --remove-values 04_0116_0020609 --remove-values 04_0116_0020506 \\
             --filter-zero
 
-        # Keep only spectra with RMSRATIOB >= 2.0
+        # Keep only spectra with RMSRATIOB <= 2.0
         filter_fits --config config.toml --filter-below RMSRATIOB 2.0
 
         # Keep only spectra with 1.3 <= RMSRATIOB <= 3.0
-        filter_fits --config config.toml --filter-below RMSRATIOB 1.3 --filter-above RMSRATIOB 3.0
+        filter_fits --config config.toml --filter-above RMSRATIOB 1.3 --filter-below RMSRATIOB 3.0
     """
     try:
         # Always try to load config
@@ -1638,12 +1719,98 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             param_filters.append((col, 'above', val))
             click.echo(f"Parameter filter: keep {col} >= {val}")
 
+        # Adaptive RMSRATIOB cut: derive the --filter-below threshold from this
+        # file's own RMSRATIOB distribution so a fixed number won't over-prune a
+        # noisier flight. Keep the lowest-noise PERCENT% via the PERCENT-th
+        # percentile of the finite RMSRATIOB values, optionally capped by a hard
+        # limit so the effective 'below' threshold is min(percentile, limit).
+        _adapt_pct = filter_below_adaptive_rmsratio
+        _adapt_limit = filter_below_adaptive_rmsratio_limit
+        if _adapt_pct is not None or _adapt_limit is not None:
+            if _adapt_pct is not None and not (0 < _adapt_pct <= 100):
+                click.echo(click.style(
+                    "Error: --filter-below-adaptive-rmsratio must be a percentage in (0, 100]",
+                    fg='red'), err=True)
+                sys.exit(1)
+            if _adapt_limit is not None and _adapt_limit <= 0:
+                click.echo(click.style(
+                    "Error: --filter-below-adaptive-rmsratio-limit must be positive",
+                    fg='red'), err=True)
+                sys.exit(1)
+            rms_vals = None
+            for _hdu in hdul:
+                _d = getattr(_hdu, 'data', None)
+                if _d is not None and getattr(_d, 'dtype', None) is not None \
+                   and _d.dtype.names and 'RMSRATIOB' in _d.dtype.names:
+                    rms_vals = np.asarray(_d['RMSRATIOB'], dtype=float)
+                    # Restrict to the science rows the 'below' filter will act on:
+                    # rows whose OBJECT contains the target object (same rule as
+                    # filter_and_save_fits), so "keep PERCENT%" means PERCENT% of
+                    # the science spectra, not of the whole (multi-object) table.
+                    if object and 'OBJECT' in _d.dtype.names:
+                        _objs = np.array([
+                            (s.decode() if isinstance(s, bytes) else str(s)).strip().lower()
+                            for s in _d['OBJECT']
+                        ])
+                        _tmask = np.char.find(_objs, object.lower()) >= 0
+                        rms_vals = rms_vals[_tmask]
+                    break
+            if rms_vals is None:
+                click.echo(click.style(
+                    "Error: --filter-below-adaptive-rmsratio[-limit] requested but no "
+                    "RMSRATIOB column was found in the input", fg='red'), err=True)
+                sys.exit(1)
+            finite = np.isfinite(rms_vals)
+            n_finite = int(finite.sum())
+            # Percentile part (skipped if RMSRATIOB is all-NaN or pct not given)
+            pct_thr = None
+            if _adapt_pct is not None:
+                if n_finite == 0:
+                    click.echo(click.style(
+                        "Warning: --filter-below-adaptive-rmsratio requested but RMSRATIOB is "
+                        "all-NaN — percentile not computed (all rows pass unless a limit is set)",
+                        fg='yellow'), err=True)
+                else:
+                    pct_thr = float(np.percentile(rms_vals[finite], _adapt_pct))
+            # Effective threshold = min(percentile, limit) over whichever are set
+            candidates = [t for t in (pct_thr, _adapt_limit) if t is not None]
+            if candidates:
+                thr = min(candidates)
+                param_filters.append(('RMSRATIOB', 'below', thr))
+                if pct_thr is not None and _adapt_limit is not None:
+                    binds = 'limit' if _adapt_limit <= pct_thr else f'P{_adapt_pct:g}'
+                    desc = (f"keep lowest-noise {_adapt_pct:g}% (P{_adapt_pct:g}={pct_thr:.4f}) "
+                            f"capped at limit {_adapt_limit:g} [{binds} binds]")
+                elif pct_thr is not None:
+                    desc = f"keep lowest-noise {_adapt_pct:g}% (P{_adapt_pct:g})"
+                else:
+                    desc = f"hard limit only"
+                kept_frac = (f"{int(np.sum(rms_vals[finite] <= thr))}/{n_finite} = "
+                             f"{100.0 * np.sum(rms_vals[finite] <= thr) / n_finite:.1f}% of finite-RMSRATIOB spectra kept"
+                             if n_finite > 0 else "no finite-RMSRATIOB science spectra")
+                click.echo(f"Adaptive RMSRATIOB filter: {desc} -> RMSRATIOB <= {thr:.4f} ({kept_frac})")
+                if any(c == 'RMSRATIOB' for c, _v in filter_below):
+                    click.echo(click.style(
+                        "  Note: an explicit --filter-below RMSRATIOB is also set; both apply "
+                        "(the stricter/lower threshold wins).", fg='yellow'))
+
         if spectrum_peak_threshold is not None:
             click.echo(f"Spectrum peak filter: reject science spectra with any |channel| > {spectrum_peak_threshold}")
         if filter_tau:
             click.echo("TAU filter: reject science spectra linked to TAU_SIG with channels outside [0.001, 1.0]")
         if filter_flight:
             click.echo(f"Flight filter: removing all rows with MISSION_ID containing: {', '.join(filter_flight)}")
+
+        # Accept both repeated (--mission-id 296 --mission-id 298) and
+        # comma-separated (--mission-id 296,298) forms.
+        mission_id_list = [s.strip() for m in mission_id for s in m.split(',') if s.strip()]
+        if mission_id_list:
+            click.echo(f"Mission-ID filter: keeping only rows with MISSION_ID containing: {', '.join(mission_id_list)}")
+
+        # Same dual-form parsing as --mission-id.
+        aor_id_list = [s.strip() for a in aor_id for s in a.split(',') if s.strip()]
+        if aor_id_list:
+            click.echo(f"AOR-ID filter: keeping only rows with AOR_ID containing: {', '.join(aor_id_list)}")
 
         obj_exact_list = [s.strip() for s in filter_object_exact.split(',')] if filter_object_exact else None
         obj_out_exact_list = [s.strip() for s in filter_out_object_exact.split(',')] if filter_out_object_exact else None
@@ -1656,6 +1823,16 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         exclude_obsmode_list = [s.strip() for s in exclude_obsmode.split(',')] if exclude_obsmode else None
         if exclude_obsmode_list:
             click.echo(f"OBSMODE exclusion filter: removing rows with OBSMODE in: {', '.join(exclude_obsmode_list)}")
+
+        if velocity_resample is not None:
+            click.echo(f"Velocity resampling: clean output will be resampled to {velocity_resample} km/s/channel")
+            if velocity_resample_range is not None:
+                click.echo(f"  Fixed grid range: {velocity_resample_range[0]} to {velocity_resample_range[1]} km/s "
+                           f"(same for every run — required for combine_fits across separate runs)")
+            else:
+                click.echo("  WARNING: no --velocity-resample-range given — the grid extent will be "
+                            "derived from this file's own data, which can differ run to run "
+                            "(e.g. across separate per-flight runs) and break combine_fits later.")
 
         # Filter and save
         clean_path, rejected_path, stats = filter_and_save_fits(
@@ -1672,9 +1849,13 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             spectrum_peak_threshold=spectrum_peak_threshold,
             filter_tau=filter_tau,
             filter_flights=list(filter_flight) if filter_flight else None,
+            filter_mission_ids=mission_id_list if mission_id_list else None,
+            filter_aor_ids=aor_id_list if aor_id_list else None,
             filter_object_exact=obj_exact_list,
             filter_out_object_exact=obj_out_exact_list,
             exclude_obsmode=exclude_obsmode_list,
+            velocity_resample_km_s=velocity_resample,
+            velocity_resample_range_km_s=velocity_resample_range,
         )
         
         # Optionally add TSYS_INDEX / TAU_SIG_INDEX to the clean output
@@ -2022,6 +2203,18 @@ def apply_baseline(config, fits, order, window, output):
               help='Use clean_data.fits from config [output] instead of input file.')
 @click.option('--unblank', is_flag=True, default=False,
               help='Fill NaN values using linear interpolation.')
+@click.option('--fill-telluric-noise', 'fill_telluric_noise', is_flag=True, default=False,
+              help="Fill each mission's telluric line window with Gaussian noise "
+                   '(matched to that spectrum\'s own continuum std) BEFORE baselining. '
+                   'Always runs before --baseline regardless of flag order on the command '
+                   'line, since a real un-excluded telluric feature would otherwise bias '
+                   'the baseline fit for missions whose telluric position falls outside a '
+                   'single fixed --baseline-window. Per-mission telluric_line_center/width '
+                   'are read from the mission parameters YAML (--mission-parameters, or '
+                   'config [pca]/[input].mission_parameters, falling back to the bundled file).')
+@click.option('--mission-parameters', 'mission_parameters', type=click.Path(exists=True), default=None,
+              help='Path to mission parameters YAML file for --fill-telluric-noise '
+                   '(overrides config [pca]/[input].mission_parameters).')
 @click.option('--baseline', is_flag=True, default=False,
               help='Apply baseline subtraction.')
 @click.option('--baseline-order', type=int, default=None,
@@ -2036,17 +2229,20 @@ def apply_baseline(config, fits, order, window, output):
               help='Extract velocity range from config [reduction].extract before baselining. Without this flag the spectrum length is left unchanged.')
 @click.option('--output', type=click.Path(), default=None,
               help='Output FITS file path.')
-def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, baseline_window,
+def reduce_spectra_cmd(config, fits, clean, unblank, fill_telluric_noise, mission_parameters,
+                       baseline, baseline_order, baseline_window,
                        smooth, decimate, extract, output):
     """
     Perform spectral reduction with selected methods.
-    
+
     Applies reduction methods in sequence:
     1. Unblank (--unblank): Fill NaN values using interpolation
     2. Extract (--extract): Trim spectrum to velocity range from config [reduction].extract
-    3. Baseline subtraction (--baseline): Remove polynomial baseline
-    4. Smoothing (--smooth [N]): Apply boxcar smoothing with window N (default: 5).
-    5. Decimation (--decimate): Keep every Nth channel using the --smooth window size as N; VELOCITY_AXIS is updated accordingly.
+    3. Fill telluric noise (--fill-telluric-noise): Overwrite each mission's telluric
+       window with Gaussian noise, before baselining.
+    4. Baseline subtraction (--baseline): Remove polynomial baseline
+    5. Smoothing (--smooth [N]): Apply boxcar smoothing with window N (default: 5).
+    6. Decimation (--decimate): Keep every Nth channel using the --smooth window size as N; VELOCITY_AXIS is updated accordingly.
 
     --extract, --smooth, and --decimate must be given explicitly. They are NOT applied
     automatically from config, so re-running reduce_spectra on an already-processed file
@@ -2093,8 +2289,17 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
         
         if unblank:
             methods['unblank'] = {}
-        
+
         reduction_cfg = cfg.get('reduction', {})
+
+        # Fill telluric noise must run before baselining (see reduce_spectra() in
+        # reduction/core.py). Resolve mission_parameters the same way prepare_for_pca does.
+        fill_telluric_from_config = reduction_cfg.get('fill_telluric_noise', False)
+        if fill_telluric_noise or fill_telluric_from_config:
+            eff_mission_parameters = (mission_parameters
+                                      or cfg.get('pca', {}).get('mission_parameters')
+                                      or cfg.get('input', {}).get('mission_parameters'))
+            methods['fill_telluric_noise'] = {'mission_parameters': eff_mission_parameters}
 
         # Extract velocity range only when --extract is explicitly requested.
         # Without the flag the spectrum length is left unchanged, so re-running
@@ -2195,7 +2400,12 @@ def reduce_spectra_cmd(config, fits, clean, unblank, baseline, baseline_order, b
         if unblank:
             click.echo(f"    - Unblank (fill NaN values with linear interpolation)")
             methods_applied = True
-        
+
+        if 'fill_telluric_noise' in methods:
+            source = " (from config)" if not fill_telluric_noise and fill_telluric_from_config else ""
+            click.echo(f"    - Fill telluric noise (per-mission window, before baselining){source}")
+            methods_applied = True
+
         # Check if baseline is in methods dict (either from --baseline flag or auto-applied from config)
         if 'baseline' in methods:
             baseline_info = methods['baseline']
@@ -3437,9 +3647,11 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
                    'COVERAGE extensions are written exactly as before whenever --weight-spectra '
                    'is set.')
 @click.option('--kernel-fwhm', type=float, default=None,
-              help='Gridding kernel FWHM in arcseconds. If not specified, uses the beam size. '
-                   'Use a value smaller than the beam to minimize resolution degradation '
-                   '(e.g., --kernel-fwhm 4.7 or --kernel-fwhm 7.0 for a 14″ beam).')
+              help='Gridding kernel FWHM in arcseconds. If not specified, uses the beam size '
+                   '(more smoothing, better sensitivity for noise-limited data). Use a value '
+                   'smaller than the beam (e.g. beam/3, matching GILDAS xy_map\'s default) to '
+                   'trade sensitivity for resolution on well-sampled, high-S/N data instead '
+                   '(e.g., --kernel-fwhm 4.7 for a 14.1″ beam).')
 @click.option('--telescop', type=str, default=None,
               help='Telescope name written to the FITS header. '
                    'If not specified, reads from config [gridding].telescop (default: IRAM-30M).')
@@ -3694,9 +3906,13 @@ def split_fits_cmd(fits_path, output_dir, manifest_path, manifest_science_path, 
 @click.command()
 @click.option(
     "--input",
+    "input_paths",
     type=click.Path(exists=True),
     required=True,
-    help="Path to text file containing list of FITS files (one per line)"
+    multiple=True,
+    help="Either a single text file listing FITS file paths (one per line), "
+         "or one or more FITS files given directly (repeat --input for each "
+         "file)."
 )
 @click.option(
     "--output",
@@ -3710,63 +3926,169 @@ def split_fits_cmd(fits_path, output_dir, manifest_path, manifest_science_path, 
     default=False,
     help="Combine all spectra into a single binary table HDU instead of keeping separate extension HDUs"
 )
-def combine_fits(input, output, single_hdu):
+def combine_fits(input_paths, output, single_hdu):
     """
     Combine multiple FITS files into a single FITS file.
-    
-    Takes a text file with a list of FITS file paths (one per line)
-    and combines them into a single FITS file.
-    
+
+    --input accepts either a text file with a list of FITS file paths (one
+    per line), or the FITS files themselves, given directly and repeated
+    once per file.
+
     Examples:
-    
-        # Default: keep all HDUs as separate extensions
+
+        # From a list file: keep all HDUs as separate extensions
         combine_fits --input list.txt --output combined.fits
-        
+
+        # FITS files given directly
+        combine_fits --input a.fits --input b.fits --input c.fits --output combined.fits
+
         # Merge all data into single HDU
         combine_fits --input list.txt --output combined.fits --single-hdu
-    
-    The input file can contain comments (lines starting with '#')
+
+    A list file can contain comments (lines starting with '#')
     and blank lines, which will be ignored.
     """
     try:
         click.echo("\n" + "="*70)
         click.echo("COMBINING FITS FILES")
         click.echo("="*70 + "\n")
-        
-        input_path = Path(input)
+
         output_path = Path(output)
-        
-        # Read the list file and display files to be combined
-        click.echo(f"Reading FITS file list from: {input_path}\n")
-        
-        with open(input_path, 'r') as f:
-            files = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
-        
+
+        # A single --input whose own extension isn't .fits/.fit is treated as
+        # a list file (legacy behavior); anything else (multiple --input, or
+        # a single one that's itself a .fits file) is taken as literal FITS
+        # file paths to combine directly.
+        list_file_path = None
+        if len(input_paths) == 1 and Path(input_paths[0]).suffix.lower() not in ('.fits', '.fit'):
+            list_file_path = Path(input_paths[0])
+            click.echo(f"Reading FITS file list from: {list_file_path}\n")
+            with open(list_file_path, 'r') as f:
+                files = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+        else:
+            files = list(input_paths)
+
         click.echo(f"Found {len(files)} FITS files to combine:\n")
         for i, f in enumerate(files, 1):
             click.echo(f"  {i:2d}. {f}")
         click.echo()
-        
+
         # Display combination mode
         if single_hdu:
             click.echo(click.style("Mode: Single HDU (all data merged into one binary table)", fg="cyan"))
         else:
             click.echo(click.style("Mode: Multiple HDUs (separate extension HDUs)", fg="cyan"))
         click.echo()
-        
+
         # Combine the files
-        combined_hdul = combine_fits_from_list(input_path, output_path, single_hdu=single_hdu)
-        
+        if list_file_path is not None:
+            combined_hdul = combine_fits_from_list(list_file_path, output_path, single_hdu=single_hdu)
+        else:
+            combined_hdul = combine_fits_files(files, single_hdu=single_hdu)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            combined_hdul.writeto(output_path, overwrite=True)
+
         # Display results
         click.echo(click.style("✓ Successfully combined FITS files!", fg="green"))
         click.echo(f"\nOutput file: {output_path}")
         click.echo(f"Total HDUs: {len(combined_hdul)}\n")
-        
+
         combined_hdul.info()
         click.echo("\n" + "="*70 + "\n")
-        
+
         combined_hdul.close()
         
+    except FileNotFoundError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.option(
+    "--input",
+    "input_fits",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to FITS file containing spectra."
+)
+@click.option(
+    "--output-folder",
+    type=click.Path(),
+    default=None,
+    help="Directory to save cascade plots into (created if missing). One "
+         "subdirectory per MISSION_ID is created inside it. If omitted, "
+         "nothing is saved — all groups are shown on screen instead, as "
+         "panels in a single figure."
+)
+@click.option(
+    "--hdu-index",
+    type=int,
+    default=None,
+    help="HDU index to read (default: first HDU with a SPECTRUM column)."
+)
+@click.option(
+    "--max-figsize-height",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Cap on figure height in inches, regardless of how many spectra are in a group."
+)
+@click.option(
+    "--object",
+    "object_filter",
+    default=None,
+    help="Only include spectra whose OBJECT contains this substring (case-insensitive). "
+         "Default: no filtering, all rows included regardless of OBJECT."
+)
+def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, object_filter):
+    """
+    Draw cascade (waterfall) plots of spectra, one plot per
+    MISSION_ID / SCAN / TELESCOP group.
+
+    Each group is rendered as an image — one row per spectrum, color encoding
+    amplitude, with a colorbar (same color-coding convention as pca_correct's
+    diagnostic plots) — useful for visually scanning many individual spectra
+    in a scan for line shape, strength, or artefacts, without rows overlapping
+    regardless of how many spectra are in the group.
+
+    Examples:
+
+        # Save one PNG per group
+        cascade_plots --input input.fits --output-folder plots/dir
+
+        # No --output-folder: show all groups as panels on screen instead
+        cascade_plots --input input.fits
+
+        cascade_plots --input input.fits --output-folder plots/dir --object M51CENTER
+    """
+    try:
+        from .cascade_plots import draw_cascade_plots
+
+        click.echo("\n" + "="*70)
+        click.echo("CASCADE PLOTS")
+        click.echo("="*70 + "\n")
+
+        saved_paths = draw_cascade_plots(
+            input_fits=input_fits,
+            output_folder=output_folder,
+            hdu_index=hdu_index,
+            max_figsize_height=max_figsize_height,
+            object_filter=object_filter,
+        )
+
+        if output_folder is not None:
+            click.echo(click.style(f"\n✓ Saved {len(saved_paths)} cascade plot(s) to {output_folder}", fg="green"))
+        else:
+            click.echo(click.style("\n✓ Displayed cascade panels on screen", fg="green"))
+
     except FileNotFoundError as e:
         click.echo(click.style(f"Error: {e}", fg="red"), err=True)
         sys.exit(1)
@@ -3947,10 +4269,14 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
               help='Output FITS file path. Defaults to output.post_processed_fits from config.')
 @click.option('--refill-telluric-noise', 'refill_telluric', is_flag=True, default=False,
               help='Refill telluric line channels with Gaussian noise at the post-PCA noise level.')
-@click.option('--baseline', 'baseline_order', type=int, default=None,
-              help='Apply polynomial baseline subtraction of this order to science spectra before '
-                   'computing RMS. The line window from config [reduction].line_window is excluded '
-                   'from the fit. If not given, no baseline is applied.')
+@click.option('--baseline', 'baseline_order', type=str, default=None, metavar='ORDER|auto',
+              help='Apply polynomial baseline subtraction to science spectra before computing RMS. '
+                   'Pass an integer polynomial order, or "auto" to choose the order per spectrum '
+                   '(capped at 3) by the radiometer stopping rule: raise the order until the '
+                   'residual line-free RMS drops to ~the theoretical (radiometer) RMS, then stop. '
+                   'The line window from config [reduction].line_window is excluded from the fit. '
+                   '"auto" also writes a BLORDER column and prints a per-flight order histogram. '
+                   'If not given, no baseline is applied.')
 @click.option('--filter-flight', 'filter_flight', type=str, multiple=True,
               help='Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated.')
 @click.option('--aor-id', 'aor_id', type=str, default=None,
@@ -3977,6 +4303,7 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
     Examples:
         post_process_data --config config.toml
         post_process_data --config config.toml --pcad --baseline 3
+        post_process_data --config config.toml --pcad --baseline auto
         post_process_data --config config.toml --reduced
         post_process_data --config config.toml --output my_post.fits
 
@@ -3991,6 +4318,23 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         output_cfg = cfg.get('output', {})
         reduction_cfg = cfg.get('reduction', {})
         object_filter = cfg.get('parameters', {}).get('object', None)
+
+        # --baseline accepts an integer polynomial order, or the literal 'auto'
+        # for per-spectrum order selection (capped at 3) via the radiometer
+        # stopping rule (raise order until residual line-free RMS ≈ theoretical RMS).
+        baseline_auto = False
+        if baseline_order is not None:
+            if str(baseline_order).strip().lower() == 'auto':
+                baseline_auto = True
+                baseline_order = None
+            else:
+                try:
+                    baseline_order = int(baseline_order)
+                except (TypeError, ValueError):
+                    click.echo(click.style(
+                        f"Error: --baseline must be an integer order or 'auto' (got {baseline_order!r})",
+                        fg='red'), err=True)
+                    sys.exit(1)
 
         # --- Determine input file ---
         if fits_input:
@@ -4186,9 +4530,44 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
 
         spectra       = np.array(data['SPECTRUM'],  dtype=np.float64)
 
+        # --- Per-spectrum theoretical (radiometer) RMS ---
+        # Computed up-front (it depends only on the metadata columns, not on the
+        # spectrum values) so --baseline auto can use it as the per-spectrum
+        # stopping target while selecting the polynomial order.
+        tsys_vals     = np.array(data['TSYS'],      dtype=np.float64)   # K
+        deltav_vals   = np.array(data['DELTAV'],    dtype=np.float64)   # m/s (actual channel width after decimation)
+        restfreq_vals = np.array(data['RESTFREQ'],  dtype=np.float64)   # Hz
+        spectime_vals = np.array(data['SPECTIME'],  dtype=np.float64)   # s, on-source
+        reftime_vals  = np.array(data['REFTIME'],   dtype=np.float64)   # s, off-source
+        tau_vals      = np.array(data['TAU-ATM'],   dtype=np.float64)   # opacity
+        elev_vals     = np.array(data['ELEVATIO'],  dtype=np.float64)   # degrees
+
+        # Theoretical radiometer RMS:
+        #   σ = T_sys / sqrt(Δν_Hz) * sqrt(1/t_sig + 1/t_ref) * exp(tau/sin(elev))
+        # Δν is computed from DELTAV (actual channel width after any decimation) and RESTFREQ.
+        # FREQRES reflects the original pre-decimation channel width and must not be used here.
+        # Opacity correction skipped when TAU-ATM <= 0 (unphysical values).
+        delta_nu = np.abs(deltav_vals) / C_MS * restfreq_vals          # Hz, shape (n_spectra,)
+        elev_rad = elev_vals * (np.pi / 180.0)
+        sin_elev = np.sin(elev_rad)
+        opacity  = np.where(
+            (tau_vals > 0) & (sin_elev > 0),
+            np.exp(tau_vals / np.where(sin_elev > 0, sin_elev, 1.0)),
+            1.0
+        )
+        valid_base = (delta_nu > 0) & (spectime_vals > 0)
+        safe_tref  = np.where(reftime_vals > 0, reftime_vals, np.inf)  # inf → 1/t_ref = 0
+        with np.errstate(invalid='ignore', divide='ignore'):
+            rms_theoretical = np.where(
+                valid_base,
+                tsys_vals / np.sqrt(delta_nu) * np.sqrt(1.0 / spectime_vals + 1.0 / safe_tref) * opacity,
+                np.nan
+            ).astype(np.float32)
+
         # --- Optional baseline subtraction (before RMS computation) ---
         rms_baseline_values = None
-        if baseline_order is not None:
+        chosen_orders = None
+        if baseline_auto or baseline_order is not None:
             from .reduction.core import _reduce_baseline
             # Only subtract from science rows
             NON_SCIENCE_BL = {'TSYS', 'TAU_SIG', 'SKYCHOPDIFF'}
@@ -4204,70 +4583,118 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
             line_ch = np.where(~outside_mask)[0]
             bl_window = (int(line_ch[0]), int(line_ch[-1])) if len(line_ch) > 0 else None
             sci_idx = np.where(sci_bl_mask)[0]
-            _CHUNK = 1000
-            for _start in range(0, len(sci_idx), _CHUNK):
-                _idx = sci_idx[_start:_start + _CHUNK]
-                spectra[_idx] = _reduce_baseline(spectra[_idx], order=baseline_order, window=bl_window)
-            n_bl = int(np.sum(sci_bl_mask))
-            win_str = f" (excluding channels {bl_window[0]}–{bl_window[1]})" if bl_window else ""
-            click.echo(f"Baseline order {baseline_order} applied to {n_bl} science spectra{win_str}")
-            # Write back so the output table contains the baselined spectra
-            data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
 
-            # Compute per-spectrum RMS outside the line window (same as reduce_spectra)
-            rms_baseline_values = np.full(len(spectra), np.nan, dtype=np.float32)
+            # Channels used to measure the post-baseline residual RMS (line-free).
+            bl_outside = np.ones(spectra.shape[1], dtype=bool)
             if bl_window is not None:
-                bl_outside = np.ones(spectra.shape[1], dtype=bool)
                 bl_outside[bl_window[0]:bl_window[1] + 1] = False
+
+            rms_baseline_values = np.full(len(spectra), np.nan, dtype=np.float32)
+
+            if baseline_auto:
+                # --- Per-spectrum order selection (radiometer stopping rule) ---
+                # Fit every science row at orders 0..CAP once, keep each order's
+                # residual line-free RMS, then pick the LOWEST order whose residual
+                # RMS has dropped to ~the theoretical radiometer RMS (tol×). Picking
+                # the lowest such order — rather than the minimum-RMS order — avoids
+                # the overfitting trap (residual RMS falls monotonically with order).
+                BL_CAP = 3
+                BL_TOL = 1.15          # accept an order once residual RMS <= tol × theoretical
+                BL_MIN_GAIN = 0.02     # fallback (no theoretical RMS): stop when relative RMS gain < 2%
+
+                sci_spectra = spectra[sci_idx]
+                n_sci = len(sci_idx)
+                order_stack = []                                   # order_stack[k] = baselined sci spectra at order k
+                resid_rms = np.full((BL_CAP + 1, n_sci), np.nan)   # residual line-free RMS per (order, sci row)
+                for k in range(BL_CAP + 1):
+                    bl_k = _reduce_baseline(sci_spectra, order=k, window=bl_window)
+                    order_stack.append(bl_k)
+                    ch = bl_k[:, bl_outside]
+                    nv = np.sum(~np.isnan(ch), axis=1)
+                    with np.errstate(invalid='ignore'):
+                        resid_rms[k] = np.where(nv >= 2, np.nanstd(ch, axis=1), np.nan)
+
+                rt_sci = rms_theoretical[sci_idx].astype(np.float64)
+                valid_rt = np.isfinite(rt_sci) & (rt_sci > 0)
+                # Radiometer rule (vectorised): first order at/under tol × theoretical.
+                under = np.isfinite(resid_rms) & (resid_rms <= (BL_TOL * rt_sci)[None, :])
+                any_under = under.any(axis=0)
+                first_under = under.argmax(axis=0)                 # first True order, else 0
+                pick = np.where(valid_rt & any_under, first_under, BL_CAP).astype(np.int16)
+                # Fallback for rows lacking a valid theoretical RMS: diminishing-returns rule.
+                for j in np.where(~valid_rt)[0]:
+                    rr = resid_rms[:, j]
+                    p = BL_CAP
+                    for k in range(1, BL_CAP + 1):
+                        if not (np.isfinite(rr[k - 1]) and rr[k - 1] > 0 and np.isfinite(rr[k])):
+                            p = k - 1
+                            break
+                        if (rr[k - 1] - rr[k]) / rr[k - 1] < BL_MIN_GAIN:
+                            p = k - 1
+                            break
+                    pick[j] = p
+
+                # Apply the chosen order per row and record it.
+                for k in range(BL_CAP + 1):
+                    sel = np.where(pick == k)[0]
+                    if sel.size:
+                        spectra[sci_idx[sel]] = order_stack[k][sel]
+                chosen_orders = np.full(len(spectra), -1, dtype=np.int16)   # -1 = non-science row
+                chosen_orders[sci_idx] = pick
+                rms_baseline_values[sci_idx] = resid_rms[pick, np.arange(n_sci)].astype(np.float32)
+                data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
+
+                win_str = f" (excluding channels {bl_window[0]}–{bl_window[1]})" if bl_window else ""
+                click.echo(f"Baseline AUTO (cap {BL_CAP}, stop at {BL_TOL}×theoretical RMS) "
+                           f"applied to {n_sci} science spectra{win_str}")
+
+                # Per-flight histogram of the selected orders (homogeneity diagnostic).
+                gcounts = [int(np.sum(pick == k)) for k in range(BL_CAP + 1)]
+                click.echo("  Selected order — overall: " + "  ".join(
+                    f"ord{k}: {gcounts[k]} ({100.0 * gcounts[k] / max(n_sci, 1):.1f}%)"
+                    for k in range(BL_CAP + 1)))
+                if 'MISSION_ID' in data.dtype.names:
+                    mid_sci = np.array([
+                        s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                        for s in data['MISSION_ID'][sci_idx]
+                    ])
+                    click.echo("  Selected order per flight:")
+                    click.echo("    {:<14}".format("MISSION_ID")
+                               + "".join(f"  ord{k}".rjust(7) for k in range(BL_CAP + 1))
+                               + "   median")
+                    for fl in sorted(set(mid_sci)):
+                        oc = pick[mid_sci == fl]
+                        counts = [int(np.sum(oc == k)) for k in range(BL_CAP + 1)]
+                        med = int(np.median(oc)) if oc.size else 0
+                        click.echo("    {:<14}".format(fl)
+                                   + "".join(f"{c:7d}" for c in counts)
+                                   + f"   {med:4d}")
             else:
-                bl_outside = np.ones(spectra.shape[1], dtype=bool)
-            for _i in sci_idx:
-                _ch = spectra[_i][bl_outside]
-                _nv = int(np.sum(~np.isnan(_ch)))
-                if _nv >= 2:
-                    rms_baseline_values[_i] = np.nanstd(_ch.astype(np.float64))
+                # --- Fixed order (existing behaviour) ---
+                _CHUNK = 1000
+                for _start in range(0, len(sci_idx), _CHUNK):
+                    _idx = sci_idx[_start:_start + _CHUNK]
+                    spectra[_idx] = _reduce_baseline(spectra[_idx], order=baseline_order, window=bl_window)
+                n_bl = int(np.sum(sci_bl_mask))
+                win_str = f" (excluding channels {bl_window[0]}–{bl_window[1]})" if bl_window else ""
+                click.echo(f"Baseline order {baseline_order} applied to {n_bl} science spectra{win_str}")
+                # Write back so the output table contains the baselined spectra
+                data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
+                for _i in sci_idx:
+                    _ch = spectra[_i][bl_outside]
+                    _nv = int(np.sum(~np.isnan(_ch)))
+                    if _nv >= 2:
+                        rms_baseline_values[_i] = np.nanstd(_ch.astype(np.float64))
 
-        tsys_vals     = np.array(data['TSYS'],      dtype=np.float64)   # K
-        deltav_vals   = np.array(data['DELTAV'],    dtype=np.float64)   # m/s (actual channel width after decimation)
-        restfreq_vals = np.array(data['RESTFREQ'],  dtype=np.float64)   # Hz
-        spectime_vals = np.array(data['SPECTIME'],  dtype=np.float64)   # s, on-source
-        reftime_vals  = np.array(data['REFTIME'],   dtype=np.float64)   # s, off-source
-        tau_vals      = np.array(data['TAU-ATM'],   dtype=np.float64)   # opacity
-        elev_vals     = np.array(data['ELEVATIO'],  dtype=np.float64)   # degrees
-
-        # --- Compute measured and theoretical RMS (fully vectorised) ---
-
-        # Measured RMS: nanstd over outside-window channels for each spectrum
+        # --- Measured RMS (fully vectorised) on the (possibly baselined) spectra ---
+        # Theoretical (radiometer) RMS was already computed up-front, before the
+        # baseline block, so --baseline auto could use it as its stopping target.
         outside_spectra = spectra[:, outside_mask]          # (n_spectra, n_outside)
         n_valid_per = np.sum(~np.isnan(outside_spectra), axis=1)
         with np.errstate(invalid='ignore'):
             rms_measured = np.where(
                 n_valid_per >= 2,
                 np.nanstd(outside_spectra, axis=1),
-                np.nan
-            ).astype(np.float32)
-
-        # Theoretical radiometer RMS:
-        #   σ = T_sys / sqrt(Δν_Hz) * sqrt(1/t_sig + 1/t_ref) * exp(tau/sin(elev))
-        # Δν is computed from DELTAV (actual channel width after any decimation) and RESTFREQ.
-        # FREQRES reflects the original pre-decimation channel width and must not be used here.
-        # Opacity correction skipped when TAU-ATM <= 0 (unphysical values).
-        delta_nu = np.abs(deltav_vals) / C_MS * restfreq_vals          # Hz, shape (n_spectra,)
-        elev_rad = elev_vals * (np.pi / 180.0)
-        sin_elev = np.sin(elev_rad)
-        opacity  = np.where(
-            (tau_vals > 0) & (sin_elev > 0),
-            np.exp(tau_vals / np.where(sin_elev > 0, sin_elev, 1.0)),
-            1.0
-        )
-
-        valid_base = (delta_nu > 0) & (spectime_vals > 0)
-        safe_tref  = np.where(reftime_vals > 0, reftime_vals, np.inf)  # inf → 1/t_ref = 0
-
-        with np.errstate(invalid='ignore', divide='ignore'):
-            rms_theoretical = np.where(
-                valid_base,
-                tsys_vals / np.sqrt(delta_nu) * np.sqrt(1.0 / spectime_vals + 1.0 / safe_tref) * opacity,
                 np.nan
             ).astype(np.float32)
 
@@ -4362,17 +4789,20 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                 data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
 
         # --- Restrict summary to science rows only ---
-        # Science rows are those whose OBJECT matches object_filter.
-        # If object_filter is not set, fall back to excluding known calibration
-        # row types (TSYS, TAU_SIG, SKYCHOPDIFF) so calibration spectra do not
-        # skew the statistics.
+        # Science rows are those whose OBJECT *contains* object_filter (substring
+        # match, consistent with the rest of the codebase, e.g. _print_object_info).
+        # This lets a single value like "M51" cover both M51CENTER and M51EDGE for
+        # whole-map runs, while a more specific value like "M51CENTER" still
+        # matches only the center rows. If object_filter is not set, fall back to
+        # excluding known calibration row types (TSYS, TAU_SIG, SKYCHOPDIFF) so
+        # calibration spectra do not skew the statistics.
         CAL_TYPES = {'TSYS', 'TAU_SIG', 'SKYCHOPDIFF'}
         objects_col_all = np.array([
             s.decode().strip() if isinstance(s, bytes) else str(s).strip()
             for s in data['OBJECT']
         ])
         if object_filter:
-            is_science_all = objects_col_all == object_filter
+            is_science_all = np.array([object_filter in o for o in objects_col_all], dtype=bool)
         else:
             is_science_all = np.array([o not in CAL_TYPES for o in objects_col_all])
         sci_rms    = rms_measured[is_science_all]
@@ -4427,13 +4857,55 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         table['RMS_THEORETICAL'] = rms_theoretical
         table['RMSRATIOB']       = rms_ratio    # ratio of measured RMS to theoretical radiometer RMS
 
-        if baseline_order is not None:
+        if baseline_auto or baseline_order is not None:
             col_name = 'RMS_BASELINE'
             while col_name in table.colnames:
                 suffix = int(col_name.split('_')[-1]) + 1 if col_name != 'RMS_BASELINE' else 2
                 col_name = f'RMS_BASELINE_{suffix}'
             table[col_name] = rms_baseline_values
             click.echo(f"  Written {col_name}: per-spectrum RMS outside line window after baseline subtraction")
+
+            if baseline_auto and chosen_orders is not None:
+                bo_name = 'BLORDER'
+                _bi = 2
+                while bo_name in table.colnames:
+                    bo_name = f'BLORDER_{_bi}'
+                    _bi += 1
+                table[bo_name] = chosen_orders
+                click.echo(f"  Written {bo_name}: baseline order chosen per spectrum by --baseline auto "
+                           f"(-1 = non-science row)")
+
+        # --- Associate each science spectrum with its TSYS / TAU_SIG calibration row ---
+        # Build TSYS_INDEX / TAU_SIG_INDEX here so every downstream stage — PCA or
+        # not — inherits the channel-based tau/T_sys association without needing
+        # prepare_for_pca (which the no-PCA pipelines skip). The values are absolute
+        # row positions in THIS output file's row order; filter_fits remaps them
+        # when it drops rows, and combine_fits shifts them by the concat offset, so
+        # they stay valid all the way to create_datacube. Built only when TSYS/
+        # TAU_SIG rows are actually present (they must be, to point at) — if absent,
+        # any pre-existing columns are left untouched rather than clobbered with -1.
+        has_cal_rows = bool(np.isin(objects_col_all, ['TSYS', 'TAU_SIG']).any())
+        if has_cal_rows and object_filter:
+            try:
+                from .pca_analysis.prepare_for_pca import build_tau_tsys_indices
+                tsys_index, tau_sig_index = build_tau_tsys_indices(data, object_filter)
+                table['TSYS_INDEX']    = np.asarray(tsys_index,    dtype=np.int32)
+                table['TAU_SIG_INDEX'] = np.asarray(tau_sig_index, dtype=np.int32)
+                click.echo(
+                    f"  TSYS_INDEX / TAU_SIG_INDEX: linked "
+                    f"{int(np.sum(tsys_index >= 0))} / {int(np.sum(tau_sig_index >= 0))} "
+                    f"of {n_science} science rows to calibration spectra")
+            except Exception as _e:
+                click.echo(click.style(
+                    f"  Warning: could not build TSYS_INDEX/TAU_SIG_INDEX ({_e}) — "
+                    f"channel-based weighting downstream will fall back to uniform",
+                    fg='yellow'))
+        elif not has_cal_rows:
+            click.echo("  TSYS_INDEX / TAU_SIG_INDEX: skipped "
+                       "(no TSYS/TAU_SIG calibration rows in this dataset)")
+        else:  # cal rows present but no object filter to identify science rows
+            click.echo("  TSYS_INDEX / TAU_SIG_INDEX: skipped "
+                       "([parameters].object not set — cannot identify science rows)")
 
         # Preserve header and write output
         primary = hdul[0].copy()
@@ -4446,10 +4918,17 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                 except (ValueError, KeyError):
                     pass
 
-        # Write median std of science spectra outside the line window as header keyword
-        median_std = float(np.nanmedian(sci_rms[np.isfinite(sci_rms)]))
-        new_hdu.header['STD'] = (median_std, 'Median RMS outside line window [K]')
-        click.echo(f"\n  STD header keyword: {median_std:.6f} K")
+        # Write median std of science spectra outside the line window as header
+        # keyword. Guard against an empty/all-NaN science set (e.g. a flight with
+        # no rows matching object_filter): nanmedian of an empty array is NaN, and
+        # FITS headers reject NaN — so skip the keyword rather than crash the run.
+        finite_sci = sci_rms[np.isfinite(sci_rms)]
+        if finite_sci.size > 0:
+            median_std = float(np.median(finite_sci))
+            new_hdu.header['STD'] = (median_std, 'Median RMS outside line window [K]')
+            click.echo(f"\n  STD header keyword: {median_std:.6f} K")
+        else:
+            click.echo("\n  STD header keyword: skipped (no science spectra with valid RMS)")
 
         import os
         os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
@@ -4532,6 +5011,13 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
 @click.option('--mask-radius', type=float, default=None,
               help='Radius in arcminutes of the circular display mask. '
                    'Pixels outside this circle are set to NaN in the plot.')
+@click.option('--trim-edges', 'trim_edges', default=None,
+              help='Peel a border off the irregular coverage footprint, following its '
+                   'shape (erosion — NOT a rectangular crop), to shave the ragged '
+                   'low-coverage edge while keeping the map outline. A bare number or "N%" '
+                   'peels a border of N% of the smaller map axis; a unit suffix peels a '
+                   'fixed angular border: "30arcsec"/"30\\"" or "0.5arcmin"/"0.5\'". '
+                   'Interior holes are preserved (only the outer edge is trimmed).')
 @click.option('--mode', default='moment0', show_default=True,
               type=click.Choice(['moment0', 'peak-intensity'], case_sensitive=False),
               help='Collapse mode. moment0: integrated intensity (K km/s). '
@@ -4544,6 +5030,38 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                    '(window = 2N+1 channels), producing a K km/s map. '
                    'If given without a number, N defaults to 5. '
                    'Overrides --mode.')
+@click.option('--peak-smooth', 'peak_smooth_channels', type=float, default=None, metavar='SIGMA',
+              help='For peak-intensity / --peak-range-int: locate each pixel\'s peak channel on a '
+                   'spectrum Gaussian-smoothed by SIGMA channels along velocity, then read the RAW '
+                   '(unsmoothed) cube there. Prevents a narrow residual spike — e.g. an un-refilled '
+                   'telluric wing that survived --refill-telluric-noise — from being picked as the '
+                   'peak, since smoothing discriminates by line width: the broad real line survives, '
+                   'a 1–2 channel spike is crushed. Reported intensities stay in true K; only the '
+                   'peak LOCATION uses the smoothed cube. Try SIGMA ~1–2.')
+@click.option('--shuffle', is_flag=True, default=False,
+              help='Velocity-field shuffle before moment-0: build a smooth per-pixel line-velocity '
+                   'field from the cube (moment-1 on high-S/N pixels, smoothed+filled), shift every '
+                   'spectrum so its line lands at a common reference velocity, then integrate a NARROW '
+                   'window around it. Removes galaxy rotation from the velocity axis so a tight window '
+                   'catches the line everywhere → far less integrated noise → faint extended/spiral '
+                   'structure survives. Requires --velocity-range (the line window used to measure the '
+                   'field). Writes the velocity field to <output>_vfield.fits for inspection. '
+                   'Intended with --mode moment0.')
+@click.option('--shuffle-snr', type=float, default=5.0, show_default=True, metavar='SNR',
+              help='S/N floor for pixels contributing to the shuffle velocity field. Only pixels above '
+                   'this get a measured line centroid; the rest inherit a smoothed value from neighbours.')
+@click.option('--shuffle-field-smooth', type=float, default=6.0, show_default=True, metavar='PIX',
+              help='Gaussian sigma (pixels) for smoothing/gap-filling the shuffle velocity field, so '
+                   'faint pixels get a robust shift from their bright neighbours.')
+@click.option('--shuffle-window', 'shuffle_window_kms', type=float, default=20.0, show_default=True,
+              metavar='KMS',
+              help='Half-width (km/s) of the narrow integration window applied AROUND the reference '
+                   'velocity after shuffling. Slightly wider than the line to tolerate field error.')
+@click.option('--shuffle-ref-velocity', type=float, default=None, metavar='KMS',
+              help='Common velocity (km/s) lines are aligned to. Default: median of the measured field. '
+                   'Pin to the systemic velocity for run-to-run comparability.')
+@click.option('--shuffle-field-output', type=click.Path(), default=None,
+              help='Explicit path for the shuffle velocity-field FITS (default: <output>_vfield.fits).')
 @click.option('--suppress-negative', is_flag=True, default=False,
               help='Set vmin=0 in the colour scale, clipping negative (noise) values to the '
                    'bottom. Gives physically correct scaling for moment-0 maps where signal '
@@ -4557,10 +5075,18 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
 @click.option('--contour', is_flag=True, default=False,
               help='Display the map as contour lines instead of a filled image.')
 @click.option('--stretch', default='linear', show_default=True,
-              type=click.Choice(['linear', 'sqrt', 'asinh', 'log'], case_sensitive=False),
+              type=click.Choice(['linear', 'sqrt', 'power', 'asinh', 'symlog', 'log', 'histeq'],
+                                 case_sensitive=False),
               help='Colour stretch for the intensity map. '
-                   'sqrt/asinh compress bright regions and reveal faint detail. '
-                   'log is the most aggressive compression.')
+                   'sqrt/asinh/symlog compress bright regions and reveal faint detail '
+                   '(asinh & symlog stay linear near zero; symlog also compresses negatives). '
+                   'power is a tunable power law (see --gamma). log is the most aggressive '
+                   'compression. histeq (histogram equalisation) maximises contrast but gives '
+                   'a non-quantitative colourbar.')
+@click.option('--gamma', type=float, default=1.0, show_default=True,
+              help='Exponent for --stretch power: displayed ∝ value**gamma after vmin/vmax '
+                   'scaling. gamma<1 lifts faint detail, gamma>1 emphasises bright peaks, '
+                   'gamma=1 is linear, gamma=0.5 equals sqrt. Ignored unless --stretch power.')
 @click.option('--output-noise-map', 'noise_map_output', type=click.Path(), default=None,
               help='Save the per-pixel noise map (RMS from line-free channels) as a FITS file. '
                    'Requires --velocity-range to identify line-free channels.')
@@ -4574,16 +5100,51 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
 @click.option('--snr-threshold', type=float, default=None, metavar='N',
               help='Mask pixels whose integrated intensity SNR is below N. '
                    'Requires --velocity-range to compute the noise map from line-free channels.')
+@click.option('--drop-rms', type=float, default=None, metavar='LIMIT',
+              help='Drop (blank) pixels whose per-pixel spectral RMS exceeds LIMIT (K). '
+                   'The RMS is measured on the already-gridded/convolved cube over the '
+                   'velocity window given by --drop-window (default: the line-free channels '
+                   'outside --velocity-range). Use it to remove noisy edge/outlier spaxels '
+                   'that a fixed SNR cut leaves in. Example: --drop-rms 1.5 --drop-window 0 400.')
+@click.option('--drop-window', type=(float, float), default=None, nargs=2,
+              metavar='VMIN VMAX',
+              help='Velocity window (km/s) over which --drop-rms measures the per-pixel RMS, '
+                   'e.g. --drop-window 0 400 to use a line-free stretch. If omitted, the '
+                   'channels outside --velocity-range are used. Ignored without --drop-rms.')
+@click.option('--align-peaks', is_flag=True, default=False,
+              help='Visual aid: before averaging spectra into the zoom/region/full-map '
+                   'spectrum panel(s), shift each one so its own peak (sub-channel, found '
+                   'within --velocity-range if given) lands on the median peak velocity of '
+                   'the stack. Use this to see line shape cleanly when the true centroid '
+                   'velocity genuinely differs across spaxels (e.g. a rotation curve) — '
+                   'otherwise that spread alone broadens a plain mean. Does not change the '
+                   'moment-0 map itself, only these spectrum panels.')
+@click.option('--polygon', is_flag=True, default=False,
+              help='Draw a polygon on the map with the MOUSE to restrict the rendered '
+                   'area: middle-click adds each vertex, left-click closes it (>=3 '
+                   'vertices), right-click undoes the last one. Everything outside is '
+                   'blanked. The chosen vertices are printed so the exact selection can '
+                   'be reproduced later with --polygon-coords.')
+@click.option('--polygon-coords', 'polygon_coords', default=None,
+              metavar='"X1,Y1 X2,Y2 ..."',
+              help='Reproduce a polygon selection headlessly from explicit pixel '
+                   'vertices (space-separated "x,y" pairs), e.g. '
+                   '--polygon-coords "120,110 180,115 170,175". No mouse window; '
+                   'takes precedence over --polygon.')
 def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
                       zoom_x, zoom_y, zoom_ra, zoom_dec,
                       region_x, region_y, region_ra, region_dec,
                       region_radius_arcmin, use_wcs,
                       plot, fits_output, no_show, colormap,
-                      coverage_threshold, mask_ra, mask_dec, mask_radius,
-                      mode, peak_range_channels, suppress_negative, suppress_high,
-                      hex_plot, contour, stretch,
+                      coverage_threshold, mask_ra, mask_dec, mask_radius, trim_edges,
+                      mode, peak_range_channels, peak_smooth_channels,
+                      shuffle, shuffle_snr, shuffle_field_smooth, shuffle_window_kms,
+                      shuffle_ref_velocity, shuffle_field_output,
+                      suppress_negative, suppress_high,
+                      hex_plot, contour, stretch, gamma,
                       noise_map_output, smooth_sigma, percentile_clip,
-                      snr_threshold):
+                      snr_threshold, drop_rms, drop_window,
+                      align_peaks, polygon, polygon_coords):
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
 
@@ -4629,6 +5190,28 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
         if peak_range_channels is not None:
             mode = 'peak-range-int'
 
+        # --polygon        → interactive mouse selection.
+        # --polygon-coords → explicit vertices (headless), takes precedence.
+        select_polygon = bool(polygon)
+        polygon_vertices = None
+        if polygon_coords:
+            select_polygon = False
+            try:
+                polygon_vertices = [
+                    (float(p.split(',')[0]), float(p.split(',')[1]))
+                    for p in polygon_coords.split()
+                ]
+            except (ValueError, IndexError):
+                click.echo(click.style(
+                    "Error: --polygon-coords must be space-separated \"x,y\" pairs, "
+                    "e.g. \"120,110 180,115 170,175\" — or use --polygon to draw it "
+                    "with the mouse.", fg='red'), err=True)
+                sys.exit(1)
+            if len(polygon_vertices) < 3:
+                click.echo(click.style(
+                    "Error: --polygon-coords needs at least 3 vertices", fg='red'), err=True)
+                sys.exit(1)
+
         click.echo(f"Collapsing cube: {cube_fits}")
         if velocity_range:
             click.echo(f"  Velocity range: {velocity_range[0]:.1f} – {velocity_range[1]:.1f} km/s")
@@ -4647,6 +5230,8 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             else:
                 ctr = "map centre"
             click.echo(f"  Region: r = {region_radius_arcmin:.1f}′ at {ctr}")
+        if align_peaks:
+            click.echo("  Align peaks: spectrum panels will be peak-aligned before averaging")
 
         collapsed, header2d, fig = collapse_cube(
             cube_fits=cube_fits,
@@ -4670,16 +5255,30 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             mask_ra=mask_ra_deg,
             mask_dec=mask_dec_deg,
             mask_radius_arcmin=mask_radius,
+            trim_edges=trim_edges,
             mode=mode,
             peak_range_channels=peak_range_channels if peak_range_channels is not None else 5,
+            peak_smooth_channels=peak_smooth_channels,
+            shuffle=shuffle,
+            shuffle_snr=shuffle_snr,
+            shuffle_field_smooth=shuffle_field_smooth,
+            shuffle_window_kms=shuffle_window_kms,
+            shuffle_ref_velocity=shuffle_ref_velocity,
+            shuffle_field_output=shuffle_field_output,
             suppress_negative=suppress_negative,
             suppress_high=suppress_high,
             hex_plot=hex_plot,
             contour=contour,
             stretch=stretch,
+            gamma=gamma,
             smooth_sigma=smooth_sigma,
             percentile_clip=percentile_clip,
             snr_threshold=snr_threshold,
+            drop_rms=drop_rms,
+            drop_window=drop_window,
+            align_peaks=align_peaks,
+            select_polygon=select_polygon,
+            polygon=polygon_vertices,
         )
 
         click.echo(f"\n✓ Collapsed map: {collapsed.shape[1]} × {collapsed.shape[0]} pixels")
@@ -5017,6 +5616,7 @@ def print_pca_parameters(fits_path, config):
     click.echo(f"\nFound {len(unique_vals)} unique PCAPARAM value(s) {n_label}:\n")
 
     param_labels = {
+        'nc':    'number of components',
         'vc':    'variance cutoff',
         'nr':    'noise ratio cutoff',
         'sk':    'smoothing kernel size',
