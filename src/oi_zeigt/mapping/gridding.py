@@ -1793,8 +1793,14 @@ def create_spectral_datacube(hdul: fits.HDUList,
             np.array(decs[_valid], dtype=np.float64),
             np.ones(int(_valid.sum()), dtype=np.float64),
         )
-        coverage_map_2d = _cov_gridder.get_datacube().squeeze().astype(np.float32)
-        print(f"  Coverage map: peak={coverage_map_2d.max():.3f}, "
+        # Use the *summed* kernel weights (Σ K), NOT get_datacube(). Gridding a
+        # field of ones and reading get_datacube() returns the kernel-weighted
+        # AVERAGE of ones = 1.0 in every covered pixel, which carries no coverage
+        # gradient (so --coverage-threshold could never fire). get_weights()
+        # returns Σ K per pixel — the true sample/coverage density that tapers
+        # toward the map edges.
+        coverage_map_2d = _cov_gridder.get_weights().squeeze().astype(np.float32)
+        print(f"  Coverage map (Σ kernel weights): peak={coverage_map_2d.max():.3f}, "
               f"pixels with coverage>0: {(coverage_map_2d > 0).sum()}")
 
     # Compute 2D weight map: grid spectrum_weights with the same kernel so each
@@ -1816,10 +1822,14 @@ def create_spectral_datacube(hdul: fits.HDUList,
             np.array(decs[_valid_w], dtype=np.float64),
             np.array(spectrum_weights[_valid_w], dtype=np.float64),
         )
-        weight_map_2d = _wm_gridder.get_datacube().squeeze().astype(np.float32)
+        # get_unweighted_datacube() = Σ K·wᵢ (the actual denominator of the
+        # science weighted-average), NOT get_datacube() which would return the
+        # normalized MEAN weight Σ K·wᵢ / Σ K (≈1.0 everywhere when the input
+        # weights are uniform, hiding all spatial structure).
+        weight_map_2d = _wm_gridder.get_unweighted_datacube().squeeze().astype(np.float32)
         if coverage_map_2d is not None:
             weight_map_2d[coverage_map_2d <= 0] = np.nan
-        print(f"  Weight map ({weight_column}): peak={np.nanmax(weight_map_2d):.4f}, "
+        print(f"  Weight map ({weight_column}, Σ kernel·weight): peak={np.nanmax(weight_map_2d):.4f}, "
               f"pixels with weight>0: {np.isfinite(weight_map_2d).sum()}")
 
     # Create WCS header for 3D cube (spectral, dec, ra)
@@ -2266,7 +2276,7 @@ def collapse_cube(
     plot_output: Optional[str] = None,
     overwrite: bool = True,
     colormap: str = 'rainbow',
-    coverage_threshold: float = 0.3,
+    coverage_threshold: float = 0.0,
     mask_ra: Optional[float] = None,
     mask_dec: Optional[float] = None,
     mask_radius_arcmin: Optional[float] = None,
@@ -2514,6 +2524,10 @@ def collapse_cube(
     # 4b. Build display mask (NaN = not shown in plot; FITS always unmasked)
     # ------------------------------------------------------------------
     display_mask = np.zeros((ny, nx), dtype=bool)  # True = masked out
+    # Pixels rejected by --snr-threshold / --drop-rms are shown as the zero
+    # colour rather than blanked (NaN); tracked here so the interactive
+    # velocity-recompute path (which re-NaNs display_mask) can re-zero them.
+    zero_display_mask = np.zeros((ny, nx), dtype=bool)
 
     # --- Coverage-based edge masking ---
     # Try to load the COVERAGE extension saved by create_spectral_datacube.
@@ -2529,10 +2543,12 @@ def collapse_cube(
         if coverage_map is not None:
             peak_cov = coverage_map.max()
             if peak_cov > 0:
+                # Simply ignore (blank to no-data) pixels below the coverage
+                # threshold — no zero-colour fill.
                 edge_mask = coverage_map < coverage_threshold * peak_cov
                 display_mask |= edge_mask
-                print(f"  Coverage masking: {edge_mask.sum()} pixels below "
-                      f"{coverage_threshold*100:.0f}% of peak coverage masked")
+                print(f"  Coverage masking: {int(edge_mask.sum())} pixels below "
+                      f"{coverage_threshold*100:.0f}% of peak coverage blanked")
         else:
             print("  Note: no COVERAGE extension found in cube — "
                   "re-run create_datacube to enable coverage masking")
@@ -2688,8 +2704,13 @@ def collapse_cube(
             snr_map = collapsed / (noise_map * np.sqrt(n_signal_chan) * deltav_kms)
         snr_mask = np.isfinite(snr_map) & (snr_map < snr_threshold)
         display_mask |= snr_mask
-        collapsed_display[snr_mask] = np.nan
-        print(f"  SNR threshold: {snr_threshold:.1f} — masked {snr_mask.sum()} additional pixels")
+        # Rejected pixels are shown as the zero colour (like suppress_negative),
+        # NOT blanked to no-data (NaN), while still kept in display_mask so they
+        # stay out of the mean-spectrum panel.
+        zero_display_mask |= snr_mask
+        collapsed_display[snr_mask] = 0.0
+        print(f"  SNR threshold: {snr_threshold:.1f} — masked {snr_mask.sum()} "
+              f"additional pixels (shown as 0)")
     elif snr_threshold is not None and noise_map is None:
         print("  Warning: --snr-threshold ignored — noise map unavailable "
               "(need --velocity-range to identify line-free channels)")
@@ -2720,10 +2741,14 @@ def collapse_cube(
             # Only drop pixels not already masked, with a finite RMS above LIMIT.
             drop_mask = np.isfinite(rms_map) & (rms_map > drop_rms) & ~display_mask
             display_mask |= drop_mask
-            collapsed_display[drop_mask] = np.nan
+            # Shown as the zero colour (like --snr-threshold / suppress_negative),
+            # NOT blanked to no-data (NaN); still kept in display_mask so they
+            # stay out of the mean-spectrum panel.
+            zero_display_mask |= drop_mask
+            collapsed_display[drop_mask] = 0.0
             print(f"  Drop-RMS: RMS over {drop_win_desc} "
                   f"({int(drop_chan_mask.sum())} channels) > {drop_rms:g} K "
-                  f"-> masked {int(drop_mask.sum())} additional pixels")
+                  f"-> masked {int(drop_mask.sum())} additional pixels (shown as 0)")
 
     # ------------------------------------------------------------------
     # 4c3. Suppress negative values: set to 0 rather than NaN so they
@@ -3316,14 +3341,41 @@ def collapse_cube(
     fig.canvas.mpl_connect('button_press_event', _on_colorbar_click)
     fig.canvas.mpl_connect('key_press_event', _on_key_press)
 
+    def _on_spec_erase(event):
+        # 'b' with the cursor over a spectrum panel erases that panel and drops
+        # its cached y-limits, so the next spectrum drawn there rescales from
+        # scratch (the y-limits are otherwise fixed to the first spectrum shown).
+        if event.key != 'b':
+            return
+        ax = event.inaxes
+        if ax not in (ax_spec_zoom, ax_spec_reg):
+            return
+        _spec_ylims.pop(ax, None)
+        ax.cla()
+        ax.set_axis_off()
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('key_press_event', _on_spec_erase)
+
     # ------------------------------------------------------------------
-    # Interactive: click on the zoom map to show the pixel spectrum
-    # in the bottom-right panel and mark the pixel with a circle.
+    # Interactive handlers (always enabled): left-click any map → pixel
+    # spectrum; right-click the full map twice → define a zoom region; click
+    # a spectrum panel twice → set the velocity range. When no --zoom was
+    # given the right-click *creates* the zoom panel on the fly (the same
+    # code path that redefines an existing one), so `_zb` starts empty and
+    # `ax_zoom` starts hidden until the first right-click pair.
     # ------------------------------------------------------------------
-    if has_zoom:
+    if True:
         _click_circle = [None]   # mutable slot for the current marker patch
-        # Shared zoom bounds — updated when the user redefines the zoom region.
-        _zb = {'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1}
+        # Shared zoom bounds — updated when the user (re)defines the zoom region.
+        # Empty (x0==x1) until a zoom exists; _zoom_active() gates zoom-only redraws.
+        if has_zoom:
+            _zb = {'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1}
+        else:
+            _zb = {'x0': 0, 'y0': 0, 'x1': 0, 'y1': 0}
+
+        def _zoom_active():
+            return _zb['x1'] > _zb['x0'] and _zb['y1'] > _zb['y0']
         # Last pixel selected by clicking on a map panel.
         _selected_pixel = {'px': None, 'py': None}
         # Current velocity range — updated by clicking the spectrum panels.
@@ -3511,6 +3563,7 @@ def collapse_cube(
                     else:
                         ax_zoom.cla()
                     ax_zoom.set_position(_ax_zoom_pos)
+                    ax_zoom.set_visible(True)   # may have started hidden (no --zoom)
                     _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
                                             f"Zoom ({new_x0}:{new_x1}, {new_y0}:{new_y1})",
                                             wcs_proj=wcs2d_zoom)
@@ -3548,6 +3601,7 @@ def collapse_cube(
                 new_col = (np.nansum(cube[new_chan_mask], axis=0) * new_deltav).astype(np.float32)
             new_col_disp = new_col.copy()
             new_col_disp[display_mask] = np.nan
+            new_col_disp[zero_display_mask] = 0.0
             if suppress_negative:
                 new_col_disp[np.isfinite(new_col_disp) & (new_col_disp < 0)] = 0.0
             if suppress_high is not None:
@@ -3570,11 +3624,12 @@ def collapse_cube(
             if crop_to_selection:
                 _crop_axes_to_data(ax_full)
             pix_tf_full = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
-            _zoom_rect[0] = ax_full.add_patch(Rectangle(
-                (_zb['x0'] - 0.5, _zb['y0'] - 0.5),
-                _zb['x1'] - _zb['x0'], _zb['y1'] - _zb['y0'],
-                linewidth=1.5, edgecolor='white', facecolor='none',
-                linestyle='--', transform=pix_tf_full))
+            if _zoom_active():
+                _zoom_rect[0] = ax_full.add_patch(Rectangle(
+                    (_zb['x0'] - 0.5, _zb['y0'] - 0.5),
+                    _zb['x1'] - _zb['x0'], _zb['y1'] - _zb['y0'],
+                    linewidth=1.5, edgecolor='white', facecolor='none',
+                    linestyle='--', transform=pix_tf_full))
             _full_circle[0] = None
             if _selected_pixel['px'] is not None:
                 c = Circle((_selected_pixel['px'], _selected_pixel['py']), radius=0.5,
@@ -3583,30 +3638,38 @@ def collapse_cube(
                 ax_full.add_patch(c)
                 _full_circle[0] = c
 
-            # Redraw zoom map
-            if _cb_zoom[0] is not None:
-                _cb_zoom[0].remove()
-            new_zoomed = new_col_disp[_zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
-            ax_zoom.cla()
-            ax_zoom.set_position(_ax_zoom_pos)
-            _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
-                                    f"Zoom ({_zb['x0']}:{_zb['x1']}, {_zb['y0']}:{_zb['y1']})",
-                                    wcs_proj=wcs2d_zoom)
-            _click_circle[0] = None
-            if (_selected_pixel['px'] is not None and
-                    _zb['x0'] <= _selected_pixel['px'] < _zb['x1'] and
-                    _zb['y0'] <= _selected_pixel['py'] < _zb['y1']):
-                px_z = _selected_pixel['px'] - _zb['x0']
-                py_z = _selected_pixel['py'] - _zb['y0']
-                pix_tf_z = ax_zoom.get_transform('pixel') if use_wcs else ax_zoom.transData
-                cz = Circle((px_z, py_z), radius=0.5,
-                            linewidth=2.0, edgecolor='white', facecolor='none',
-                            transform=pix_tf_z)
-                ax_zoom.add_patch(cz)
-                _click_circle[0] = cz
+            # Redraw zoom map (only when a zoom region is currently active)
+            if _zoom_active():
+                if _cb_zoom[0] is not None:
+                    _cb_zoom[0].remove()
+                new_zoomed = new_col_disp[_zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
+                ax_zoom.cla()
+                ax_zoom.set_position(_ax_zoom_pos)
+                _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
+                                        f"Zoom ({_zb['x0']}:{_zb['x1']}, {_zb['y0']}:{_zb['y1']})",
+                                        wcs_proj=wcs2d_zoom)
+                _click_circle[0] = None
+                if (_selected_pixel['px'] is not None and
+                        _zb['x0'] <= _selected_pixel['px'] < _zb['x1'] and
+                        _zb['y0'] <= _selected_pixel['py'] < _zb['y1']):
+                    px_z = _selected_pixel['px'] - _zb['x0']
+                    py_z = _selected_pixel['py'] - _zb['y0']
+                    pix_tf_z = ax_zoom.get_transform('pixel') if use_wcs else ax_zoom.transData
+                    cz = Circle((px_z, py_z), radius=0.5,
+                                linewidth=2.0, edgecolor='white', facecolor='none',
+                                transform=pix_tf_z)
+                    ax_zoom.add_patch(cz)
+                    _click_circle[0] = cz
 
-            # Redraw zoom mean spectrum with updated velocity range
-            _zb_slice = cube[:, _zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
+            # Redraw mean spectrum panel with updated velocity range.
+            # With a zoom active this is the zoom-region mean; otherwise it falls
+            # back to the whole-map mean (matching the no-zoom initial layout).
+            if _zoom_active():
+                _zb_slice = cube[:, _zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
+                _zb_spec_title = 'Mean spectrum — zoom'
+            else:
+                _zb_slice = cube
+                _zb_spec_title = 'Mean spectrum — full map'
             if align_peaks:
                 new_zoom_spec = _peak_aligned_mean_spectrum(
                     _zb_slice.reshape(_zb_slice.shape[0], -1).T,
@@ -3617,7 +3680,7 @@ def collapse_cube(
             ax_spec_zoom.plot(channels_kms, new_zoom_spec, color='steelblue', linewidth=1.0, drawstyle='steps-mid')
             ax_spec_zoom.set_xlabel('Velocity (km/s)')
             ax_spec_zoom.set_ylabel('Mean T$_A^*$ (K)')
-            ax_spec_zoom.set_title('Mean spectrum — zoom', fontsize=10)
+            ax_spec_zoom.set_title(_zb_spec_title, fontsize=10)
             ax_spec_zoom.axhline(0, color='gray', linewidth=0.5, linestyle=':')
             ax_spec_zoom.axvspan(new_v_min, new_v_max, alpha=0.15, color='steelblue',
                                  label=f'{new_v_min:.0f}–{new_v_max:.0f} km/s')
@@ -3670,11 +3733,155 @@ def collapse_cube(
             ax_spec_reg.set_axis_off()
             ax_spec_reg.text(0.5, 0.5,
                              'Left-click any map → pixel spectrum\n'
-                             'Right-click full map ×2 → redefine zoom\n\n'
-                             'Click spectrum ×2 → set velocity range',
+                             'Middle-click map or zoom → region vertex '
+                             '(left-click closes ≥3)\n'
+                             + ('Right-click full map ×2 → redefine zoom\n\n'
+                                if has_zoom else
+                                'Right-click full map ×2 → create zoom\n\n')
+                             + 'Click spectrum ×2 → set velocity range\n'
+                             "'b' → reset region",
                              ha='center', va='center',
                              transform=ax_spec_reg.transAxes,
                              fontsize=9, color='gray', style='italic')
+
+    # ------------------------------------------------------------------
+    # Interactive: draw a region polygon with the MIDDLE mouse button
+    # (like --polygon / _interactive_polygon). Enabled only when no static
+    # --polygon / --select-polygon region is already applied. Each middle
+    # click on the full map drops a vertex; a LEFT click closes the polygon
+    # (needs >=3 vertices), and only then is the mean spectrum over the
+    # enclosed (rendered) pixels shown in the bottom-right panel. Press 'b'
+    # to reset. Middle-clicking after a close starts a fresh polygon.
+    # ------------------------------------------------------------------
+    if polygon is None:
+        _poly_verts = []            # accumulated (x, y) full-cube pixel vertices
+        _poly_line = [None]         # Line2D currently drawn on ax_full
+        _poly_line_zoom = [None]    # mirror Line2D drawn on ax_zoom (when active)
+        _poly_closed = [False]      # True once the ring has been closed
+
+        def _show_poly_hint():
+            ax_spec_reg.set_visible(True)
+            ax_spec_reg.cla()
+            ax_spec_reg.set_axis_off()
+            ax_spec_reg.text(0.5, 0.5,
+                             'Middle-click the map to drop\n'
+                             'region-polygon vertices;\n'
+                             'left-click to close it (≥3).\n'
+                             'The enclosed mean spectrum\n'
+                             'is shown here.\n\n'
+                             "press 'b' to reset the region",
+                             ha='center', va='center',
+                             transform=ax_spec_reg.transAxes,
+                             fontsize=9, color='gray', style='italic')
+
+        def _draw_poly_region_spec():
+            outside = _polygon_mask(_poly_verts, ny, nx)   # True OUTSIDE polygon
+            inside = (~outside) & (~display_mask)          # rendered pixels only
+            n_in = int(inside.sum())
+            if n_in == 0:                                  # fall back to raw polygon
+                inside = ~outside
+                n_in = int(inside.sum())
+            if n_in == 0:
+                return
+            sel = cube.reshape(cube.shape[0], -1)[:, inside.ravel()]
+            if align_peaks:
+                spec = _peak_aligned_mean_spectrum(sel.T, channels_kms,
+                                                   search_range=velocity_range)
+            else:
+                spec = np.nanmean(sel, axis=1)
+            ax_spec_reg.set_visible(True)
+            ax_spec_reg.cla()
+            ax_spec_reg.set_axis_on()
+            ax_spec_reg.plot(channels_kms, spec, color='magenta', linewidth=1.0,
+                             drawstyle='steps-mid')
+            ax_spec_reg.set_xlabel('Velocity (km/s)')
+            ax_spec_reg.set_ylabel('Mean T$_A^*$ (K)')
+            ax_spec_reg.axhline(0, color='gray', linewidth=0.5, linestyle=':')
+            if velocity_range is not None:
+                ax_spec_reg.axvspan(v_min, v_max, alpha=0.15, color='magenta')
+            ax_spec_reg.set_title(f'Mean spectrum — polygon region ({n_in} px)',
+                                  fontsize=9)
+            finite = spec[np.isfinite(spec)]
+            if finite.size:
+                lo, hi = float(finite.min()), float(finite.max())
+                m = 0.05 * (hi - lo) if hi > lo else 1.0
+                ax_spec_reg.set_ylim(lo - m, hi + m)
+
+        def _redraw_poly_line():
+            for _ln in (_poly_line, _poly_line_zoom):
+                if _ln[0] is not None:
+                    try:
+                        _ln[0].remove()
+                    except Exception:
+                        pass
+                    _ln[0] = None
+            if not _poly_verts:
+                return
+            xs = [v[0] for v in _poly_verts]
+            ys = [v[1] for v in _poly_verts]
+            if _poly_closed[0] and len(_poly_verts) >= 3:   # close the ring visually
+                xs = xs + [xs[0]]
+                ys = ys + [ys[0]]
+            pix_tf = ax_full.get_transform('pixel') if use_wcs else ax_full.transData
+            _poly_line[0], = ax_full.plot(xs, ys, '-o', color='magenta', lw=1.5,
+                                          ms=5, mfc='yellow', transform=pix_tf)
+            # Mirror the polygon onto the zoom panel (coords shifted by the zoom
+            # origin) so it's visible whichever panel you're drawing on.
+            if _zoom_active():
+                xs_z = [x - _zb['x0'] for x in xs]
+                ys_z = [y - _zb['y0'] for y in ys]
+                pix_tf_z = ax_zoom.get_transform('pixel') if use_wcs else ax_zoom.transData
+                _poly_line_zoom[0], = ax_zoom.plot(xs_z, ys_z, '-o', color='magenta',
+                                                   lw=1.5, ms=5, mfc='yellow',
+                                                   transform=pix_tf_z)
+
+        def _on_poly_click(event):
+            if event.xdata is None:
+                return
+            # Vertices can be dropped on the full map OR, when a zoom is active,
+            # on the zoom panel — zoom-panel pixel coords are shifted back to
+            # full-cube coords by the zoom origin so both share one polygon.
+            if event.inaxes is ax_full:
+                px, py = float(event.xdata), float(event.ydata)
+            elif event.inaxes is ax_zoom and _zoom_active():
+                px = float(event.xdata) + _zb['x0']
+                py = float(event.ydata) + _zb['y0']
+            else:
+                return
+            # MIDDLE click: drop a vertex (open, growing polygon).
+            if event.button == 2:
+                if not (0 <= px < nx and 0 <= py < ny):
+                    return
+                if _poly_closed[0]:                 # start a fresh polygon
+                    _poly_verts.clear()
+                    _poly_closed[0] = False
+                _poly_verts.append((px, py))
+                _redraw_poly_line()
+                fig.canvas.draw_idle()
+            # LEFT click: close the polygon (needs >=3 vertices) and show spectrum.
+            elif event.button == 1 and not _poly_closed[0] and len(_poly_verts) >= 3:
+                _poly_closed[0] = True
+                _redraw_poly_line()
+                _draw_poly_region_spec()
+                fig.canvas.draw_idle()
+
+        def _on_poly_reset(event):
+            if event.key != 'b' or not _poly_verts:
+                return
+            _poly_verts.clear()
+            _poly_closed[0] = False
+            _redraw_poly_line()
+            _show_poly_hint()
+            fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('button_press_event', _on_poly_click)
+        fig.canvas.mpl_connect('key_press_event', _on_poly_reset)
+
+        # NB: the initial bottom-right hint is now drawn once by the always-on
+        # interactive block above (the comprehensive hint, when no --region was
+        # given). We only fall back to the polygon-only hint after a 'b' reset
+        # (handled in _on_poly_reset), so nothing is drawn here to avoid
+        # overwriting that comprehensive hint.
 
     if plot_output:
         fig.savefig(plot_output, dpi=150, bbox_inches='tight')
@@ -3682,3 +3889,431 @@ def collapse_cube(
 
     return collapsed, header2d, fig
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# compare_maps — collapse N cubes to maps and render them in one comparison grid
+# ══════════════════════════════════════════════════════════════════════════════
+# These reproduce the *compute* half of collapse_cube (load → shuffle → collapse →
+# coverage/trim/all-nan masks → suppress → smooth), deliberately WITHOUT the large
+# interactive/plotting half. Kept separate rather than refactored out of
+# collapse_cube so that function (1400+ lines, heavily interactive) is left
+# untouched. If the collapse maths there changes, mirror it here too.
+
+def _trim_border_px(trim_edges, pixel_scale_arcsec, nx, ny):
+    """Parse a --trim-edges string to (border_px, human_desc). Mirrors collapse_cube.
+
+    Bare number / "N%" → N% of the smaller map axis; a unit suffix
+    ("arcmin"/"am"/"'" or "arcsec"/"as"/'"') → a fixed angular border.
+    Returns (0, None) if unparseable.
+    """
+    s = str(trim_edges).strip().lower()
+    try:
+        if s.endswith('arcmin') or s.endswith('am') or s.endswith("'"):
+            val = float(s.rstrip("'").replace('arcmin', '').replace('am', ''))
+            border_px = int(round(val * 60.0 / pixel_scale_arcsec))
+            desc = f"{val:g}' ({border_px}px)"
+        elif s.endswith('arcsec') or s.endswith('as') or s.endswith('"'):
+            val = float(s.rstrip('"').replace('arcsec', '').replace('as', ''))
+            border_px = int(round(val / pixel_scale_arcsec))
+            desc = f'{val:g}" ({border_px}px)'
+        else:
+            pct = float(s.rstrip('%'))
+            border_px = int(round(min(nx, ny) * pct / 100.0))
+            desc = f"{pct:g}% ({border_px}px)"
+    except ValueError:
+        return 0, None
+    return border_px, desc
+
+
+def _footprint_trim_ring(footprint, border_px):
+    """Ring of footprint pixels to blank when eroding the footprint inward by
+    border_px (8-connected), following the irregular coverage boundary. Interior
+    holes are filled first (flood-fill from the array border) so only the OUTER
+    edge is peeled. Mirrors collapse_cube's edge-trim block.
+    """
+    from collections import deque
+    ny, nx = footprint.shape
+    bg = ~footprint
+    exterior = np.zeros_like(footprint)
+    dq = deque()
+    for x in range(nx):
+        for yb in (0, ny - 1):
+            if bg[yb, x] and not exterior[yb, x]:
+                exterior[yb, x] = True; dq.append((yb, x))
+    for y in range(ny):
+        for xb in (0, nx - 1):
+            if bg[y, xb] and not exterior[y, xb]:
+                exterior[y, xb] = True; dq.append((y, xb))
+    while dq:
+        y, x = dq.popleft()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            yy2, xx2 = y + dy, x + dx
+            if 0 <= yy2 < ny and 0 <= xx2 < nx and bg[yy2, xx2] and not exterior[yy2, xx2]:
+                exterior[yy2, xx2] = True; dq.append((yy2, xx2))
+    filled = ~exterior
+    eroded = filled
+    for _ in range(border_px):
+        e = eroded.copy()
+        e[:-1, :] &= eroded[1:, :]; e[1:, :] &= eroded[:-1, :]
+        e[:, :-1] &= eroded[:, 1:]; e[:, 1:] &= eroded[:, :-1]
+        e[:-1, :-1] &= eroded[1:, 1:]; e[:-1, 1:] &= eroded[1:, :-1]
+        e[1:, :-1] &= eroded[:-1, 1:]; e[1:, 1:] &= eroded[:-1, :-1]
+        e[0, :] = False; e[-1, :] = False; e[:, 0] = False; e[:, -1] = False
+        eroded = e
+    return footprint & ~eroded
+
+
+def collapse_cube_to_map(
+    cube_fits: str,
+    velocity_range: Optional[Tuple[float, float]] = None,
+    mode: str = 'moment0',
+    peak_range_channels: int = 5,
+    peak_smooth_channels: Optional[float] = None,
+    shuffle: bool = False,
+    shuffle_snr: float = 5.0,
+    shuffle_field_smooth: float = 6.0,
+    shuffle_window_kms: float = 20.0,
+    shuffle_ref_velocity: Optional[float] = None,
+    coverage_threshold: float = 0.0,
+    trim_edges: Optional[str] = None,
+    suppress_negative: bool = False,
+    suppress_high: Optional[float] = None,
+    smooth_sigma: Optional[float] = None,
+    verbose: bool = True,
+):
+    """Collapse ONE gridded cube to a 2D display map — compute only, no plotting.
+
+    Applies the same steps as collapse_cube: velocity-range select, optional
+    velocity-field shuffle, moment0 / peak-range-int / peak-intensity collapse,
+    coverage + edge-trim + all-NaN masking (masked → NaN), suppress-negative,
+    suppress-high, and Gaussian display smoothing.
+
+    Returns
+    -------
+    (display_map, header2d, map_label, map_units, mode)
+    """
+    tag = Path(cube_fits).name
+    with fits.open(cube_fits) as hdul:
+        cube = hdul[0].data.astype(float)
+        header = hdul[0].header.copy()
+    if cube.ndim != 3:
+        raise ValueError(f"{tag}: expected a 3-D datacube, got shape {cube.shape}")
+    nvel, ny, nx = cube.shape
+
+    crval3 = float(header.get('CRVAL3', 0.0))
+    crpix3 = float(header.get('CRPIX3', 1.0))
+    cdelt3 = float(header.get('CDELT3', 1.0))
+    channels_kms = (crval3 + (np.arange(nvel) - (crpix3 - 1)) * cdelt3) / 1e3
+    deltav_kms = abs(cdelt3) / 1e3
+
+    if velocity_range is not None:
+        v_min, v_max = float(velocity_range[0]), float(velocity_range[1])
+        chan_mask = (channels_kms >= v_min) & (channels_kms <= v_max)
+        if not np.any(chan_mask):
+            raise ValueError(f"{tag}: no channels in [{v_min}, {v_max}] km/s "
+                             f"(cube covers {channels_kms.min():.1f}–{channels_kms.max():.1f}).")
+    else:
+        chan_mask = np.ones(nvel, dtype=bool)
+
+    # --- Optional velocity-field shuffle (same as collapse_cube) ---
+    if shuffle:
+        if velocity_range is None:
+            raise ValueError(f"{tag}: --shuffle requires --velocity-range.")
+        v0_raw, v0_field, _snr = _velocity_field_from_cube(
+            cube, channels_kms, chan_mask.copy(), deltav_kms, shuffle_snr, shuffle_field_smooth)
+        if int(np.sum(np.isfinite(v0_raw))) == 0:
+            raise ValueError(f"{tag}: --shuffle found no pixels at S/N ≥ {shuffle_snr}; "
+                             f"lower --shuffle-snr or widen --velocity-range.")
+        ref_v = (float(shuffle_ref_velocity) if shuffle_ref_velocity is not None
+                 else float(np.nanmedian(v0_raw)))
+        cube = _shuffle_cube(cube, channels_kms, v0_field, ref_v)
+        v_min, v_max = ref_v - shuffle_window_kms, ref_v + shuffle_window_kms
+        chan_mask = (channels_kms >= v_min) & (channels_kms <= v_max)
+        if verbose:
+            print(f"  [{tag}] shuffle → ref {ref_v:.1f} km/s, window "
+                  f"{v_min:.1f}–{v_max:.1f} ({int(chan_mask.sum())} ch)")
+
+    # --- Peak-location smoothing (locate on smoothed, read raw) ---
+    cube_pf = cube
+    if peak_smooth_channels and peak_smooth_channels > 0 and mode in ('peak-intensity', 'peak-range-int'):
+        cube_pf = _spectral_smooth_nanaware(cube, float(peak_smooth_channels))
+
+    # --- Collapse ---
+    if mode == 'peak-intensity':
+        peak_idx = np.argmax(np.where(np.isnan(cube_pf), -np.inf, cube_pf), axis=0)
+        _ry = np.arange(ny)[:, None]; _rx = np.arange(nx)[None, :]
+        collapsed = cube[peak_idx, _ry, _rx].astype(np.float32)
+        units, label = 'K', 'Peak intensity (K)'
+    elif mode == 'peak-range-int':
+        sub = cube[chan_mask, :, :]; sub_pf = cube_pf[chan_mask, :, :]
+        nsel = sub.shape[0]
+        peak_idx = np.argmax(np.where(np.isnan(sub_pf), -np.inf, sub_pf), axis=0)
+        n = peak_range_channels
+        acc = np.zeros((ny, nx), dtype=np.float64)
+        ri = np.arange(ny)[:, None]; ci = np.arange(nx)[None, :]
+        for k in range(-n, n + 1):
+            ck = peak_idx + k
+            valid = (ck >= 0) & (ck < nsel)
+            vals = sub[np.clip(ck, 0, nsel - 1), ri, ci]
+            acc += np.where(valid & ~np.isnan(vals), vals, 0.0)
+        collapsed = (acc * deltav_kms).astype(np.float32)
+        units, label = 'K km/s', f'Peak ±{n}ch (K km/s)'
+    else:  # moment0
+        collapsed = (np.nansum(cube[chan_mask, :, :], axis=0) * deltav_kms).astype(np.float32)
+        units, label = 'K km/s', 'K km/s'
+
+    # --- Masks (masked → NaN in the display) ---
+    display_mask = np.zeros((ny, nx), dtype=bool)
+    coverage_map = None
+    if coverage_threshold > 0:
+        try:
+            with fits.open(cube_fits) as _h:
+                if 'COVERAGE' in [e.name for e in _h]:
+                    coverage_map = _h['COVERAGE'].data.astype(float)
+        except Exception:
+            pass
+        if coverage_map is not None and coverage_map.max() > 0:
+            display_mask |= coverage_map < coverage_threshold * coverage_map.max()
+
+    if trim_edges is not None:
+        pix_as = abs(float(header.get('CDELT2', 1.0))) * 3600.0
+        border_px, desc = _trim_border_px(trim_edges, pix_as, nx, ny)
+        if desc is not None and border_px > 0:
+            footprint = ~np.all(np.isnan(cube[chan_mask, :, :]), axis=0)
+            if coverage_map is not None:
+                footprint &= (coverage_map > 0)
+            ring = _footprint_trim_ring(footprint, border_px)
+            if int(ring.sum()) < int(footprint.sum()):
+                display_mask |= ring
+            elif verbose:
+                print(f"  [{tag}] --trim-edges {trim_edges} would blank everything; ignored")
+
+    display_mask |= np.all(np.isnan(cube[chan_mask, :, :]), axis=0)
+
+    disp = collapsed.copy()
+    disp[display_mask] = np.nan
+    if suppress_negative:
+        disp[np.isfinite(disp) & (disp < 0)] = 0.0
+    if suppress_high is not None:
+        disp[np.isfinite(disp) & (disp > suppress_high)] = suppress_high
+    if smooth_sigma is not None and smooth_sigma > 0:
+        from astropy.convolution import Gaussian2DKernel, convolve as _convolve
+        disp = _convolve(disp, Gaussian2DKernel(x_stddev=smooth_sigma),
+                         boundary='fill', fill_value=np.nan,
+                         nan_treatment='interpolate', preserve_nan=True).astype(np.float32)
+
+    header2d = WCS(header).dropaxis(2).to_header()
+    header2d['BUNIT'] = units
+    if verbose:
+        finite = np.isfinite(disp)
+        rng = (f"[{np.nanmin(disp):.2f}, {np.nanmax(disp):.2f}]" if finite.any() else "[empty]")
+        print(f"  [{tag}] {mode}: {ny}×{nx}, {int(finite.sum())} valid px, range {rng} {units}")
+    return disp, header2d, label, units, mode
+
+
+def _compare_build_norm(stretch, vmin, vmax, gamma, data=None):
+    """Same stretch→matplotlib-norm mapping as collapse_cube._make_norm."""
+    from matplotlib import colors as mcolors
+    if stretch == 'sqrt':
+        return mcolors.PowerNorm(gamma=0.5, vmin=vmin, vmax=vmax)
+    if stretch == 'power':
+        return mcolors.PowerNorm(gamma=gamma, vmin=vmin, vmax=vmax)
+    if stretch == 'log':
+        safe_vmin = max(vmin, 1e-6 * vmax) if vmax > 0 else 1e-6
+        return mcolors.LogNorm(vmin=safe_vmin, vmax=vmax)
+    if stretch == 'symlog':
+        linthresh = max(abs(vmax), abs(vmin)) * 0.1 or 1e-6
+        return mcolors.SymLogNorm(linthresh=linthresh, vmin=vmin, vmax=vmax)
+    if stretch == 'asinh':
+        if hasattr(mcolors, 'AsinhNorm'):
+            return mcolors.AsinhNorm(linear_width=(vmax - vmin) * 0.1 or 1e-6, vmin=vmin, vmax=vmax)
+        return mcolors.PowerNorm(gamma=0.5, vmin=vmin, vmax=vmax)
+    return mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+
+def compare_maps(
+    cube_files: List[str],
+    plot_output: Optional[str] = None,
+    titles: Optional[List[str]] = None,
+    use_wcs: bool = False,
+    colormap: str = 'rainbow',
+    stretch: str = 'linear',
+    gamma: float = 1.0,
+    percentile_clip: Optional[Tuple[float, float]] = None,
+    per_panel_scale: bool = False,
+    show: bool = True,
+    **collapse_kwargs,
+):
+    """Collapse N cubes and draw their maps in one auto-sized comparison grid.
+
+    All the collapse controls (velocity_range, mode, peak_range_channels,
+    peak_smooth_channels, shuffle*, coverage_threshold, trim_edges,
+    suppress_negative, suppress_high, smooth_sigma) are forwarded to
+    collapse_cube_to_map via **collapse_kwargs. By default every panel shares one
+    colour scale + colorbar (comparable brightness); per_panel_scale=True scales
+    each to its own range instead.
+    """
+    if not cube_files:
+        raise ValueError("compare_maps: no cube files given")
+
+    maps = []
+    for f in cube_files:
+        disp, hdr2d, label, units, mode = collapse_cube_to_map(f, **collapse_kwargs)
+        maps.append((f, disp, hdr2d, label, units, mode))
+    N = len(maps)
+    mode = maps[0][5]
+    map_label = maps[0][3]
+    suppress_negative = bool(collapse_kwargs.get('suppress_negative', False))
+
+    # --- Auto grid: near-square for N>3, single row for N<=3 (looks nice) ---
+    import math
+    if N <= 3:
+        ncols, nrows = N, 1
+    else:
+        ncols = int(math.ceil(math.sqrt(N)))
+        nrows = int(math.ceil(N / ncols))
+    # constrained_layout keeps the (possibly wrapped, multi-line) panel titles,
+    # the suptitle and the colorbar from overlapping — without it a two-line
+    # title grows up into the panel/frame above.
+    fig = plt.figure(figsize=(5.2 * ncols, 5.0 * nrows), constrained_layout=True)
+
+    # --- Shared colour limits from pooled data (unless per-panel) ---
+    def _vlims(arrs):
+        pooled = np.concatenate([a[np.isfinite(a)].ravel() for a in arrs
+                                 if np.isfinite(a).any()]) if arrs else np.array([np.nan])
+        lo, hi = percentile_clip if percentile_clip is not None else (0, 100)
+        vmin = 0.0 if (suppress_negative and mode == 'moment0') else float(np.nanpercentile(pooled, lo))
+        vmax = float(np.nanpercentile(pooled, hi))
+        if not np.isfinite(vmax) or vmax <= vmin:
+            vmax = vmin + 1.0
+        return vmin, vmax
+
+    shared_vmin, shared_vmax = _vlims([m[1] for m in maps])
+    shared_norm = _compare_build_norm(stretch, shared_vmin, shared_vmax, gamma,
+                                      data=np.concatenate([m[1][np.isfinite(m[1])].ravel() for m in maps]))
+    cmap_obj = plt.colormaps[colormap].copy() if isinstance(colormap, str) else colormap.copy()
+    cmap_obj.set_bad('white')
+
+    # Wrap long panel titles onto multiple lines so they stay within their
+    # panel and are not clipped/hidden by the colorbar (the rightmost column's
+    # centred title would otherwise overflow rightward under the shared
+    # colorbar). Breaks at spaces or underscores — filenames have no spaces —
+    # keeping each delimiter on the preceding line.
+    def _wrap_title(s, width=24):
+        if len(s) <= width:
+            return s
+        lines, cur, seg = [], '', ''
+        for ch in s:
+            seg += ch
+            if ch in ' _':
+                if cur and len(cur) + len(seg) > width:
+                    lines.append(cur); cur = seg
+                else:
+                    cur += seg
+                seg = ''
+        if seg:
+            if cur and len(cur) + len(seg) > width:
+                lines.append(cur); cur = seg
+            else:
+                cur += seg
+        if cur:
+            lines.append(cur)
+        return '\n'.join(lines)
+
+    # Each colorbar is registered with the image(s) it controls, so an
+    # interactive click on it can re-clip those panels (see below).
+    _cb_registry = []
+    axes, images, last_im = [], [], None
+    for i, (f, disp, hdr2d, label, units, _m) in enumerate(maps):
+        if use_wcs:
+            ax = fig.add_subplot(nrows, ncols, i + 1, projection=WCS(hdr2d))
+        else:
+            ax = fig.add_subplot(nrows, ncols, i + 1)
+        if per_panel_scale:
+            vmn, vmx = _vlims([disp])
+            norm = _compare_build_norm(stretch, vmn, vmx, gamma, data=disp[np.isfinite(disp)])
+        else:
+            norm = shared_norm
+        im = ax.imshow(disp, origin='lower', cmap=cmap_obj, norm=norm, interpolation='nearest')
+        last_im = im
+        ttl = titles[i] if (titles and i < len(titles)) else Path(f).stem
+        ax.set_title(_wrap_title(ttl), fontsize=9)
+        if use_wcs:
+            ax.set_xlabel('RA'); ax.set_ylabel('Dec')
+            try:
+                ax.coords.grid(color='gray', alpha=0.25, linewidth=0.5)
+            except Exception:
+                pass
+        else:
+            ax.set_xlabel('pixel'); ax.set_ylabel('pixel')
+        if per_panel_scale:
+            cb = fig.colorbar(im, ax=ax, label=map_label, fraction=0.046, pad=0.04)
+            _cb_registry.append({'cb': cb, 'images': [im]})
+        axes.append(ax)
+        images.append(im)
+
+    if not per_panel_scale and last_im is not None:
+        from matplotlib.cm import ScalarMappable
+        sm = ScalarMappable(norm=shared_norm, cmap=cmap_obj); sm.set_array([])
+        cb = fig.colorbar(sm, ax=axes, label=map_label, fraction=0.046, pad=0.04)
+        _cb_registry.append({'cb': cb, 'images': list(images)})
+
+    scale_note = 'per-panel scale' if per_panel_scale else 'shared scale'
+    fig.suptitle(f"{mode} comparison — {N} cubes ({nrows}×{ncols}, {scale_note})",
+                 fontsize=12, fontweight='bold')
+    # Layout is handled by constrained_layout (set at figure creation); calling
+    # tight_layout here would conflict with it.
+
+    # ------------------------------------------------------------------
+    # Interactive: click on a colorbar to adjust its colour scale
+    # (left click = new lower clip, right click = new upper clip). In the
+    # default shared-scale mode the single colorbar re-clips every panel at
+    # once; with per_panel_scale each colorbar re-clips only its own panel.
+    # Press 'b' to undo the last change.
+    # ------------------------------------------------------------------
+    _cb_history = []
+
+    def _apply(entry, vmin, vmax):
+        cb = entry['cb']
+        cb.mappable.norm.vmin, cb.mappable.norm.vmax = vmin, vmax
+        cb.mappable.set_norm(cb.mappable.norm)
+        cb.update_normal(cb.mappable)
+        for im in entry['images']:
+            im.norm.vmin, im.norm.vmax = vmin, vmax
+            im.set_norm(im.norm)
+        fig.canvas.draw_idle()
+
+    def _on_colorbar_click(event):
+        if event.button not in (1, 3) or event.ydata is None:
+            return
+        for entry in _cb_registry:
+            if event.inaxes is not entry['cb'].ax:
+                continue
+            norm = entry['cb'].mappable.norm
+            new_vmin, new_vmax = norm.vmin, norm.vmax
+            if event.button == 1:
+                new_vmin = float(event.ydata)
+            else:
+                new_vmax = float(event.ydata)
+            if new_vmin >= new_vmax:
+                return
+            _cb_history.append((entry, norm.vmin, norm.vmax))
+            _apply(entry, new_vmin, new_vmax)
+            return
+
+    def _on_key_press(event):
+        if event.key != 'b' or not _cb_history:
+            return
+        entry, prev_vmin, prev_vmax = _cb_history.pop()
+        _apply(entry, prev_vmin, prev_vmax)
+
+    fig.canvas.mpl_connect('button_press_event', _on_colorbar_click)
+    fig.canvas.mpl_connect('key_press_event', _on_key_press)
+
+    if plot_output:
+        fig.savefig(plot_output, dpi=150, bbox_inches='tight')
+        print(f"  Comparison figure saved: {plot_output}")
+    if show:
+        plt.show()
+    return fig

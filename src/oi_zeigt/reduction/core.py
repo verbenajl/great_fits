@@ -2076,9 +2076,16 @@ def reduce_spectra(hdul: fits.HDUList,
     # Track which rows to keep (for when we filter spectra)
     keep_mask = np.ones(len(spectra), dtype=bool)
 
-    # Identify calibration rows (TSYS, TAU_SIG) — these must NOT be modified
-    # by baseline subtraction, smoothing, or any other reduction step that
-    # would corrupt their calibration values.
+    # Identify calibration rows (TSYS, TAU_SIG). science_mask gates baseline
+    # subtraction AND telluric noise-fill: both must skip TSYS/TAU_SIG. These are
+    # absolute calibration spectra — baselining zero-centres them and destroys
+    # their real level (e.g. opacity goes below the physical floor), which makes
+    # filter_fits --filter-tau reject every linked science spectrum. Boxcar
+    # smoothing, by contrast, IS applied to every row (including TSYS/TAU_SIG):
+    # it preserves the absolute level while anti-aliasing, so a later decimation
+    # subsamples locally-averaged channels for the calibration spectra too rather
+    # than raw-subsampling them. SKYCHOPDIFF is treated as science here (baselined
+    # and smoothed); only fill_telluric_noise excludes it as well.
     NON_SCIENCE = {'TSYS', 'TAU_SIG'}
     if 'OBJECT' in data.dtype.names:
         raw_obj = data['OBJECT']
@@ -2314,6 +2321,12 @@ def reduce_spectra(hdul: fits.HDUList,
 
         # Process baseline in chunks: convert each chunk to float64 for numerical
         # precision, store result back as float32.  Avoids a full float64 copy.
+        # Applied ONLY to science + SKYCHOPDIFF rows (science_mask). TSYS / TAU_*
+        # are absolute calibration spectra: baselining them subtracts a fit that
+        # zero-centres their real values (e.g. opacity would go negative / below
+        # the physical floor), which then makes downstream filters like
+        # filter_fits --filter-tau reject every linked science spectrum. Leave
+        # them untouched.
         _CHUNK = 1000
         sci_indices = np.where(science_mask)[0]
         if baseline_window_info is not None:
@@ -2351,9 +2364,12 @@ def reduce_spectra(hdul: fits.HDUList,
         params = methods['smooth']
         window_size = params.get('window_size', 5)
         _CHUNK = 1000
-        sci_indices = np.where(science_mask)[0]
-        for start in range(0, len(sci_indices), _CHUNK):
-            idx = sci_indices[start:start + _CHUNK]
+        # Smooth EVERY row (science, SKYCHOPDIFF, TSYS, TAU_SIG). Calibration
+        # spectra are boxcar-smoothed too so that a subsequent decimation subsamples
+        # anti-aliased (locally averaged) channels for them as well, matching science.
+        smooth_indices = np.arange(spectra.shape[0])
+        for start in range(0, len(smooth_indices), _CHUNK):
+            idx = smooth_indices[start:start + _CHUNK]
             spectra[idx] = _reduce_smooth(spectra[idx], window_size=window_size)
 
     if 'decimate' in methods:

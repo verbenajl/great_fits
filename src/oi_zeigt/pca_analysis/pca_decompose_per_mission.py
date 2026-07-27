@@ -289,8 +289,12 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
                               flight_date: str, n_components: int = 5,
                               velocity_axis: np.ndarray = None,
                               line_window_kms: tuple = None,
+                              science_line_window_kms: tuple = None,
+                              fit_exclude_window_kms: tuple = None,
                               spectrum_indices: np.ndarray = None,
                               smoothing_kernel_size: int = None,
+                              reject_lined_rows: bool = False,
+                              reject_line_sigma: float = 3.0,
                               pca_source: str = 'SKYCHOPDIFF') -> DecompositionResult:
     """
     Perform PCA decomposition on spectra from a single mission/telescope combination.
@@ -310,7 +314,21 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
     velocity_axis : np.ndarray, optional
         Velocity axis in km/s for masking lines
     line_window_kms : tuple, optional
-        (v_min, v_max) in km/s to mask emission lines during decomposition
+        (v_min, v_max) in km/s of the atmospheric telluric line to exclude from
+        the baseline fit and the PCA fit during decomposition
+    science_line_window_kms : tuple, optional
+        (v_min, v_max) in km/s of the [CII] science line ([reduction].line_window).
+        Always held out of the baseline polynomial (a linear baseline shouldn't be
+        dragged by a possible line). It is NOT, by itself, held out of the PCA fit
+        — that is governed separately by fit_exclude_window_kms.
+    fit_exclude_window_kms : tuple, optional
+        (v_min, v_max) in km/s of the window to also hold OUT of the PCA component
+        fit. None (default) = the science line is fully INCLUDED in the fit, so the
+        components get a real baseline across it. Set to a NARROW core around the
+        line peak (via --exclude-narrow-line-window / [pca].narrow_line_window) to
+        keep the destructive peak out of the basis while keeping the broad wings as
+        baseline; or to the full science window to reproduce the old leak-fix. The
+        telluric window is excluded from the fit regardless.
     spectrum_indices : np.ndarray, optional
         Indices of these spectra in the original FITS file
     smoothing_kernel_size : int, optional
@@ -338,54 +356,125 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
     spectra, velocity_axis, channel_first, channel_last = preprocess_spectra(spectra, velocity_axis)
     logger.info(f"After preprocessing: {spectra.shape}")
     
-    # Baseline-subtract each SKYCHOPDIFF spectrum before decomposition,
-    # matching the original pyclass behaviour where prepare_spectrum() calls
-    # baseline() prior to adding a spectrum to the PCA input set.
-    # The telluric line window is excluded from the baseline fit so that
-    # the atmospheric emission feature does not bias the polynomial.
+    # Build channel-exclusion masks. The BASELINE polynomial and the PCA fit are
+    # masked differently:
+    #   * telluric window (line_window_kms): always excluded from BOTH — it is
+    #     atmospheric junk that must never enter either fit.
+    #   * science line window (science_line_window_kms, from [reduction].line_window):
+    #     always excluded from the BASELINE polynomial (a linear baseline should
+    #     not be dragged by a possible line).
+    #   * fit_exclude_window_kms: the window (if any) additionally held out of the
+    #     PCA FIT. None (default) → the science line is fully IN the fit, so the
+    #     components get a real baseline across it. A NARROW core around the line
+    #     peak keeps the destructive peak out of the basis (so pca_correct can't
+    #     over-subtract the bright central line) while the broad wings still supply
+    #     the baseline. The full science window here reproduces the old leak-fix.
+    # The windows are generally disjoint, so we build explicit boolean channel
+    # masks rather than a single (v_min,v_max) range.
+    def _window_mask(win, label, reason):
+        if win is None or velocity_axis is None:
+            return np.zeros(spectra.shape[1], dtype=bool)
+        w_lo, w_hi = win
+        m = (velocity_axis >= w_lo) & (velocity_axis <= w_hi)
+        if np.any(m):
+            logger.info(f"  {reason} {label} window {w_lo:.1f}-{w_hi:.1f} km/s "
+                        f"({int(np.sum(m))} channels)")
+        return m
+
+    telluric_win_mask = _window_mask(line_window_kms, 'telluric',
+                                     'Excluding (baseline+fit)')
+    science_win_mask = _window_mask(science_line_window_kms, 'science',
+                                    'Excluding from baseline')
+    fit_win_mask = _window_mask(fit_exclude_window_kms, 'science-core',
+                                'Excluding from PCA fit')
+    if fit_exclude_window_kms is None:
+        logger.info("  Science line window INCLUDED in the PCA fit "
+                    "(no --exclude-narrow-line-window)")
+
+    baseline_exclude_mask = telluric_win_mask | science_win_mask
+    baseline_exclude_mask = baseline_exclude_mask if np.any(baseline_exclude_mask) else None
+
+    pca_exclude_mask = telluric_win_mask | fit_win_mask
+    pca_exclude_mask = pca_exclude_mask if np.any(pca_exclude_mask) else None
+
+    # Baseline-subtract each SKYCHOPDIFF spectrum before decomposition, matching
+    # the original pyclass behaviour where prepare_spectrum() calls baseline()
+    # prior to adding a spectrum to the PCA input set. Both line windows are held
+    # out of the baseline fit so neither telluric emission nor a (possibly
+    # contaminating) [CII] line biases the polynomial.
     from oi_zeigt.reduction.core import baseline_subtract
-    baseline_window = None
-    if line_window_kms is not None and velocity_axis is not None:
-        v_min_bl, v_max_bl = line_window_kms
-        line_mask_bl = (velocity_axis >= v_min_bl) & (velocity_axis <= v_max_bl)
-        ch_indices = np.where(line_mask_bl)[0]
-        if len(ch_indices) > 0:
-            baseline_window = (int(ch_indices[0]), int(ch_indices[-1]) + 1)
     baselined = np.empty_like(spectra)
     for s_idx in range(len(spectra)):
         baselined[s_idx] = baseline_subtract(spectra[s_idx], order=1,
-                                             window=baseline_window)
+                                             exclude_mask=baseline_exclude_mask)
     spectra = baselined
-    logger.info(f"  ✓ Baseline-subtracted {len(spectra)} spectra "
-                f"(order=1, excluded channels {baseline_window})")
+    logger.info(f"  ✓ Baseline-subtracted {len(spectra)} spectra (order=1, "
+                f"excluded {0 if baseline_exclude_mask is None else int(np.sum(baseline_exclude_mask))} channels)")
 
-    # Exclude the telluric line window from the PCA fit entirely (from mission-
-    # specific parameters), instead of injecting a mean-filled placeholder.
-    # Matches legacy pyclass, which physically trims the channel range before
-    # fitting (apply_pca_exclude_range) so the components never encode anything
-    # about that region. Implemented as a boolean mask rather than a physical
-    # trim so the rest of the pipeline (correction, plotting) keeps working
-    # with full-length, fixed-shape arrays — the excluded channels are
-    # zero-filled back in below, after fitting/smoothing.
-    telluric_mask = None
-    if line_window_kms is not None and velocity_axis is not None:
-        logger.info(f"Excluding telluric line window {line_window_kms[0]:.1f}-{line_window_kms[1]:.1f} km/s from PCA fit")
-        logger.info(f"  Velocity axis range: {velocity_axis[0]:.1f} to {velocity_axis[-1]:.1f} km/s ({len(velocity_axis)} channels)")
-        v_min, v_max = line_window_kms
-        candidate_mask = (velocity_axis >= v_min) & (velocity_axis <= v_max)
-        line_channels = np.where(candidate_mask)[0]
-
-        if len(line_channels) == 0:
-            logger.warning(f"  ⚠ No channels found in line window {v_min:.1f}-{v_max:.1f} km/s!")
-        elif len(line_channels) >= spectra.shape[1]:
-            logger.warning(f"  ⚠ Telluric window covers the entire spectrum — ignoring exclusion")
+    # ── Optional per-ROW line rejection ───────────────────────────────────────
+    # Drop the individual SKYCHOPDIFF reference spectra that themselves carry a
+    # [CII] line, so the PCA basis is trained ONLY on clean (line-free) rows and
+    # the components never learn the leak direction. This is a per-ROW filter,
+    # complementary to (and stackable with) the per-CHANNEL science-core holdout
+    # (fit_exclude_window_kms / --exclude-narrow-line-window) and the per-FLIGHT
+    # skip_correction pass-through. Detection is a data-driven matched filter:
+    # the median line-window profile across the rows (the coherent leak shape) is
+    # the template, each row is projected onto it and divided by its own line-free
+    # noise, and rows with |MF/σ| > reject_line_sigma are removed before the fit.
+    # NOTE: like preprocess_spectra's NaN drop above, this decouples the fitted
+    # row count from spectrum_indices (metadata only), which is already the case.
+    if reject_lined_rows and np.any(science_win_mask):
+        line_ch = science_win_mask
+        free_ch = ~(telluric_win_mask | science_win_mask)
+        n_before = len(spectra)
+        if np.sum(free_ch) >= 5 and np.sum(line_ch) >= 3 and n_before > 0:
+            sigma = np.std(spectra[:, free_ch], axis=1)
+            templ = np.median(spectra[:, line_ch], axis=0)
+            tnorm = float(np.linalg.norm(templ))
+            if tnorm > 0 and np.all(np.isfinite(templ)):
+                templ = templ / tnorm
+                mf = spectra[:, line_ch] @ templ
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    row_snr = np.where(sigma > 0, np.abs(mf) / sigma, 0.0)
+                keep = row_snr <= reject_line_sigma
+                n_keep = int(np.sum(keep))
+                min_keep = max(n_components + 2, 10)
+                if n_keep < min_keep:
+                    logger.warning(
+                        f"  ⚠ Per-row line rejection would leave only {n_keep}/"
+                        f"{n_before} rows (< {min_keep} needed for {n_components} "
+                        f"components) — KEEPING ALL rows for {mission_id}")
+                else:
+                    spectra = spectra[keep]
+                    frac = 100.0 * (n_before - n_keep) / n_before
+                    logger.info(
+                        f"  ✓ Per-row line rejection (|MF/σ| > {reject_line_sigma}): "
+                        f"dropped {n_before - n_keep}/{n_before} lined SKYCHOPDIFF "
+                        f"rows ({frac:.1f}%); fitting on {n_keep} clean rows")
+            else:
+                logger.info("  Per-row line rejection: degenerate template — skipped")
         else:
-            logger.info(f"  Mapped to {len(line_channels)} channels: indices {line_channels[0]}-{line_channels[-1]}")
-            logger.info(f"  Actual velocity range in data: {velocity_axis[line_channels[0]]:.1f} to {velocity_axis[line_channels[-1]]:.1f} km/s")
-            telluric_mask = candidate_mask
-            logger.info(f"  ✓ Excluding {len(line_channels)} channels from PCA fit (never mean-filled or otherwise faked)")
+            logger.info("  Per-row line rejection: too few line/free channels — skipped")
 
-    # Fit PCA on the non-telluric channels only
+    # Exclude the chosen channels from the PCA fit entirely, instead of injecting
+    # a mean-filled placeholder. Matches legacy pyclass, which physically trims
+    # the channel range before fitting (apply_pca_exclude_range) so the components
+    # never encode anything about that region. Implemented as a boolean mask
+    # rather than a physical trim so the rest of the pipeline (correction,
+    # plotting) keeps working with full-length, fixed-shape arrays — the excluded
+    # channels are interpolated back in below, after fitting/smoothing.
+    telluric_mask = None
+    if pca_exclude_mask is not None:
+        n_excl = int(np.sum(pca_exclude_mask))
+        if n_excl >= spectra.shape[1]:
+            logger.warning(f"  ⚠ Exclusion windows cover the entire spectrum — ignoring exclusion")
+        else:
+            telluric_mask = pca_exclude_mask
+            _what = 'telluric + science-core' if fit_exclude_window_kms is not None else 'telluric only'
+            logger.info(f"  ✓ Excluding {n_excl} channels ({_what}) from PCA fit "
+                        f"(never mean-filled or otherwise faked)")
+
+    # Fit PCA on the non-excluded channels only
     fit_spectra = spectra[:, ~telluric_mask] if telluric_mask is not None else spectra
     logger.info(f"Fitting PCA with {n_components} components on {fit_spectra.shape[1]}/{spectra.shape[1]} channels...")
     decomposer = PCADecomposer(n_components=n_components, scale=False)
@@ -399,25 +488,97 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
     if smoothing_kernel_size:
         kernel_size = int(smoothing_kernel_size)
         kernel = np.ones(kernel_size) / kernel_size
+        # np.convolve(mode='same') returns length max(len(signal), len(kernel)),
+        # so when the kernel is LONGER than the fitted-channel array (which happens
+        # here once wide science+telluric exclusion windows leave fewer channels
+        # than smoothing_kernel_size) it silently grows the component by
+        # (kernel_size - n_channels) samples and the later interp back to full
+        # length fails ("fp and xp are not of the same length"). Compute the full
+        # convolution and take the centred slice so the output is ALWAYS the same
+        # length as the input component, for any kernel size.
+        n_ch_fit = decomposer.pca_model.components_.shape[1]
+        _off = (kernel_size - 1) // 2
         smoothed = []
         for component in decomposer.pca_model.components_:
-            smoothed.append(np.convolve(component.copy(), kernel, mode='same'))
+            full = np.convolve(component.copy(), kernel, mode='full')
+            smoothed.append(full[_off:_off + n_ch_fit])
         decomposer.pca_model.components_ = np.array(smoothed)
         logger.info(f"Smoothed {len(smoothed)} components with boxcar kernel size {kernel_size}")
+        if kernel_size > n_ch_fit:
+            logger.warning(f"  ⚠ smoothing_kernel_size ({kernel_size}) exceeds the "
+                           f"{n_ch_fit} channels left after exclusion — smoothing is very "
+                           f"aggressive (near-flat components); consider lowering it.")
 
     components_fit = decomposer.get_components()   # (n_comp, n_channels_fit)
     mean_fit = decomposer.pca_model.mean_           # (n_channels_fit,)
 
-    # Pad components/mean back to the full channel length, with zero at the
-    # excluded telluric channels — they were never part of the fit, so there is
-    # no eigenvector value to report there. Matches legacy's zero-insertion in
-    # prepare_spectrum_for_plot()/plot_pca_decomposition().
+    # Pad components/mean back to the full channel length. The excluded windows
+    # were never part of the fit, so PCA reports no eigenvector value there. We
+    # fill them by LINEAR INTERPOLATION from the flanking fitted channels rather
+    # than zero-filling. Rationale (see AskUserQuestion 2026-07-13, "off-off"
+    # model): the SKYCHOPDIFF references are off-off spectra assumed free of the
+    # [CII] science line, so the component's true behaviour across the window is
+    # its smooth baseline continuation, NOT a line and NOT a hard-zero plateau.
+    #   * Interpolation reads only from good-channel flanks, which never saw the
+    #     weak leaked line (F296 ~+0.6 K), so it recovers the baseline level, not
+    #     the line — the line stays mathematically untouched by correction.
+    #   * Unlike zero-filling (which flatlined ~47% of the component and removed
+    #     its ability to model the baseline *under* the line), the interpolated
+    #     component subtracts the continuum beneath the line while leaving the
+    #     narrow line itself intact.
+    # np.interp clamps to the nearest endpoint for any excluded channel outside
+    # the good-channel range (constant extrapolation at spectrum edges).
+    #
+    # CAVEAT that the science-core block below fixes: interpolation across a WIDE
+    # window draws a straight CHORD between the two flanks. For the ~7-ch telluric
+    # window the flanks sit at nearly the same level, so the chord is ~flat and
+    # harmless. But the science core ([pca].narrow_line_window, ~25 ch) spans a
+    # region where a real eigenvector genuinely differs between flanks, so the
+    # chord is a SLOPE — and pca_correct subtracts coeff*component across the line,
+    # injecting a fake line (one coeff sign) or a trough (the other) right where we
+    # are most sensitive. So we interpolate everything (good for telluric) and then
+    # force the science core to ZERO (below).
     if telluric_mask is not None:
         n_channels_full = spectra.shape[1]
-        components_full = np.zeros((components_fit.shape[0], n_channels_full), dtype=components_fit.dtype)
-        components_full[:, ~telluric_mask] = components_fit
-        mean_full = np.zeros(n_channels_full, dtype=mean_fit.dtype)
-        mean_full[~telluric_mask] = mean_fit
+        good = ~telluric_mask
+        x = np.arange(n_channels_full)
+        xg = x[good]
+        components_full = np.empty((components_fit.shape[0], n_channels_full), dtype=components_fit.dtype)
+        for _c in range(components_fit.shape[0]):
+            components_full[_c] = np.interp(x, xg, components_fit[_c])
+        mean_full = np.interp(x, xg, mean_fit).astype(mean_fit.dtype)
+        logger.info(f"  ✓ Interpolated components/mean across {int(np.sum(telluric_mask))} "
+                    f"excluded channels (smooth baseline continuation, no zero plateau)")
+
+        # SCIENCE-CORE PROTECTION (only when --exclude-narrow-line-window is on).
+        # Force the components to ZERO inside the science core, cosine-tapered from
+        # the full flank value down to zero over a few channels at each edge so
+        # there is no hard step. Then coeff*component == 0 across the protected
+        # interior: the PCA correction is a strict NO-OP there and can neither add
+        # a line nor dig a trough — the [CII] line is left exactly as the order-1
+        # baseline poly leaves it. The taper keeps real correction at the core
+        # edges (line wings, adjacent to fitted channels) while fully protecting
+        # the centre (the line peak). Only the COMPONENTS are zeroed: the mean just
+        # centres the coefficient fit and is never subtracted from the data
+        # (pca_correct subtracts coeff*component only — pca_correct_fits.py:566,
+        # 1503), so a zero component alone fully protects the core. Supersedes the
+        # 2026-07-13 "interpolate, don't zero" choice, which assumed similar flanks.
+        if fit_win_mask is not None and np.any(fit_win_mask):
+            idx = np.where(fit_win_mask)[0]
+            lo, hi = int(idx.min()), int(idx.max())
+            width = hi - lo + 1
+            taper = np.zeros(n_channels_full, dtype=components_full.dtype)
+            taper[:lo] = 1.0
+            taper[hi + 1:] = 1.0
+            ramp = int(min(4, max(1, width // 4)))   # cosine-ramp channels per edge
+            for k in range(ramp):
+                w = 0.5 * (1.0 + np.cos(np.pi * k / ramp))   # 1 at boundary → 0 inward
+                taper[lo + k] = w
+                taper[hi - k] = w
+            components_full = components_full * taper[None, :]
+            logger.info(f"  ✓ Zeroed components across the {width}-channel science core "
+                        f"(cosine-tapered {ramp} ch/edge) — correction is a no-op there, "
+                        f"[CII] line left intact")
     else:
         components_full = components_fit
         mean_full = mean_fit
@@ -571,7 +732,40 @@ def main_cli():
         dest="plot_components",
         help="Generate visualization plots of PCA components"
     )
-    
+    parser.add_argument(
+        "--exclude-narrow-line-window",
+        action="store_true",
+        dest="exclude_narrow_line",
+        help="Hold a NARROW core around the [CII] line peak out of the PCA "
+             "component fit (window from [pca].narrow_line_window, else the "
+             "central 40%% of [reduction].line_window). The broad line wings "
+             "stay in the fit as baseline, but the destructive peak never enters "
+             "the basis — prevents pca_correct over-subtracting the bright "
+             "central line. Without this flag the whole line window is included "
+             "in the fit."
+    )
+    parser.add_argument(
+        "--reject-lined-references",
+        action="store_true",
+        dest="reject_lined_references",
+        help="Drop individual SKYCHOPDIFF reference spectra that themselves "
+             "carry a [CII] line (per-ROW matched-filter detection over the "
+             "science line window) BEFORE the component fit, so the basis is "
+             "trained only on clean reference rows. Complementary to "
+             "--exclude-narrow-line-window (per-channel) and skip_correction "
+             "(per-flight). Enable via [pca].reject_lined_references too."
+    )
+    parser.add_argument(
+        "--reject-line-sigma",
+        type=float,
+        default=None,
+        dest="reject_line_sigma",
+        help="Threshold |matched-filter/σ| above which a SKYCHOPDIFF row is "
+             "treated as lined and dropped (default 3.0, or [pca].reject_line_sigma). "
+             "Per-mission override via the YAML key reject_line_sigma. Lower = "
+             "more aggressive rejection."
+    )
+
     args = parser.parse_args()
     
     # Set logging level
@@ -663,6 +857,65 @@ def main_cli():
             logger.warning(f"Could not reconstruct velocity axis from FITS: {e}")
             logger.warning(f"Proceeding without velocity axis (line masking will be skipped)")
         
+        # The [CII] science line window ([reduction].line_window). It is always
+        # held out of the baseline polynomial; whether a (narrow) core is also
+        # held out of the PCA fit is governed by --exclude-narrow-line-window
+        # (default: whole line window IS included in the component fit). See
+        # decompose_mission_spectra for the trade-off.
+        _rw = config.get('reduction', {}).get('line_window')
+        science_line_window_kms = (float(_rw[0]), float(_rw[1])) if _rw and len(_rw) == 2 else None
+
+        # Decide which window (if any) is also held out of the PCA FIT. Default:
+        # None → the science line is fully IN the fit. With --exclude-narrow-line-window
+        # we hold out only a NARROW core around the line peak, taken from
+        # [pca].narrow_line_window; if that key is absent we fall back to the
+        # central 40% of the wide science window so the flag works out-of-the-box.
+        fit_exclude_window_kms = None
+        if args.exclude_narrow_line:
+            _nw = pca_config.get('narrow_line_window')
+            if _nw and len(_nw) == 2:
+                fit_exclude_window_kms = (float(_nw[0]), float(_nw[1]))
+                _src = '[pca].narrow_line_window'
+            elif science_line_window_kms is not None:
+                _lo, _hi = science_line_window_kms
+                _span = _hi - _lo
+                fit_exclude_window_kms = (_lo + 0.3 * _span, _hi - 0.3 * _span)
+                _src = 'central 40% of [reduction].line_window (no [pca].narrow_line_window set)'
+            else:
+                logger.warning("  ⚠ --exclude-narrow-line-window set but no "
+                               "narrow_line_window and no line_window — ignoring")
+                _src = None
+            if fit_exclude_window_kms is not None:
+                logger.info(f"✓ --exclude-narrow-line-window: holding "
+                            f"{fit_exclude_window_kms[0]:.1f}-{fit_exclude_window_kms[1]:.1f} "
+                            f"km/s out of the PCA fit (from {_src})")
+
+        if science_line_window_kms is not None:
+            _fit_state = (f"core {fit_exclude_window_kms[0]:.1f}-{fit_exclude_window_kms[1]:.1f} "
+                          f"km/s excluded from PCA fit" if fit_exclude_window_kms is not None
+                          else "fully INCLUDED in PCA fit")
+            logger.info(f"✓ Science line window ({science_line_window_kms[0]:.1f}-"
+                        f"{science_line_window_kms[1]:.1f} km/s): held out of baseline, "
+                        f"{_fit_state}")
+
+        # Per-ROW line rejection: drop lined SKYCHOPDIFF reference spectra before
+        # the component fit. Enabled by CLI flag OR [pca].reject_lined_references.
+        # Base sigma from CLI > [pca].reject_line_sigma > 3.0 default; a per-mission
+        # reject_line_sigma in the YAML can override it below (see loop).
+        reject_lined_rows = bool(args.reject_lined_references
+                                 or pca_config.get('reject_lined_references', False))
+        if args.reject_line_sigma is not None:
+            base_reject_sigma = float(args.reject_line_sigma)
+        else:
+            base_reject_sigma = float(pca_config.get('reject_line_sigma', 3.0))
+        if reject_lined_rows:
+            if science_line_window_kms is None:
+                logger.warning("  ⚠ reject-lined-references set but no "
+                               "[reduction].line_window — per-row rejection will be skipped")
+            else:
+                logger.info(f"✓ Per-row line rejection ENABLED (base |MF/σ| > "
+                            f"{base_reject_sigma}); lined SKYCHOPDIFF rows dropped before fit")
+
         # Load mission-specific parameters from mission_id_parameters.yml
         mission_line_windows = {}
         try:
@@ -804,6 +1057,13 @@ def main_cli():
                 logger.info(f"  {mission_id}: n_components={eff_n_components} "
                             f"(per-mission YAML override; base {n_components})")
 
+            # Per-mission reject_line_sigma override (falls back to base when absent)
+            eff_reject_sigma = float(_resolve_mission_param(
+                mission_id, 'reject_line_sigma', mission_pca_params, base_reject_sigma))
+            if reject_lined_rows and eff_reject_sigma != base_reject_sigma:
+                logger.info(f"  {mission_id}: reject_line_sigma={eff_reject_sigma} "
+                            f"(per-mission YAML override; base {base_reject_sigma})")
+
             # Decompose with velocity axis and line masking if available
             result = decompose_mission_spectra(
                 mission_id,
@@ -813,8 +1073,12 @@ def main_cli():
                 n_components=eff_n_components,
                 velocity_axis=velocity_axis,
                 line_window_kms=mission_line_windows.get(mission_id),
+                science_line_window_kms=science_line_window_kms,
+                fit_exclude_window_kms=fit_exclude_window_kms,
                 spectrum_indices=spectrum_indices,
                 smoothing_kernel_size=pca_config.get('smoothing_kernel_size'),
+                reject_lined_rows=reject_lined_rows,
+                reject_line_sigma=eff_reject_sigma,
                 pca_source=pca_source,
             )
             

@@ -4160,6 +4160,20 @@ def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, obje
     help="Fill telluric line channels with Gaussian noise (default: off)"
 )
 @click.option(
+    "--baseline",
+    "baseline_order",
+    type=int,
+    default=None,
+    metavar="ORDER",
+    help="Subtract a polynomial baseline of this order from the science spectra "
+         "(OBJECT == the --object value) before writing. The order must be given "
+         "here on the command line — there is no default and it is NEVER read from "
+         "config.toml; omit the flag to skip baselining. The PCA reference "
+         "(--pca-source, e.g. SKYCHOPDIFF) and TSYS/TAU_SIG rows are left untouched. "
+         "The emission line is protected by iterative sigma-clipping (no line window "
+         "is read from config)."
+)
+@click.option(
     "--filter-missions",
     "filter_missions",
     is_flag=True,
@@ -4174,6 +4188,32 @@ def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, obje
     help="Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated."
 )
 @click.option(
+    "--filter-below",
+    "filter_below",
+    type=(str, float),
+    multiple=True,
+    metavar="COLUMN VALUE",
+    help="Keep spectra where COLUMN <= VALUE (drop the noisier ones above it), "
+         "same semantics as filter_fits --filter-below. Applies to science rows "
+         "(OBJECT contains --object) AND the PCA reference (--pca-source, e.g. "
+         "SKYCHOPDIFF) so noisy references can be dropped from the basis; TSYS and "
+         "TAU_SIG calibration rows are ALWAYS exempt. Rows with NaN in the column "
+         "always pass. RMSRATIO and RMSRATIOB fall back to each other if only one is "
+         "present. NOTE: SKYCHOPDIFF has NaN RMSRATIO (RMS_THEORETICAL=0), so a "
+         "RMSRATIO cut only affects science — use RMS to also cut noisy references. "
+         "Can be repeated. Example: --filter-below RMSRATIO 1.3"
+)
+@click.option(
+    "--filter-above",
+    "filter_above",
+    type=(str, float),
+    multiple=True,
+    metavar="COLUMN VALUE",
+    help="Keep spectra where COLUMN >= VALUE (mirror of --filter-below). "
+         "Same row scope (science + PCA reference; calibration exempt) and "
+         "NaN/fallback rules. Can be repeated."
+)
+@click.option(
     "--mission-parameters",
     "mission_parameters",
     type=click.Path(exists=True),
@@ -4183,7 +4223,10 @@ def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, obje
 def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional[str],
                    pca_source: Optional[str], object: Optional[str], mission_id: Optional[str],
                    scan: Optional[int], aor_id: Optional[str], fill_noise: bool,
-                   filter_missions: bool, filter_flight: tuple, mission_parameters: Optional[str]):
+                   baseline_order: Optional[int],
+                   filter_missions: bool, filter_flight: tuple,
+                   filter_below: tuple, filter_above: tuple,
+                   mission_parameters: Optional[str]):
     """
     Prepare FITS data for PCA analysis.
     
@@ -4232,7 +4275,10 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
             fill_noise=fill_noise,
             filter_missions=filter_missions,
             filter_flight=list(filter_flight) if filter_flight else None,
+            filter_below=list(filter_below) if filter_below else None,
+            filter_above=list(filter_above) if filter_above else None,
             mission_params_file=mission_parameters,
+            baseline_order=baseline_order,
         )
         
         click.echo("\n" + "="*70)
@@ -4277,6 +4323,10 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
                    'The line window from config [reduction].line_window is excluded from the fit. '
                    '"auto" also writes a BLORDER column and prints a per-flight order histogram. '
                    'If not given, no baseline is applied.')
+@click.option('--smooth', 'smooth_window', type=int, default=None, is_flag=False, flag_value=5,
+              help='Apply boxcar smoothing to science spectra (same kernel as reduce_spectra). '
+                   'Optional window size (default: 5). E.g. --smooth or --smooth 7. Applied after '
+                   '--baseline and before the RMS is measured, so the RMS reflects the smoothed spectra.')
 @click.option('--filter-flight', 'filter_flight', type=str, multiple=True,
               help='Remove all rows whose MISSION_ID contains this string (e.g. F528). Can be repeated.')
 @click.option('--aor-id', 'aor_id', type=str, default=None,
@@ -4286,16 +4336,30 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
                    '(same rules as prepare_for_pca --filter-missions).')
 @click.option('--mission-parameters', 'mission_parameters', type=click.Path(), default=None,
               help='Path to mission_id_parameters YAML. Overrides config [pca]/[input][mission_parameters].')
+@click.option('--whiteness-check', 'whiteness_check', is_flag=True, default=False,
+              help='Flag problematic spectra by an Allan-variance whiteness test: decimate the '
+                   'line-free baseline channels by a factor k and check that the RMS drops as √k '
+                   '(pure thermal noise) rather than slower (correlated baseline ripple/fringes/'
+                   'standing waves, which survive binning). Metric R = √k·σ_binned/σ_baseline is ~1 '
+                   'for good spectra, >1 for bad. Writes a WHITENESS column (R) and a WHITEFLAG '
+                   'column (1=bad, 0=good, -1=non-science), and prints how many spectra were flagged.')
+@click.option('--whiteness-bin', 'whiteness_bin', type=int, default=4, show_default=True, metavar='K',
+              help='Decimation factor k for the whiteness test.')
+@click.option('--whiteness-sigma', 'whiteness_sigma', type=float, default=3.0, show_default=True, metavar='Z',
+              help='Empirical cut: flag spectra with R > median(R) + Z·MAD(R) over all science '
+                   'spectra (data-adaptive, robust to any mild non-whiteness common to all spectra).')
 def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, output, refill_telluric,
-                          baseline_order, filter_flight, aor_id, filter_missions, mission_parameters):
+                          baseline_order, smooth_window, filter_flight, aor_id, filter_missions, mission_parameters,
+                          whiteness_check, whiteness_bin, whiteness_sigma):
     """
     Post-process spectra: optionally baseline-subtract, then compute per-spectrum RMS.
 
     Reads spectra from the PCA-corrected file (default) or an alternative dataset.
-    Optionally applies a polynomial baseline subtraction (--baseline N) to science
-    spectra, excluding the line window from the fit.  Then computes the noise RMS in
-    channels outside [reduction].line_window (km/s) from config.toml, and writes the
-    result as RMS / RMS_THEORETICAL / RMSRATIOB columns in the output FITS file.
+    Optionally applies a polynomial baseline subtraction (--baseline N) and/or boxcar
+    smoothing (--smooth [N]) to science spectra (baseline first, then smoothing, as in
+    reduce_spectra), excluding the line window from the baseline fit.  Then computes the
+    noise RMS in channels outside [reduction].line_window (km/s) from config.toml, and
+    writes the result as RMS / RMS_THEORETICAL / RMSRATIOB columns in the output FITS file.
 
     Input priority (first matching flag wins):
       --fits > --clean > --prepared > --reduced > --pcad (default)
@@ -4304,6 +4368,7 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         post_process_data --config config.toml
         post_process_data --config config.toml --pcad --baseline 3
         post_process_data --config config.toml --pcad --baseline auto
+        post_process_data --config config.toml --pcad --baseline 1 --smooth 5
         post_process_data --config config.toml --reduced
         post_process_data --config config.toml --output my_post.fits
 
@@ -4686,6 +4751,33 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                     if _nv >= 2:
                         rms_baseline_values[_i] = np.nanstd(_ch.astype(np.float64))
 
+        # --- Optional boxcar smoothing (after baseline, before RMS) ---
+        # Same kernel as reduce_spectra (_reduce_smooth → smooth_spectrum, a
+        # normalised boxcar via np.convolve). Applied to science rows only —
+        # TSYS / TAU_SIG / SKYCHOPDIFF calibration rows are left untouched, matching
+        # the --baseline block above. Runs before the RMS is measured so RMS /
+        # RMSRATIOB reflect the smoothed spectra.
+        if smooth_window is not None:
+            from .reduction.core import _reduce_smooth
+            NON_SCIENCE_SM = {'TSYS', 'TAU_SIG', 'SKYCHOPDIFF'}
+            if 'OBJECT' in data.dtype.names:
+                obj_strs_sm = np.array([
+                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
+                    for s in data['OBJECT']
+                ])
+                sci_sm_mask = np.array([o not in NON_SCIENCE_SM for o in obj_strs_sm])
+            else:
+                sci_sm_mask = np.ones(len(spectra), dtype=bool)
+            sci_sm_idx = np.where(sci_sm_mask)[0]
+            _CHUNK = 1000
+            for _start in range(0, len(sci_sm_idx), _CHUNK):
+                _idx = sci_sm_idx[_start:_start + _CHUNK]
+                spectra[_idx] = _reduce_smooth(spectra[_idx], window_size=smooth_window)
+            click.echo(f"Boxcar smoothing (window {smooth_window}) applied to "
+                       f"{len(sci_sm_idx)} science spectra")
+            # Write back so the output table and RMS below use the smoothed spectra.
+            data['SPECTRUM'][:] = spectra.astype(data['SPECTRUM'].dtype)
+
         # --- Measured RMS (fully vectorised) on the (possibly baselined) spectra ---
         # Theoretical (radiometer) RMS was already computed up-front, before the
         # baseline block, so --baseline auto could use it as its stopping target.
@@ -4810,6 +4902,60 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         sci_ratio  = rms_ratio[is_science_all]
         n_science  = int(np.sum(is_science_all))
 
+        # --- Whiteness (Allan-variance) quality check -------------------------
+        # White thermal noise averages down as sqrt(N) under binning; correlated
+        # baseline structure (ripple, standing waves, fringes, drifts) does not.
+        # Decimate the line-free baseline channels by a factor k and compare the
+        # RMS before/after: R = sqrt(k) * sigma_binned / sigma_baseline is ~1 for
+        # a white spectrum and > 1 for a spectrum with residual structure. The cut
+        # is EMPIRICAL: median(R) + z * MAD(R) over the science population, robust
+        # and self-calibrating against any mild non-whiteness common to all rows.
+        whiteness_R    = np.full(n_spectra, np.nan, dtype=np.float64)
+        whiteflag      = np.full(n_spectra, -1, dtype=np.int16)  # -1 non-science
+        n_white_bad    = 0
+        white_R_crit   = np.nan
+        white_lf       = None   # line-free baseline, kept for the sweep table
+        white_nbl      = 0
+        if whiteness_check:
+            k   = max(2, int(whiteness_bin))
+            nbl = int(np.sum(outside_mask))
+            lf  = spectra[:, outside_mask].astype(np.float64)     # post-refill baseline
+            white_lf, white_nbl = lf, nbl
+
+            def _whiteness_R_for_k(kk):
+                """R = sqrt(kk)*sigma_binned/sigma_baseline per spectrum, or None."""
+                mm = (lf.shape[1] // kk) * kk
+                if mm < kk or nbl < 2 * kk:
+                    return None
+                b = np.nanmean(lf[:, :mm].reshape(lf.shape[0], -1, kk), axis=2)
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    _s0 = np.nanstd(lf, axis=1)
+                    _sk = np.nanstd(b,  axis=1)
+                    return np.where(_s0 > 0, np.sqrt(kk) * _sk / _s0, np.nan)
+
+            m   = (lf.shape[1] // k) * k
+            if m >= k and nbl >= 2 * k:
+                R = _whiteness_R_for_k(k)
+                whiteness_R = R
+                # Empirical robust threshold over science spectra only.
+                Rsci = R[is_science_all]
+                Rsci = Rsci[np.isfinite(Rsci)]
+                if len(Rsci) >= 10:
+                    med = float(np.median(Rsci))
+                    mad = 1.4826 * float(np.median(np.abs(Rsci - med)))
+                    white_R_crit = med + whiteness_sigma * mad
+                    # Analytic white-null reference (for context only).
+                    r_analytic = 1.0 + whiteness_sigma * np.sqrt(k / (2.0 * nbl))
+                    bad = is_science_all & np.isfinite(R) & (R > white_R_crit)
+                    whiteflag[is_science_all & np.isfinite(R)] = 0
+                    whiteflag[bad] = 1
+                    n_white_bad = int(np.sum(bad))
+                else:
+                    click.echo("  [whiteness] too few valid science spectra (<10); skipping cut")
+            else:
+                click.echo(f"  [whiteness] not enough line-free channels "
+                           f"(nbl={nbl}, k={k}); skipping")
+
         sep = "─" * 60
         click.echo(f"\n{sep}")
         click.echo(f"  Post-process summary  ({n_valid_rms}/{n_spectra} spectra computed, {n_science} science rows)")
@@ -4849,6 +4995,58 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         n_above = int(np.sum(valid_ratio > thresholds[-1]))
         click.echo(f"    >  {thresholds[-1]:.1f} : {n_above:6d} spectra")
 
+        if whiteness_check and np.isfinite(white_R_crit):
+            k   = max(2, int(whiteness_bin))
+            nbl = int(np.sum(outside_mask))
+            _row("WHITENESS R", whiteness_R[is_science_all])
+            r_analytic = 1.0 + whiteness_sigma * np.sqrt(k / (2.0 * nbl))
+            click.echo(
+                f"\n  Whiteness test (bin k={k}, {nbl} line-free channels):"
+                f"\n    R_crit (empirical, med + {whiteness_sigma:g}·MAD) = {white_R_crit:.4f}"
+                f"\n    R_crit (analytic white-null, ref only)     = {r_analytic:.4f}"
+            )
+
+            # --- Sensitivity sweep: how the flagged fraction moves with the two
+            #     knobs, so the tradeoff is visible without a manual re-run. ---
+            def _flagged(Rarr, z):
+                rs = Rarr[is_science_all]; rs = rs[np.isfinite(rs)]
+                if len(rs) < 10:
+                    return None, np.nan, 0
+                md = float(np.median(rs))
+                m9 = 1.4826 * float(np.median(np.abs(rs - md)))
+                crit = md + z * m9
+                nb = int(np.sum(rs > crit))
+                return len(rs), crit, nb
+
+            # Z-sweep at the current k (reuses the already-computed R).
+            click.echo(f"\n  Strictness vs --whiteness-sigma  (current k={k}, ★ = current z={whiteness_sigma:g}):")
+            click.echo(f"    {'z':>4}  {'R_crit':>8}  {'flagged':>8}  {'pct':>6}")
+            for z in [1.5, 2.0, 2.5, 3.0, 3.5, 4.0]:
+                nsci, crit, nb = _flagged(whiteness_R, z)
+                if nsci is None:
+                    continue
+                star = " ★" if abs(z - whiteness_sigma) < 1e-9 else ""
+                click.echo(f"    {z:>4.1f}  {crit:>8.4f}  {nb:>8d}  {100.0*nb/nsci:>5.1f}%{star}")
+
+            # k-sweep at the current z (recomputes R per k; keep N_bl/k >= 8).
+            click.echo(f"\n  Timescale vs --whiteness-bin  (current z={whiteness_sigma:g}, ★ = current k={k}):")
+            click.echo(f"    {'k':>4}  {'N_bl/k':>7}  {'R_crit':>8}  {'flagged':>8}  {'pct':>6}")
+            for kk in [2, 4, 8, 16, 32]:
+                if white_nbl < 2 * kk or (white_lf.shape[1] // kk) < 1:
+                    continue
+                Rk = _whiteness_R_for_k(kk)
+                if Rk is None:
+                    continue
+                nsci, crit, nb = _flagged(Rk, whiteness_sigma)
+                if nsci is None:
+                    continue
+                ratio = white_nbl / kk
+                warn  = " (low)" if ratio < 8 else ""
+                star  = " ★" if kk == k else ""
+                click.echo(f"    {kk:>4d}  {ratio:>7.1f}  {crit:>8.4f}  {nb:>8d}  "
+                           f"{100.0*nb/nsci:>5.1f}%{warn}{star}")
+            click.echo("    (N_bl/k < 8 → R gets noisy per-spectrum; treat those rows as indicative)")
+
         click.echo(sep)
 
         # --- Build output table: same columns as input, add/replace columns ---
@@ -4856,6 +5054,20 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         table['RMS']             = rms_measured
         table['RMS_THEORETICAL'] = rms_theoretical
         table['RMSRATIOB']       = rms_ratio    # ratio of measured RMS to theoretical radiometer RMS
+
+        if whiteness_check:
+            w_name = 'WHITENESS'
+            _wi = 2
+            while w_name in table.colnames:
+                w_name = f'WHITENESS_{_wi}'; _wi += 1
+            table[w_name] = whiteness_R.astype(np.float32)
+            wf_name = 'WHITEFLAG'
+            _wi = 2
+            while wf_name in table.colnames:
+                wf_name = f'WHITEFLAG_{_wi}'; _wi += 1
+            table[wf_name] = whiteflag
+            click.echo(f"  Written {w_name}: Allan whiteness ratio R (NaN where not computable)")
+            click.echo(f"  Written {wf_name}: whiteness flag (1=bad, 0=good, -1=non-science)")
 
         if baseline_auto or baseline_order is not None:
             col_name = 'RMS_BASELINE'
@@ -4935,6 +5147,21 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         fits.HDUList([primary, new_hdu]).writeto(output, overwrite=True)
         click.echo(f"\n✓ Written: {output}")
 
+        if whiteness_check:
+            if np.isfinite(white_R_crit):
+                pct = 100.0 * n_white_bad / n_science if n_science > 0 else 0.0
+                click.echo(sep)
+                click.echo(click.style(
+                    f"  WHITENESS: {n_white_bad}/{n_science} science spectra "
+                    f"({pct:.1f}%) identified as BAD",
+                    fg=('yellow' if n_white_bad else 'green'), bold=True))
+                click.echo(f"    (R > R_crit = {white_R_crit:.4f}, "
+                           f"bin k={max(2, int(whiteness_bin))}, "
+                           f"z={whiteness_sigma:g}·MAD)")
+                click.echo(sep)
+            else:
+                click.echo("  WHITENESS: no cut applied (see note above)")
+
         hdul.close()
 
     except FileNotFoundError as e:
@@ -4997,11 +5224,11 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                   'Classic: jet, rainbow, gray. '
                   'Append "_r" to any name to reverse it (e.g. viridis_r).'
               ))
-@click.option('--coverage-threshold', type=float, default=0.3, show_default=True,
+@click.option('--coverage-threshold', type=float, default=0.0, show_default=True,
               help='Mask edge pixels whose gridding coverage (kernel weight sum) is below this '
                    'fraction of the peak coverage in the map. Requires a COVERAGE extension in '
                    'the cube FITS file (written automatically by create_datacube). '
-                   '0 = no coverage masking.')
+                   'Default 0 = no coverage masking (show the entire map).')
 @click.option('--mask-ra', type=str, default=None,
               help='RA centre of circular display mask (hh:mm:ss or degrees). '
                    'Defaults to map centre when --mask-radius is given without this option.')
@@ -5098,14 +5325,18 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
               help='Percentile range for the colour scale (default: 0 100, full data range). '
                    'Example: --percentile-clip 2 98 to clip outliers.')
 @click.option('--snr-threshold', type=float, default=None, metavar='N',
-              help='Mask pixels whose integrated intensity SNR is below N. '
+              help='Mask pixels whose integrated intensity SNR is below N: they are '
+                   'shown as 0 (the zero colour), like --suppress-negative does for '
+                   'negatives, and are excluded from the mean-spectrum panel. '
                    'Requires --velocity-range to compute the noise map from line-free channels.')
 @click.option('--drop-rms', type=float, default=None, metavar='LIMIT',
-              help='Drop (blank) pixels whose per-pixel spectral RMS exceeds LIMIT (K). '
-                   'The RMS is measured on the already-gridded/convolved cube over the '
-                   'velocity window given by --drop-window (default: the line-free channels '
-                   'outside --velocity-range). Use it to remove noisy edge/outlier spaxels '
-                   'that a fixed SNR cut leaves in. Example: --drop-rms 1.5 --drop-window 0 400.')
+              help='Drop pixels whose per-pixel spectral RMS exceeds LIMIT (K): they are '
+                   'shown as 0 (the zero colour), like --snr-threshold, and excluded from '
+                   'the mean-spectrum panel. The RMS is measured on the already-gridded/'
+                   'convolved cube over the velocity window given by --drop-window (default: '
+                   'the line-free channels outside --velocity-range). Use it to remove noisy '
+                   'edge/outlier spaxels that a fixed SNR cut leaves in. '
+                   'Example: --drop-rms 1.5 --drop-window 0 400.')
 @click.option('--drop-window', type=(float, float), default=None, nargs=2,
               metavar='VMIN VMAX',
               help='Velocity window (km/s) over which --drop-rms measures the per-pixel RMS, '
@@ -5287,6 +5518,172 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             plt.show()
         plt.close()
 
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(click.style(f"Error: {e}", fg='red'), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg='red'), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.option('--fits', 'cube_files', required=False, multiple=True,
+              type=click.Path(),
+              help='Gridded FITS datacube(s) to collapse and compare. Repeat the flag, '
+                   'pass several paths, or use shell globs: --fits a.fits b.fits, '
+                   '--fits a.fits --fits b.fits, or --fits *_center_*.fits '
+                   '(quote a pattern to expand it here: --fits "*_center_*.fits").')
+@click.argument('extra_cube_files', nargs=-1, type=click.Path())
+@click.option('--velocity-range', type=(float, float), default=None, nargs=2,
+              help='Integration range in km/s (e.g. --velocity-range 450 500). '
+                   'Applied to every cube. Required with --shuffle.')
+@click.option('--mode', default='moment0', show_default=True,
+              type=click.Choice(['moment0', 'peak-intensity'], case_sensitive=False),
+              help='Collapse mode for every cube. moment0: integrated intensity (K km/s). '
+                   'peak-intensity: brightest channel in the window (K). Overridden by --peak-range-int.')
+@click.option('--peak-range-int', 'peak_range_channels',
+              is_flag=False, flag_value=5, default=None, type=int, metavar='N',
+              help='Integrate N channels either side of each pixel peak (2N+1 window) -> K km/s. '
+                   'Without a number, N=5. Overrides --mode.')
+@click.option('--peak-smooth', 'peak_smooth_channels', type=float, default=None, metavar='SIGMA',
+              help='For peak modes: locate the peak on a spectrum Gaussian-smoothed by SIGMA channels, '
+                   'read the RAW cube there (crushes 1-2 channel telluric spikes). Try SIGMA ~1-2.')
+@click.option('--shuffle', is_flag=True, default=False,
+              help='Velocity-field shuffle before collapse: align each pixel line to a common '
+                   'reference velocity, then integrate a narrow window (faint structure survives). '
+                   'Requires --velocity-range. Applied per cube independently.')
+@click.option('--shuffle-snr', type=float, default=5.0, show_default=True, metavar='SNR',
+              help='S/N floor for pixels contributing to the shuffle velocity field.')
+@click.option('--shuffle-field-smooth', type=float, default=6.0, show_default=True, metavar='PIX',
+              help='Gaussian sigma (pixels) to smooth/gap-fill the shuffle velocity field.')
+@click.option('--shuffle-window', 'shuffle_window_kms', type=float, default=20.0, show_default=True,
+              metavar='KMS', help='Half-width (km/s) of the aligned integration window after shuffling.')
+@click.option('--shuffle-ref-velocity', type=float, default=None, metavar='KMS',
+              help='Common velocity (km/s) lines are aligned to. Default: per-cube median field. '
+                   'Pin it (e.g. 476.5) for cube-to-cube comparability.')
+@click.option('--coverage-threshold', type=float, default=0.0, show_default=True,
+              help='Mask pixels below this fraction of peak gridding coverage (needs a COVERAGE '
+                   'extension). Default 0 = no coverage masking (show the entire map).')
+@click.option('--trim-edges', 'trim_edges', default=None,
+              help='Peel a border off each cube coverage footprint (erosion, not a crop). '
+                   'Bare number / "N%" = N% of the smaller axis; unit suffix (30arcsec, 0.5arcmin) = angular.')
+@click.option('--suppress-negative', is_flag=True, default=False,
+              help='Clip negative (noise) pixels to 0 and force vmin=0 (moment0 only).')
+@click.option('--suppress-high', type=float, default=None, metavar='VALUE',
+              help='Clip pixels above VALUE to VALUE (tame bright artefacts).')
+@click.option('--smooth', 'smooth_sigma', type=float, default=None, metavar='SIGMA',
+              help='Gaussian-smooth each display map by SIGMA pixels before plotting.')
+@click.option('--use-wcs', is_flag=True, default=False,
+              help='Show each panel in RA/Dec (WCS) instead of pixel indices.')
+@click.option('--colormap', default='rainbow', show_default=True,
+              help='Matplotlib colormap for all panels (append "_r" to reverse).')
+@click.option('--stretch', default='sqrt', show_default=True,
+              type=click.Choice(['linear', 'sqrt', 'power', 'asinh', 'symlog', 'log'],
+                                 case_sensitive=False),
+              help='Colour stretch shared by all panels. sqrt/asinh/symlog lift faint detail.')
+@click.option('--gamma', type=float, default=1.0, show_default=True,
+              help='Exponent for --stretch power (gamma<1 lifts faint, >1 emphasises peaks).')
+@click.option('--percentile-clip', type=(float, float), default=None, nargs=2, metavar='LO HI',
+              help='Percentile range for the colour scale (e.g. 2 98). Pooled across cubes for the shared scale.')
+@click.option('--per-panel-scale', is_flag=True, default=False,
+              help='Scale each panel to its OWN range (default: one shared scale + colorbar so '
+                   'brightness is directly comparable between cubes).')
+@click.option('--titles', default=None,
+              help='Comma-separated panel titles, in file order (default: each file stem).')
+@click.option('--output', '--plot', 'plot_output', type=click.Path(), default=None,
+              help='Save the comparison figure to this path (PNG).')
+@click.option('--no-show', is_flag=True, default=False,
+              help='Do not open an interactive window (just save/return).')
+def compare_maps_cmd(cube_files, extra_cube_files, velocity_range, mode, peak_range_channels,
+                     peak_smooth_channels, shuffle, shuffle_snr, shuffle_field_smooth,
+                     shuffle_window_kms, shuffle_ref_velocity, coverage_threshold,
+                     trim_edges, suppress_negative, suppress_high, smooth_sigma,
+                     use_wcs, colormap, stretch, gamma, percentile_clip,
+                     per_panel_scale, titles, plot_output, no_show):
+    """
+    Collapse several gridded datacubes and draw their maps side by side.
+
+    A lightweight, multi-cube companion to collapse_cube: it reuses the same
+    collapse machinery (velocity range, peak / peak-range / moment0, --shuffle,
+    coverage/edge-trim masks, --suppress-*, --smooth) but drops the interactive
+    single-cube panels. The grid size is chosen from the number of cubes, and by
+    default all panels share one colour scale + colorbar so map depth is directly
+    comparable.
+
+    Examples:
+
+        compare_maps --fits pca.fits --fits nonpca.fits --velocity-range 350 540 \\
+            --suppress-negative --stretch sqrt --peak-range-int 20 --output cmp.png
+
+        compare_maps --fits a.fits b.fits c.fits --shuffle --velocity-range 400 560 \\
+            --shuffle-ref-velocity 476.5 --shuffle-window 50 --trim-edges 3% --use-wcs
+
+        compare_maps --fits *_center_*.fits --velocity-range 350 540 --peak-range-int 20
+    """
+    try:
+        import os
+        import glob as _glob
+        from oi_zeigt.mapping.gridding import compare_maps
+
+        # Collect cubes from --fits values, extra positional paths, and any
+        # (quoted) shell globs, then expand/dedupe/validate.
+        raw_paths = list(cube_files) + list(extra_cube_files)
+        expanded = []
+        for pat in raw_paths:
+            hits = sorted(_glob.glob(pat))
+            expanded.extend(hits if hits else [pat])   # keep literal if no match
+        seen = set()
+        cube_files = []
+        for f in expanded:
+            if f not in seen:
+                seen.add(f)
+                cube_files.append(f)
+
+        if not cube_files:
+            raise ValueError(
+                "No FITS cubes given. Pass paths via --fits (e.g. --fits *_center_*.fits).")
+        missing = [f for f in cube_files if not os.path.isfile(f)]
+        if missing:
+            raise FileNotFoundError("FITS file(s) not found: " + ", ".join(missing))
+
+        title_list = [t.strip() for t in titles.split(',')] if titles else None
+        eff_mode = 'peak-range-int' if peak_range_channels is not None else mode
+
+        click.echo(f"Comparing {len(cube_files)} cube(s) [{eff_mode}]:")
+        for f in cube_files:
+            click.echo(f"  - {f}")
+
+        compare_maps(
+            cube_files=cube_files,
+            plot_output=plot_output,
+            titles=title_list,
+            use_wcs=use_wcs,
+            colormap=colormap,
+            stretch=stretch,
+            gamma=gamma,
+            percentile_clip=percentile_clip,
+            per_panel_scale=per_panel_scale,
+            show=not no_show,
+            # forwarded to collapse_cube_to_map:
+            velocity_range=velocity_range,
+            mode=eff_mode,
+            peak_range_channels=peak_range_channels if peak_range_channels is not None else 5,
+            peak_smooth_channels=peak_smooth_channels,
+            shuffle=shuffle,
+            shuffle_snr=shuffle_snr,
+            shuffle_field_smooth=shuffle_field_smooth,
+            shuffle_window_kms=shuffle_window_kms,
+            shuffle_ref_velocity=shuffle_ref_velocity,
+            coverage_threshold=coverage_threshold,
+            trim_edges=trim_edges,
+            suppress_negative=suppress_negative,
+            suppress_high=suppress_high,
+            smooth_sigma=smooth_sigma,
+        )
+        click.echo(f"\n✓ Comparison of {len(cube_files)} cube(s) done")
+        plt.close('all')
     except (FileNotFoundError, ValueError) as e:
         click.echo(click.style(f"Error: {e}", fg='red'), err=True)
         sys.exit(1)

@@ -259,7 +259,10 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             fill_noise: bool = False,
                             filter_missions: bool = False,
                             filter_flight: Optional[list] = None,
-                            mission_params_file: Optional[Union[str, Path]] = None) -> None:
+                            filter_below: Optional[list] = None,
+                            filter_above: Optional[list] = None,
+                            mission_params_file: Optional[Union[str, Path]] = None,
+                            baseline_order: Optional[int] = None) -> None:
     """
     Filter FITS file and optionally fill telluric lines with Gaussian noise.
 
@@ -450,6 +453,63 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                 logger.info(f"Mission drop rules: removed {n_before_drop - n_after_drop} rows "
                             f"({n_before_drop} → {n_after_drop})")
 
+        # --- Parameter-value filters on the science + PCA-reference spectra -----
+        # Mirrors filter_fits' --filter-below / --filter-above (implemented by
+        # filter_and_save_fits._apply_param_filters): keep rows where COLUMN <= VALUE
+        # (below) or COLUMN >= VALUE (above). A row with a non-finite value in COLUMN
+        # always passes.
+        #
+        # SCOPE: the cut applies to the science rows (OBJECT contains object_filter)
+        # AND the PCA reference rows (pca_source, e.g. SKYCHOPDIFF) — a noisy
+        # reference pollutes the PCA basis, so it should be droppable too. TSYS and
+        # TAU_SIG calibration rows are ALWAYS exempt: their RMS/RMSRATIO live on a
+        # totally different scale (TSYS RMSRATIOB ~ hundreds) and a naive cut would
+        # wipe out the calibration set.
+        #
+        # NB on columns: SKYCHOPDIFF has RMS_THEORETICAL = 0, so its RMSRATIO/RMSRATIOB
+        # is NaN and a `--filter-below RMSRATIO 1.3` is a no-op on the reference (NaN
+        # passes) — it only cuts science. To actually drop noisy references, filter on
+        # a column that is finite for them, e.g. `--filter-below RMS <value>`.
+        # As a convenience (and unlike the raise in filter_fits) RMSRATIO<->RMSRATIOB
+        # fall back to each other, because the noise-filtered nopca inputs this
+        # pipeline consumes carry RMSRATIOB while other products carry RMSRATIO.
+        param_value_filters = ([(c, 'below', v) for (c, v) in (filter_below or [])] +
+                               [(c, 'above', v) for (c, v) in (filter_above or [])])
+        if param_value_filters:
+            # Everything that is not calibration is subject to the cut.
+            filterable_mask = (objects != 'TSYS') & (objects != 'TAU_SIG')
+            for col, direction, value in param_value_filters:
+                use_col = col
+                if use_col not in data.dtype.names:
+                    alt = {'RMSRATIO': 'RMSRATIOB', 'RMSRATIOB': 'RMSRATIO'}.get(col)
+                    if alt and alt in data.dtype.names:
+                        logger.warning(f"  Filter column '{col}' not found — "
+                                       f"falling back to '{alt}'")
+                        use_col = alt
+                    else:
+                        raise ValueError(f"Filter column '{col}' not found in FITS data")
+                col_vals = np.asarray(data[use_col], dtype=np.float64)
+                finite = np.isfinite(col_vals)
+                if direction == 'below':
+                    cond = (~finite) | (col_vals <= value)
+                else:
+                    cond = (~finite) | (col_vals >= value)
+                # Non-calibration rows are subject to the cut; calibration rows
+                # always pass (cond OR not-filterable).
+                subject = combined_mask & filterable_mask
+                sci = subject & np.array([object_filter in o for o in objects])
+                ref = subject & (objects == pca_source)
+                n_before = int(np.sum(combined_mask))
+                removed = int(np.sum(subject & ~cond))
+                removed_sci = int(np.sum(sci & ~cond))
+                removed_ref = int(np.sum(ref & ~cond))
+                combined_mask = combined_mask & (cond | ~filterable_mask)
+                op = '<=' if direction == 'below' else '>='
+                logger.info(f"Parameter filter: keep {use_col} {op} {value} "
+                            f"(science + {pca_source}; TSYS/TAU_SIG exempt) — removed "
+                            f"{removed} rows [{removed_sci} science, {removed_ref} {pca_source}] "
+                            f"({n_before} → {int(np.sum(combined_mask))} rows)")
+
         n_original = len(data)
         n_filtered = np.sum(combined_mask)
         n_tsys = np.sum(objects[combined_mask] == 'TSYS')
@@ -519,19 +579,51 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
             logger.info(f"Filled telluric lines in {n_filled} spectra")
         else:
             logger.info("Skipping telluric noise filling (--fill-telluric-with-noise not set)")
-        
+
+        # --- Optional polynomial baseline subtraction on the science spectra ---
+        # The order is supplied EXCLUSIVELY on the command line (--baseline N):
+        # there is no default and nothing is read from config.toml — when
+        # baseline_order is None this step is skipped entirely. Only science
+        # rows (OBJECT == object_filter) are baselined; TSYS/TAU_SIG and the
+        # PCA reference (pca_source, e.g. SKYCHOPDIFF) are left untouched — the
+        # reference is separately baselined inside pca_decompose. The emission
+        # line is protected by baseline_subtract's iterative sigma-clipping
+        # (no fixed line window is used here, by design — see --baseline docs).
+        if baseline_order is not None:
+            from oi_zeigt.reduction.core import baseline_subtract
+            order = int(baseline_order)
+            spectra_bl = np.array(filtered_data['SPECTRUM'], dtype=np.float64)
+            is_science = np.array([obj not in ('TSYS', 'TAU_SIG')
+                                   and obj != pca_source
+                                   for obj in filtered_objects])
+            for i in np.where(is_science)[0]:
+                spectra_bl[i] = baseline_subtract(spectra_bl[i], order=order)
+            filtered_data['SPECTRUM'][:] = spectra_bl.astype(filtered_data['SPECTRUM'].dtype)
+            logger.info(f"Baseline-subtracted (order {order}) {int(np.sum(is_science))} science "
+                        f"spectra [CLI --baseline; line protected via sigma-clipping]")
+        else:
+            logger.info("Skipping baseline subtraction (--baseline not set)")
+
         # Create index columns for linking science spectra to TSYS and TAU_SIG
         logger.info("Creating TSYS and TAU_SIG index columns...")
         tsys_indices, tau_sig_indices = build_tau_tsys_indices(filtered_data, object_filter)
         
         # Add the index columns to filtered_data by extending the table
-        # Build column list from filtered data arrays
+        # Build column list from filtered data arrays. Skip any pre-existing
+        # TSYS_INDEX / TAU_SIG_INDEX columns: inputs that already went through
+        # filter_fits --filter-tau (e.g. the nopca post_cleaned files this
+        # pipeline consumes) carry these columns already, and re-appending them
+        # below would create duplicate names ("name already used as a name or
+        # title"). We recompute them fresh here, so drop the old copies.
+        _index_cols = {'TSYS_INDEX', 'TAU_SIG_INDEX'}
         col_list = []
         for name in filtered_data.columns.names:
+            if name in _index_cols:
+                continue
             col_array = filtered_data[name]  # Get sliced data
             col_format = filtered_data.columns[name].format
             col_list.append(fits.Column(name=name, format=col_format, array=col_array))
-        
+
         # Add TSYS_INDEX and TAU_SIG_INDEX columns as simple int32 arrays
         col_list.append(fits.Column(name='TSYS_INDEX', format='J', array=tsys_indices.astype(np.int32)))
         col_list.append(fits.Column(name='TAU_SIG_INDEX', format='J', array=tau_sig_indices.astype(np.int32)))
@@ -574,7 +666,10 @@ def prepare_for_pca(fits_file: Optional[str] = None,
                    fill_noise: bool = False,
                    filter_missions: bool = False,
                    filter_flight: Optional[list] = None,
-                   mission_params_file: Optional[str] = None) -> None:
+                   filter_below: Optional[list] = None,
+                   filter_above: Optional[list] = None,
+                   mission_params_file: Optional[str] = None,
+                   baseline_order: Optional[int] = None) -> None:
     """
     Main entry point for prepare_for_pca functionality.
     
@@ -677,4 +772,6 @@ def prepare_for_pca(fits_file: Optional[str] = None,
                             mission_id=mission_id, scan=scan, aor_id=aor_id,
                             fill_noise=fill_noise, filter_missions=filter_missions,
                             filter_flight=filter_flight,
-                            mission_params_file=mission_params_file)
+                            filter_below=filter_below, filter_above=filter_above,
+                            mission_params_file=mission_params_file,
+                            baseline_order=baseline_order)

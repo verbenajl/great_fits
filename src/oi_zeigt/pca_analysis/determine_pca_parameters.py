@@ -160,16 +160,19 @@ def _keep(name, only, exclude):
     return True
 
 
-def run_decompositions(reduced_dir, config, n_components, verbose, only, exclude):
-    """Re-run pca_decompose for every reduced_data_*.fits in reduced_dir.
+def run_decompositions(reduced_dir, config, n_components, verbose, only, exclude,
+                       file_glob="reduced_data_*.fits"):
+    """Re-run pca_decompose for every input FITS in reduced_dir.
 
+    file_glob selects which files to feed (default reduced_data_*.fits); pass e.g.
+    "post_cleaned_nopca_*.fits" to score already post-processed/filtered inputs.
     Returns the wall-clock start time so the caller can restrict scoring to the
     pickles this run (re)wrote.
     """
-    files = sorted(glob.glob(os.path.join(reduced_dir, "reduced_data_*.fits")))
+    files = sorted(glob.glob(os.path.join(reduced_dir, file_glob)))
     files = [f for f in files if _keep(os.path.basename(f), only, exclude)]
     if not files:
-        sys.exit(f"No reduced_data_*.fits found in {reduced_dir}"
+        sys.exit(f"No {file_glob} found in {reduced_dir}"
                  + (" matching --only/--exclude" if (only or exclude) else ""))
     exe = shutil.which("pca_decompose")
     base = [exe] if exe else [sys.executable, "-m",
@@ -261,11 +264,16 @@ def _set_key(body, key, value, comment=None):
         body.append(line)
 
 
-def merge_into_yaml(path, results, gates):
+def merge_into_yaml(path, results, gates, n_components_only=False):
     """In-place update of n_components + gate keys for scored flights.
 
     Preserves all comments and any flights not in `results`. Existing flights are
-    updated key-by-key; flights not present are appended as a new block.
+    updated key-by-key; flights not present are appended as a new block. When
+    `n_components_only` is True, only the n_components line is touched and every
+    existing gate key (and its hand-tuned value/comment) is left untouched — use
+    this to refresh coherence-derived n_components without disturbing gates that
+    were tuned by hand or that the gate-override flags can't express (e.g. a
+    float line_cutoff_std).
     """
     text = Path(path).read_text()
     lines = text.split("\n")
@@ -278,8 +286,9 @@ def merge_into_yaml(path, results, gates):
         nc, comment = results[name]
         body = lines[bs:be]
         _set_key(body, "n_components", nc, comment)
-        for k in GATE_ORDER:
-            _set_key(body, k, gates[k])
+        if not n_components_only:
+            for k in GATE_ORDER:
+                _set_key(body, k, gates[k])
         lines[bs:be] = body
     # Append flights not already in the file.
     for name, (nc, comment) in results.items():
@@ -287,7 +296,8 @@ def merge_into_yaml(path, results, gates):
             continue
         block = [f"{name}:", f"  n_components: {_fmt(nc)}"
                  + (f"           # {comment}" if comment else "")]
-        block += [f"  {k}: {_fmt(gates[k])}" for k in GATE_ORDER]
+        if not n_components_only:
+            block += [f"  {k}: {_fmt(gates[k])}" for k in GATE_ORDER]
         if lines and lines[-1].strip() != "":
             lines.append("")
         lines.extend(block)
@@ -307,7 +317,11 @@ def main_cli():
         epilog=__doc__,
     )
     parser.add_argument("--dir", required=True,
-                        help="Directory containing reduced_data_*.fits")
+                        help="Directory containing the input FITS (see --file-glob)")
+    parser.add_argument("--file-glob", default="reduced_data_*.fits", dest="file_glob",
+                        help="Filename glob selecting inputs inside --dir. Default: "
+                             "reduced_data_*.fits. Use e.g. 'post_cleaned_nopca_*.fits' "
+                             "to score already post-processed/filtered data.")
     parser.add_argument("--config", default="config.toml",
                         help="config.toml (for pca_source, smoothing, components_dir, "
                              "mission_pca_parameters). Default: config.toml")
@@ -337,6 +351,11 @@ def main_cli():
     parser.add_argument("--params-file", default=None, dest="params_file",
                         help="Params yaml to update with --write "
                              "(default: config [input][mission_pca_parameters])")
+    parser.add_argument("--n-components-only", action="store_true",
+                        dest="n_components_only",
+                        help="With --write, update ONLY the n_components line for each "
+                             "scored flight and leave every existing gate key untouched "
+                             "(preserves hand-tuned gates/comments).")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Stream pca_decompose output instead of capturing it")
     # Gate overrides (defaults = the standard tuned block)
@@ -379,7 +398,8 @@ def main_cli():
         t0 = 0.0
     else:
         t0 = run_decompositions(reduced_dir, args.config, args.n_components,
-                                args.verbose, args.only, args.exclude)
+                                args.verbose, args.only, args.exclude,
+                                file_glob=args.file_glob)
     missions = discover_fresh_missions(components_dir, t0)
     missions = [m for m in missions if _keep(m, args.only, args.exclude)]
     if not missions:
@@ -405,7 +425,7 @@ def main_cli():
         if not params_file:
             sys.exit("--write: no params file (set --params-file or config "
                      "[input][mission_pca_parameters])")
-        merge_into_yaml(params_file, results, gates)
+        merge_into_yaml(params_file, results, gates, n_components_only=args.n_components_only)
 
 
 if __name__ == "__main__":

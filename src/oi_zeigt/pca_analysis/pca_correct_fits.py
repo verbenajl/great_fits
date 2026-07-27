@@ -313,7 +313,12 @@ def load_mission_pca_parameters(yaml_path):
     Returns a dict mapping mission_id keys to dicts of correction parameters.
     Supported keys per mission: global_noise_ratio_cutoff, noise_ratio_cutoff,
     cutoff_variance (alias variance_cutoff), cut_coefficients, line_kernel_size,
-    line_cutoff_std, least_squares.
+    line_cutoff_std, least_squares, skip_correction (alias passthrough).
+
+    skip_correction: true  → the mission is NOT PCA-corrected; its spectra pass
+    through to the output verbatim (the output still carries the "corrected"
+    name). Use for flights whose PCA reference (e.g. SKYCHOPDIFF) is contaminated
+    so correction does more harm than good.
     """
     import yaml
     path = Path(yaml_path)
@@ -917,6 +922,7 @@ class PCACorrector:
                  line_kernel_size=51, line_cutoff_std=2.0,
                  smoothing_kernel_size=None, line_window_velocities=None,
                  use_lstsq=True, force_line_window=False,
+                 protect_line_in_subtraction=False,
                  mission_params_file=None):
         """
         Initialize PCA corrector with decomposition results.
@@ -938,6 +944,13 @@ class PCACorrector:
         force_line_window : bool
             If True and detection finds nothing, mask the configured velocity
             window directly (hard fallback). Default: False.
+        protect_line_in_subtraction : bool
+            If True, detected line channels are excluded from the correction's
+            SUBTRACTION too (gcs), not just from the coefficient fit (gcf) — the
+            same treatment telluric already gets. Where a line is detected the
+            correction is skipped over those channels, so a line-shaped component
+            can't be subtracted into the [CII] line. Default: False (line channels
+            are still corrected, to remove instrumental artifacts under the line).
         """
         self.config = config or {}
         self.line_kernel_size = line_kernel_size
@@ -946,6 +959,7 @@ class PCACorrector:
         self.line_window_velocities = line_window_velocities
         self.use_lstsq = use_lstsq
         self.force_line_window = force_line_window
+        self.protect_line_in_subtraction = protect_line_in_subtraction
         self.mission_params_file = mission_params_file
         
         self.decomposition = self._load_decomposition(decomposition_pkl)
@@ -1746,7 +1760,30 @@ class PCACorrector:
             if generate_plots:
                 logger.info(f"  Will generate {len(unique_groups_for_plotting)} plots (one per mission/telescope/scan)")
             logger.info(f"  Total spectra to process: {len(indices)}")
-            
+
+            # --- Per-mission skip (pass-through) --------------------------------
+            # Missions flagged `skip_correction: true` (alias `passthrough: true`)
+            # in the per-mission YAML are NOT PCA-corrected: their spectra are
+            # written to the output verbatim. They stay in `indices` so they still
+            # appear in the (AOR-/mission-)filtered output — the output file keeps
+            # its "corrected" name by design; only the SPECTRUM values are left
+            # untouched. Enforced just before the corrected spectra are written back
+            # (`skip_indices` reset there), so it is robust to every correction path.
+            skip_indices = np.array([], dtype=int)
+            if mission_pca_params is not None and len(indices) > 0:
+                _skip_row = np.array([
+                    bool(_resolve_mission_param(
+                            mid, 'skip_correction', mission_pca_params,
+                            _resolve_mission_param(mid, 'passthrough', mission_pca_params, False)))
+                    for mid in mission_ids
+                ])
+                if _skip_row.any():
+                    skip_indices = indices[_skip_row]
+                    for mid in sorted(set(mission_ids[_skip_row].tolist())):
+                        logger.info(
+                            f"  ⏭  SKIP correction for {mid}: {int(np.sum(mission_ids == mid))} "
+                            f"spectra passed through UNCORRECTED (skip_correction in per-mission YAML)")
+
             # Load telluric line mask from mission parameters (per-mission)
             telluric_line_mask = None
             if velocity_axis_kms is not None:
@@ -2291,8 +2328,13 @@ class PCACorrector:
                     if detected_lines_mask is not None and np.any(detected_lines_mask):
                         line_regions = detected_lines_mask[spec_idx]
                         gcf = gcf & ~line_regions
-                        # gcs NOT modified: line channels are still corrected (artifact removed),
-                        # only excluded from fitting so line emission doesn't bias the projection.
+                        # gcs modified ONLY when protect_line_in_subtraction is set:
+                        # then detected line channels are also skipped in the subtraction
+                        # (like telluric below), so a line-shaped component can't be
+                        # subtracted into the [CII] line. Default keeps line channels
+                        # corrected (artifact removed), only excluded from the coeff fit.
+                        if self.protect_line_in_subtraction:
+                            gcs = gcs & ~line_regions
                     if telluric_line_mask is not None:
                         telluric_regions = telluric_line_mask[min(spec_idx, len(telluric_line_mask) - 1)]
                         gcf = gcf & ~telluric_regions
@@ -2370,13 +2412,20 @@ class PCACorrector:
                         n_good = np.sum(good_channels_for_fitting)
                         n_line = 0
 
-                        # Exclude detected lines from FITTING only — not from subtraction.
-                        # The PCA correction is still subtracted at line channels to remove
-                        # instrumental artifacts there; only the coefficient fit avoids them
-                        # so the line emission does not bias the projection.
+                        # Exclude detected lines from FITTING; and, when
+                        # protect_line_in_subtraction is set, from SUBTRACTION too.
+                        # By default the PCA correction is still subtracted at line
+                        # channels to remove instrumental artifacts there, and only
+                        # the coefficient fit avoids them so the line emission does not
+                        # bias the projection. With the toggle on, detected line
+                        # channels are skipped in the subtraction as well (like
+                        # telluric below), so a line-shaped component can't be
+                        # subtracted into the [CII] line.
                         if detected_lines_mask is not None and np.any(detected_lines_mask):
                             line_regions = detected_lines_mask[spec_idx]
                             good_channels_for_fitting = good_channels_for_fitting & ~line_regions
+                            if self.protect_line_in_subtraction:
+                                good_channels_for_subtraction = good_channels_for_subtraction & ~line_regions
                             n_line = np.sum(line_regions)
                             stats['lines_detected'] = True
 
@@ -2499,6 +2548,17 @@ class PCACorrector:
                     f"gcs (subtract) = {np.mean(gcs3_counts):.0f} ch avg "
                     f"({100*np.mean(gcs3_counts)/n_total_ch3:.1f}%)"
                 )
+
+            # Restore pass-through spectra for skip_correction missions: whatever the
+            # correction paths above did to them is discarded, so they are written
+            # exactly as they came in (data[spectrum_col] is still the original here).
+            if len(skip_indices) > 0:
+                corrected_spectra[skip_indices] = data[spectrum_col][skip_indices]
+                for i in skip_indices:
+                    correction_details[int(i)] = {'n_components_used': 0, 'skipped': True,
+                                                   'reason': 'mission_skip_correction'}
+                logger.info(f"  Pass-through enforced for {len(skip_indices)} skip_correction spectra "
+                            f"(written uncorrected)")
 
             # Update data with corrected spectra
             data[spectrum_col] = corrected_spectra
@@ -2679,9 +2739,12 @@ class PCACorrector:
                 # nc (n_components) is per-mission (YAML), falling back to the number of
                 # components actually loaded; sk comes from the [pca] config.
                 eff_nc  = _resolve_mission_param(mission_id_val, 'n_components',             mission_pca_params, len(self.components))
+                eff_skip = bool(_resolve_mission_param(mission_id_val, 'skip_correction', mission_pca_params,
+                                _resolve_mission_param(mission_id_val, 'passthrough', mission_pca_params, False)))
                 return (f"nc={_fmt(eff_nc)} vc={_fmt(eff_vc)} nr={_fmt(eff_nr)} "
                         f"sk={_fmt(self.smoothing_kernel_size)} "
-                        f"cc={_fmt(eff_cc)} gnr={_fmt(eff_gnr)} lk={eff_lk} ls={eff_ls} lstsq={int(eff_lstsq)}")
+                        f"cc={_fmt(eff_cc)} gnr={_fmt(eff_gnr)} lk={eff_lk} ls={eff_ls} lstsq={int(eff_lstsq)} "
+                        f"skip={int(eff_skip)}")
 
             n_rows = len(output_table.data)
             if mission_pca_params and 'MISSION_ID' in output_table.data.dtype.names:
@@ -3924,6 +3987,17 @@ Examples:
              'line_window channels directly (prevents line from entering the PCA fit).'
     )
     parser.add_argument(
+        '--protect-line-in-subtraction',
+        action='store_true',
+        default=False,
+        help='Also skip the PCA correction SUBTRACTION over detected line channels '
+             '(not just the coefficient fit), the same way telluric is handled. Where '
+             'a line is detected the correction is a no-op over it, so a line-shaped '
+             'component cannot be subtracted into the [CII] line. Pairs with deriving '
+             'components WITH the line window in the fit. Default off (line channels '
+             'are still corrected to remove instrumental artifacts under the line).'
+    )
+    parser.add_argument(
         '--config-window',
         type=float,
         nargs=2,
@@ -4350,6 +4424,7 @@ Examples:
         line_window_velocities = tuple(config_line_window) if config_line_window else None
 
         force_line_window = args.force_line_window
+        protect_line_in_subtraction = args.protect_line_in_subtraction
 
         if decomposition_file:
             # Use single decomposition file
@@ -4362,6 +4437,7 @@ Examples:
                 line_window_velocities=line_window_velocities,
                 use_lstsq=use_lstsq,
                 force_line_window=force_line_window,
+                protect_line_in_subtraction=protect_line_in_subtraction,
                 mission_params_file=config_mission_params_file,
             )
             mission_decompositions_to_use = None
@@ -4394,6 +4470,7 @@ Examples:
                     line_window_velocities=line_window_velocities,
                     use_lstsq=use_lstsq,
                     force_line_window=force_line_window,
+                    protect_line_in_subtraction=protect_line_in_subtraction,
                     mission_params_file=config_mission_params_file,
                 )
             finally:
