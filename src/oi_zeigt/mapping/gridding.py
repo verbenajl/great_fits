@@ -2302,6 +2302,7 @@ def collapse_cube(
     drop_rms: Optional[float] = None,
     drop_window: Optional[Tuple[float, float]] = None,
     align_peaks: bool = False,
+    collapse_weights: bool = False,
     select_polygon: bool = False,
     polygon: Optional[List[Tuple[float, float]]] = None,
 ) -> Tuple[np.ndarray, fits.Header, plt.Figure]:
@@ -2314,6 +2315,17 @@ def collapse_cube(
 
     Weights are not applied here — they were already baked into the cube during
     gridding.  The resulting map has units of K km/s.
+
+    With ``collapse_weights=True`` the function instead reads the 3D
+    ``WEIGHT_CUBE`` extension (written by ``create_datacube --weight-channels
+    --create-weights-datacube``) and integrates the per-channel gridding weights
+    (``Σ K·w``) over the velocity window into a 2D weight/sensitivity map — a
+    plain sum, NOT multiplied by channel width (units: ``weight``).  All the
+    spatial/display options (zoom, region spectrum, circular mask, trim-edges,
+    suppress-high, stretch/gamma, smooth, percentile-clip, hex, contour, WCS
+    axes, polygon, colormap) apply unchanged; the line/noise-specific options
+    (noise map, ``snr_threshold``, ``drop_rms``, ``shuffle``, ``align_peaks``,
+    peak modes) are meaningless for a weight cube and are ignored with a warning.
 
     Parameters
     ----------
@@ -2375,13 +2387,46 @@ def collapse_cube(
     # 1. Load cube
     # ------------------------------------------------------------------
     with fits.open(cube_fits) as hdul:
-        cube   = hdul[0].data.astype(float)   # (nvel, ny, nx)
-        header = hdul[0].header.copy()
+        if collapse_weights:
+            ext_names = [h.name for h in hdul]
+            if 'WEIGHT_CUBE' not in ext_names:
+                has_2d = 'WEIGHT_MAP' in ext_names
+                raise ValueError(
+                    f"No WEIGHT_CUBE extension in {cube_fits} "
+                    f"(found: {', '.join(n for n in ext_names if n) or 'none'}). "
+                    + ("This cube has a 2D WEIGHT_MAP instead — that is already the "
+                       "collapsed per-spectrum weight, so there is nothing to collapse. "
+                       if has_2d else "")
+                    + "Re-run create_datacube with "
+                      "--weight-channels --create-weights-datacube to write a 3D "
+                      "WEIGHT_CUBE."
+                )
+            cube = hdul['WEIGHT_CUBE'].data.astype(float)   # (nvel, ny, nx)
+        else:
+            cube = hdul[0].data.astype(float)   # (nvel, ny, nx)
+        header = hdul[0].header.copy()          # WCS lives in the primary header
 
     if cube.ndim != 3:
         raise ValueError(f"Expected a 3-D datacube, got shape {cube.shape}")
 
     nvel, ny, nx = cube.shape
+
+    # Weight-collapse ignores options defined in terms of a spectral line + noise
+    # (a weight cube has neither).  Disable them here — warning if the user set
+    # any — so the rest of the (shared) collapse/display machinery runs unchanged.
+    if collapse_weights:
+        _incompat = []
+        if shuffle:              _incompat.append('--shuffle');          shuffle = False
+        if snr_threshold is not None: _incompat.append('--snr-threshold'); snr_threshold = None
+        if drop_rms is not None: _incompat.append('--drop-rms');         drop_rms = None
+        if align_peaks:          _incompat.append('--align-peaks');      align_peaks = False
+        if noise_map_output:     _incompat.append('--output-noise-map'); noise_map_output = None
+        if mode != 'moment0':    _incompat.append(f'--mode {mode}');     mode = 'moment0'
+        if _incompat:
+            warnings.warn(
+                "collapse_weights: ignoring line/noise-specific option(s) "
+                + ", ".join(_incompat)
+                + " — they have no meaning for a weight cube.", UserWarning)
 
     # ------------------------------------------------------------------
     # 2. Reconstruct velocity axis from WCS keywords
@@ -2515,6 +2560,10 @@ def collapse_cube(
         collapsed = (acc * deltav_kms).astype(np.float32)
         _map_units = 'K km/s'
         _map_label = f'Peak ±{n}ch (K km/s)'
+    elif collapse_weights:  # weight cube: plain sum of Σ K·w, no channel-width factor
+        collapsed = np.nansum(cube[chan_mask, :, :], axis=0)
+        _map_units = 'weight'
+        _map_label = 'Integrated weight (Σ K·w)'
     else:  # moment0
         collapsed = np.nansum(cube[chan_mask, :, :], axis=0) * deltav_kms
         _map_units = 'K km/s'
@@ -2679,7 +2728,9 @@ def collapse_cube(
     # ------------------------------------------------------------------
     noise_map = None
     noise_chan_mask = ~chan_mask
-    if noise_chan_mask.sum() >= 2:
+    if collapse_weights:
+        pass  # a weight cube has no line-free "noise" to measure
+    elif noise_chan_mask.sum() >= 2:
         noise_map = np.nanstd(cube[noise_chan_mask, :, :], axis=0).astype(np.float32)
         noise_map[display_mask] = np.nan
         avg_noise = float(np.nanmean(noise_map))
@@ -3888,7 +3939,6 @@ def collapse_cube(
         print(f"  Plot saved: {plot_output}")
 
     return collapsed, header2d, fig
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════

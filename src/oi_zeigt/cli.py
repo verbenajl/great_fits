@@ -5350,6 +5350,18 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                    'velocity genuinely differs across spaxels (e.g. a rotation curve) — '
                    'otherwise that spread alone broadens a plain mean. Does not change the '
                    'moment-0 map itself, only these spectrum panels.')
+@click.option('--collapse-weights', is_flag=True, default=False,
+              help='Collapse the 3D WEIGHT_CUBE extension (written by create_datacube '
+                   '--weight-channels --create-weights-datacube) instead of the data, '
+                   'summing the per-channel gridding weights over --velocity-range into '
+                   'a 2D weight/sensitivity map (units: weight, a plain sum — NOT x dv). '
+                   'Writes to --fits-output, or <cube>_weights.fits next to the input '
+                   'cube if omitted. All spatial/display options apply as usual (zoom, '
+                   'region, --mask-radius, --trim-edges, --suppress-high, --stretch/'
+                   '--gamma, --smooth, --percentile-clip, --hex-plot, --contour, --wcs, '
+                   '--polygon, --colormap). Line/noise options are ignored with a warning '
+                   '(--snr-threshold, --drop-rms, --shuffle, --align-peaks, '
+                   '--output-noise-map, --mode/peak modes).')
 @click.option('--polygon', is_flag=True, default=False,
               help='Draw a polygon on the map with the MOUSE to restrict the rendered '
                    'area: middle-click adds each vertex, left-click closes it (>=3 '
@@ -5375,7 +5387,7 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
                       hex_plot, contour, stretch, gamma,
                       noise_map_output, smooth_sigma, percentile_clip,
                       snr_threshold, drop_rms, drop_window,
-                      align_peaks, polygon, polygon_coords):
+                      align_peaks, collapse_weights, polygon, polygon_coords):
     """
     Collapse a 3D spectral datacube to a 2D integrated intensity map (moment-0).
 
@@ -5411,6 +5423,12 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
     try:
         from oi_zeigt.mapping.gridding import collapse_cube
 
+        # In weight-collapse mode, default the FITS output next to the cube so the
+        # map lands in the pipeline's OUTDIR even without an explicit --fits-output.
+        if collapse_weights and not fits_output:
+            from pathlib import Path as _Path
+            fits_output = str(_Path(cube_fits).with_suffix('')) + '_weights.fits'
+
         zoom_ra    = _parse_angle(zoom_ra,   is_ra=True)
         zoom_dec   = _parse_angle(zoom_dec,  is_ra=False)
         region_ra  = _parse_angle(region_ra,  is_ra=True)
@@ -5443,7 +5461,7 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
                     "Error: --polygon-coords needs at least 3 vertices", fg='red'), err=True)
                 sys.exit(1)
 
-        click.echo(f"Collapsing cube: {cube_fits}")
+        click.echo(f"Collapsing {'WEIGHT_CUBE' if collapse_weights else 'cube'}: {cube_fits}")
         if velocity_range:
             click.echo(f"  Velocity range: {velocity_range[0]:.1f} – {velocity_range[1]:.1f} km/s")
         if zoom_size_arcmin:
@@ -5508,6 +5526,7 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             drop_rms=drop_rms,
             drop_window=drop_window,
             align_peaks=align_peaks,
+            collapse_weights=collapse_weights,
             select_polygon=select_polygon,
             polygon=polygon_vertices,
         )
