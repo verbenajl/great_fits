@@ -309,6 +309,73 @@ def dec_degrees_to_dms_formatter(axes_obj, dec_degrees):
     return format_dec_dms(dec_degrees)
 
 
+def _check_velocity_grid_uniform(
+    table,
+    velo_ref: float,
+    deltav: float,
+    velo_tol_frac: float = 0.1,
+    deltav_rtol: float = 1e-3,
+) -> None:
+    """
+    Warn if the VELOCITY/DELTAV columns are not uniform across the table.
+
+    Gridding builds a single velocity axis from the first row
+    (``velo_ref``/``deltav``) and applies it to every spectrum. That is only
+    valid when all spectra were resampled onto a common LSR grid, which
+    kalibrate normally does. If spectra carry different velocity references -
+    e.g. flights observed with slightly different tuning frequencies that were
+    never reconciled to a common systemic velocity - the single-axis assumption
+    misregisters the data and blurs the co-added cube with no error raised.
+    This emits a ``UserWarning`` describing the spread so the mismatch can be
+    caught and fixed upstream (reconcile to a common Vsys before gridding).
+
+    Parameters
+    ----------
+    table : FITS_rec
+        Binary table with (optionally) VELOCITY and DELTAV columns, in m/s.
+    velo_ref : float
+        Reference velocity taken from row 0 (m/s) - the value gridding uses.
+    deltav : float
+        Channel spacing taken from row 0 (m/s) - the value gridding uses.
+    velo_tol_frac : float, optional
+        Allowed VELOCITY spread as a fraction of ``|deltav|`` (default 0.1,
+        i.e. one tenth of a channel).
+    deltav_rtol : float, optional
+        Allowed relative spread in DELTAV (default 1e-3).
+    """
+    names = getattr(table, 'names', []) or []
+
+    if 'DELTAV' in names and deltav != 0.0:
+        dv = np.asarray(table['DELTAV'], dtype=np.float64)
+        dv = dv[np.isfinite(dv)]
+        if dv.size and float(np.ptp(dv)) > deltav_rtol * abs(deltav):
+            warnings.warn(
+                f"DELTAV is not uniform across the table (spread "
+                f"{float(np.ptp(dv)):.4g} m/s, min {dv.min():.6g}, max {dv.max():.6g}); "
+                f"gridding applies the row-0 value {deltav:.6g} m/s to all spectra. "
+                f"Spectra do not share a common channel spacing - the cube will be "
+                f"misgridded.",
+                UserWarning,
+            )
+
+    if 'VELOCITY' in names:
+        vel = np.asarray(table['VELOCITY'], dtype=np.float64)
+        vel = vel[np.isfinite(vel)]
+        tol = velo_tol_frac * abs(deltav)
+        if vel.size and float(np.ptp(vel)) > tol:
+            spread = float(np.ptp(vel))
+            chans = f" = {spread / abs(deltav):.2f} channels" if deltav != 0.0 else ""
+            warnings.warn(
+                f"VELOCITY reference is not uniform across the table (spread "
+                f"{spread:.4g} m/s{chans}; min {vel.min():.6g}, max {vel.max():.6g}); "
+                f"gridding applies the row-0 value {velo_ref:.6g} m/s to all spectra. "
+                f"Spectra are not registered to a common velocity grid (e.g. distinct "
+                f"tuning frequencies) - the co-added cube will be blurred. Reconcile to "
+                f"a common Vsys before gridding.",
+                UserWarning,
+            )
+
+
 def _get_spectral_axis_params(hdul: fits.HDUList) -> Tuple[float, float, float, str, float, float]:
     """
     Extract spectral axis parameters from FITS file for velocity axis reconstruction.
@@ -393,6 +460,12 @@ def _get_spectral_axis_params(hdul: fits.HDUList) -> Tuple[float, float, float, 
         else:
             warnings.warn("DELTAV not found in columns or headers - using 1.0 m/s", UserWarning)
             deltav = 1.0
+
+    # Guard: gridding applies this single velo_ref/deltav axis to every spectrum.
+    # Verify the columns are actually uniform so an un-registered dataset (e.g.
+    # flights with different tuning frequencies) is flagged rather than silently
+    # blurring the cube.
+    _check_velocity_grid_uniform(table, velo_ref, deltav)
 
     # Extract rest frequency
     if 'RESTFREQ' in table.names:
@@ -910,6 +983,9 @@ def create_integrated_map(hdul: fits.HDUList,
             if 'VELOCITY' in data.dtype.names and 'DELTAV' in data.dtype.names:
                 velo_ref = float(data['VELOCITY'][0]) / 1000.0  # Convert m/s to km/s
                 deltav = float(data['DELTAV'][0]) / 1000.0      # Convert m/s to km/s
+                # Same single-axis assumption as create_spectral_datacube: flag
+                # non-uniform grids (checker works in m/s, matching the columns).
+                _check_velocity_grid_uniform(data, velo_ref * 1000.0, deltav * 1000.0)
             else:
                 # Fallback to header (CRVAL3/CDELT3 units depend on CUNIT3)
                 velo_ref = header.get('CRVAL3', 0.0)
@@ -4364,6 +4440,257 @@ def compare_maps(
     if plot_output:
         fig.savefig(plot_output, dpi=150, bbox_inches='tight')
         print(f"  Comparison figure saved: {plot_output}")
+    if show:
+        plt.show()
+    return fig
+
+
+def _celestial_header_dict(cube_fits: str) -> dict:
+    """Plain 2-D celestial WCS keys for a gridded cube, as cygrid wants them.
+
+    Read straight off the file rather than round-tripped through
+    ``WCS.to_header()``: that emits a PC matrix and drops NAXISn, whereas
+    cygrid.WcsGrid wants the same CDELT-style keys create_wcs_header writes.
+    """
+    hdr = fits.getheader(cube_fits)
+    out = {'NAXIS': 2, 'NAXIS1': int(hdr['NAXIS1']), 'NAXIS2': int(hdr['NAXIS2'])}
+    for key in ('CTYPE1', 'CTYPE2', 'CRVAL1', 'CRVAL2',
+                'CRPIX1', 'CRPIX2', 'CDELT1', 'CDELT2'):
+        out[key] = hdr[key]
+    for key in ('EQUINOX', 'RADESYS'):
+        if key in hdr:
+            out[key] = hdr[key]
+    return out
+
+
+def regrid_map_with_cygrid(src_map: np.ndarray,
+                           src_cube_fits: str,
+                           dst_cube_fits: str,
+                           kernel_fwhm_arcsec: Optional[float] = None,
+                           verbose: bool = True) -> np.ndarray:
+    """Resample a 2-D map onto another cube's celestial grid using cygrid.
+
+    The source map's pixel centres are treated as irregular samples and pushed
+    through :func:`grid_to_map`, the same cygrid primitive create_datacube
+    uses — no second interpolation engine, and NaN pixels drop out of the
+    sample list rather than bleeding into their neighbours.
+
+    The default kernel FWHM is ONE TARGET PIXEL, not the beam. These maps are
+    already beam-convolved products; re-gridding with the beam again would
+    smooth the contour map relative to the image it is drawn over, so the
+    contours would sit systematically wider than the colour scale beneath
+    them. A ~pixel kernel moves the samples onto the new grid without
+    materially changing the resolution. Pass an explicit value to override.
+    """
+    src_hdr = fits.getheader(src_cube_fits)
+    src_wcs = WCS(src_hdr).celestial
+    ny, nx = src_map.shape
+
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    sky = src_wcs.pixel_to_world(xx.ravel(), yy.ravel())
+    ras = np.asarray(sky.ra.deg, dtype=np.float64)
+    decs = np.asarray(sky.dec.deg, dtype=np.float64)
+    vals = np.asarray(src_map, dtype=np.float64).ravel()
+
+    good = np.isfinite(ras) & np.isfinite(decs) & np.isfinite(vals)
+    if not good.any():
+        raise ValueError(f"{Path(src_cube_fits).name}: contour map is entirely blank; "
+                         "nothing to regrid.")
+    ras, decs, vals = ras[good], decs[good], vals[good]
+
+    dst = _celestial_header_dict(dst_cube_fits)
+    pix_deg = abs(float(dst['CDELT2']))
+    fwhm_deg = (kernel_fwhm_arcsec / 3600.0) if kernel_fwhm_arcsec else pix_deg
+
+    grid_kw = dict(
+        wcs_header_dict=dst,
+        naxis1=dst['NAXIS1'], naxis2=dst['NAXIS2'],
+        beamsize_deg=fwhm_deg,
+        ra_min=float(ras.min()), ra_max=float(ras.max()),
+        dec_min=float(decs.min()), dec_max=float(decs.max()),
+        kernel_fwhm_deg=fwhm_deg,
+    )
+    out = grid_to_map(ras=ras, decs=decs, values=vals, **grid_kw)
+
+    # The kernel has 3*FWHM support, so gridding alone spreads signal a few
+    # pixels PAST the source footprint and grid_to_map only blanks pixels with
+    # literally zero coverage. Left as is, contours would be drawn over sky
+    # where the contour cube has no data at all. Re-grid the validity mask
+    # through the identical kernel and keep only pixels a majority-covered by
+    # real samples.
+    edge = grid_to_map(ras=ras, decs=decs,
+                       values=np.ones_like(vals), **grid_kw)
+    out = np.where(np.isfinite(edge) & (edge >= 0.5), out, np.nan).astype(np.float32)
+
+    if verbose:
+        engine = 'cygrid' if HAS_CYGRID else 'scipy fallback'
+        print(f"  regrid ({engine}): {ny}×{nx} → {out.shape[0]}×{out.shape[1]}, "
+              f"kernel FWHM {fwhm_deg * 3600:.2f}\", "
+              f"{int(np.isfinite(out).sum())} valid px "
+              f"(from {int(good.sum())} source px)")
+    return out
+
+
+def _overlay_levels(data: np.ndarray,
+                    levels: Optional[List[float]],
+                    level_fractions: Optional[List[float]],
+                    n_levels: int,
+                    verbose: bool = True) -> List[float]:
+    """Resolve contour levels: explicit > peak fractions > evenly spaced."""
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        raise ValueError("regridded contour map has no finite pixels; "
+                         "check --velocity-range and the two cubes' overlap.")
+    if levels:
+        out = sorted(float(v) for v in levels)
+    else:
+        peak = float(np.nanmax(finite))
+        fracs = (sorted(float(f) for f in level_fractions) if level_fractions
+                 else list(np.linspace(0.2, 0.9, n_levels)))
+        out = [f * peak for f in fracs]
+        if verbose:
+            print(f"  contour peak {peak:.3g}; levels at "
+                  f"{', '.join(f'{f * 100:.0f}%' for f in fracs)}")
+    uniq = sorted(set(out))
+    if len(uniq) < len(out) and verbose:
+        print(f"  dropped {len(out) - len(uniq)} duplicate level(s)")
+    return uniq
+
+
+def overlay_maps(
+    image_cube: str,
+    contour_cube: str,
+    velocity_range: Optional[Tuple[float, float]] = None,
+    mode: str = 'moment0',
+    peak_range_channels: int = 5,
+    peak_smooth_channels: Optional[float] = None,
+    shuffle: bool = False,
+    shuffle_snr: float = 5.0,
+    shuffle_field_smooth: float = 6.0,
+    shuffle_window_kms: float = 20.0,
+    shuffle_ref_velocity: Optional[float] = None,
+    coverage_threshold: float = 0.0,
+    trim_edges: Optional[str] = None,
+    suppress_negative: bool = False,
+    suppress_high: Optional[float] = None,
+    smooth_sigma: Optional[float] = None,
+    levels: Optional[List[float]] = None,
+    level_fractions: Optional[List[float]] = None,
+    n_levels: int = 8,
+    regrid_kernel_arcsec: Optional[float] = None,
+    contour_color: str = 'white',
+    contour_linewidth: float = 0.9,
+    label_contours: bool = False,
+    colormap: str = 'rainbow',
+    stretch: str = 'linear',
+    gamma: float = 1.0,
+    percentile_clip: Optional[Tuple[float, float]] = None,
+    titles: Optional[List[str]] = None,
+    plot_output: Optional[str] = None,
+    show: bool = True,
+    verbose: bool = True,
+):
+    """Overlay two gridded cubes on ONE axes: first as colour, second as contours.
+
+    Both cubes are collapsed to 2-D with the *same* settings via
+    collapse_cube_to_map, so the two layers always represent the same
+    quantity over the same velocity window. The contour cube is then
+    resampled onto the image cube's celestial grid with cygrid, so the two
+    layers genuinely share a grid — they are not merely drawn on top of each
+    other and assumed to line up.
+
+    That regrid is not optional bookkeeping. Two cubes from this pipeline can
+    share a pixel scale and projection and still be offset by a fraction of a
+    pixel (differing CRPIX/CRVAL) and differ in NAXIS2, in which case a raw
+    ``ax.contour(other_map)`` silently draws the contours shifted against the
+    colour scale.
+
+    Note the velocity window is applied in km/s on each cube's own axis, never
+    by channel index: cubes resampled by filter_fits --velocity-resample are
+    anchored to multiples of the channel width relative to 0 km/s, so an
+    externally-produced cube can share the channel width yet sit a fractional
+    channel off. Selecting by velocity is immune to that; selecting by channel
+    index is not.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    from matplotlib import colors as mcolors  # noqa: F401  (used via _compare_build_norm)
+
+    for tag, path in (('image', image_cube), ('contour', contour_cube)):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{tag} cube not found: {path}")
+
+    collapse_kw = dict(
+        velocity_range=velocity_range, mode=mode,
+        peak_range_channels=peak_range_channels,
+        peak_smooth_channels=peak_smooth_channels,
+        shuffle=shuffle, shuffle_snr=shuffle_snr,
+        shuffle_field_smooth=shuffle_field_smooth,
+        shuffle_window_kms=shuffle_window_kms,
+        shuffle_ref_velocity=shuffle_ref_velocity,
+        coverage_threshold=coverage_threshold, trim_edges=trim_edges,
+        suppress_negative=suppress_negative, suppress_high=suppress_high,
+        smooth_sigma=smooth_sigma, verbose=verbose,
+    )
+
+    if verbose:
+        print(f"Image   (colour)  : {Path(image_cube).name}")
+    img, img_hdr2d, img_label, img_units, _ = collapse_cube_to_map(image_cube, **collapse_kw)
+    if verbose:
+        print(f"Contour (overlay) : {Path(contour_cube).name}")
+    con, _con_hdr2d, con_label, con_units, _ = collapse_cube_to_map(contour_cube, **collapse_kw)
+
+    if con_units != img_units and verbose:
+        print(f"  ! unit mismatch: image is {img_units}, contours are {con_units}")
+
+    con_r = regrid_map_with_cygrid(con, contour_cube, image_cube,
+                                   kernel_fwhm_arcsec=regrid_kernel_arcsec,
+                                   verbose=verbose)
+    if con_r.shape != img.shape:
+        raise ValueError(f"regrid produced {con_r.shape}, expected {img.shape}")
+
+    lvls = _overlay_levels(con_r, levels, level_fractions, n_levels, verbose=verbose)
+
+    finite = img[np.isfinite(img)]
+    if finite.size == 0:
+        raise ValueError(f"{Path(image_cube).name}: collapsed image map is entirely blank.")
+    if percentile_clip:
+        p_lo, p_hi = float(percentile_clip[0]), float(percentile_clip[1])
+        lo = float(np.nanpercentile(finite, p_lo))
+        hi = float(np.nanpercentile(finite, p_hi))
+    else:
+        lo, hi = float(np.nanmin(finite)), float(np.nanmax(finite))
+    if suppress_negative:
+        lo = 0.0
+    norm = _compare_build_norm(stretch, lo, hi, gamma, data=finite)
+
+    img_title = titles[0] if titles and len(titles) > 0 else Path(image_cube).name
+    con_title = titles[1] if titles and len(titles) > 1 else Path(contour_cube).name
+
+    fig = plt.figure(figsize=(9.0, 7.5))
+    ax = fig.add_subplot(111, projection=WCS(img_hdr2d))
+    im = ax.imshow(img, origin='lower', cmap=colormap, norm=norm, interpolation='nearest')
+    cs = ax.contour(con_r, levels=lvls, colors=contour_color,
+                    linewidths=contour_linewidth, alpha=0.9)
+    if label_contours:
+        ax.clabel(cs, inline=True, fontsize=6, fmt='%.3g')
+
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label(f"{img_label}  —  {img_title}")
+
+    ax.set_xlabel('RA (J2000)')
+    ax.set_ylabel('Dec (J2000)')
+    vr = (f"{velocity_range[0]:.0f}–{velocity_range[1]:.0f} km/s"
+          if velocity_range else "full band")
+    ax.set_title(f"{mode}, {vr}\ncolour: {img_title}   contours: {con_title}", fontsize=10)
+    ax.coords.grid(color='grey', ls=':', alpha=0.5)
+
+    fig.tight_layout()
+    if plot_output:
+        fig.savefig(plot_output, dpi=150, bbox_inches='tight')
+        print(f"  Overlay figure saved: {plot_output}")
     if show:
         plt.show()
     return fig

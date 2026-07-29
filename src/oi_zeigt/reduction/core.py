@@ -637,7 +637,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
                         filter_mission_ids: Optional[list] = None,
                         filter_aor_ids: Optional[list] = None,
                         velocity_resample_km_s: Optional[float] = None,
-                        velocity_resample_range_km_s: Optional[Tuple[float, float]] = None
+                        velocity_resample_range_km_s: Optional[Tuple[float, float]] = None,
+                        extract_velocity_range_m_s: Optional[Tuple[float, float]] = None
                         ) -> Tuple[Path, Path]:
     """
     Filter FITS data by object and NaN content, with optional column value removal and zero-spectrum filtering.
@@ -1234,11 +1235,54 @@ def filter_and_save_fits(hdul: fits.HDUList,
     # original resolution), and only ever touches clean_combined — the
     # rejected file keeps its original resolution.
     new_crpix1 = None
+    crpix1_current = float(matrix_hdus[0][1].header.get('CRPIX1', 1.0))
+
+    # Extract (trim) the surviving spectra to a velocity window, if requested.
+    # Mirrors reduce_spectra's [reduction].extract step exactly: same
+    # _extract_velocity_range helper, caller passes the window in m/s. Runs on
+    # clean_combined only (the rejected file keeps its original width) and trims
+    # every row — science and calibration (TSYS/TAU_SIG/SKYCHOPDIFF) — to the
+    # same channel window, so TSYS_INDEX/TAU_SIG_INDEX stay channel-aligned. If
+    # --velocity-resample is also given, extraction happens first and the resample
+    # below re-grids the already-trimmed spectra.
+    if extract_velocity_range_m_s is not None:
+        if 'VELOCITY' not in clean_combined.dtype.names or 'DELTAV' not in clean_combined.dtype.names:
+            raise ValueError("VELOCITY/DELTAV columns not found in FITS data — "
+                             "cannot use --extract")
+        velo_ref0 = float(clean_combined['VELOCITY'][0])
+        deltav0   = float(clean_combined['DELTAV'][0])
+        nch0      = clean_combined['SPECTRUM'].shape[1]
+        vaxis = velo_ref0 + (np.arange(nch0) - (crpix1_current - 1.0)) * deltav0
+        extracted, ch_min, ch_max = _extract_velocity_range(
+            np.asarray(clean_combined['SPECTRUM'], dtype=np.float64),
+            vaxis, extract_velocity_range_m_s[0], extract_velocity_range_m_s[1])
+        new_nch = extracted.shape[1]
+        orig_spec_dtype = clean_combined['SPECTRUM'].dtype
+        new_dtype = []
+        for name in clean_combined.dtype.names:
+            if name == 'SPECTRUM':
+                new_dtype.append((name, orig_spec_dtype, (new_nch,)))
+            else:
+                new_dtype.append((name, clean_combined.dtype[name]))
+        extracted_combined = np.recarray(len(clean_combined), dtype=new_dtype)
+        for name in clean_combined.dtype.names:
+            if name == 'SPECTRUM':
+                extracted_combined[name] = extracted.astype(orig_spec_dtype)
+            else:
+                extracted_combined[name] = clean_combined[name]
+        clean_combined = extracted_combined
+        # Reference channel shifts left by ch_min; VELOCITY/DELTAV are unchanged.
+        crpix1_current = crpix1_current - ch_min
+        new_crpix1 = crpix1_current
+        print(f"Extracted velocity range [{extract_velocity_range_m_s[0]/1000:.0f}, "
+              f"{extract_velocity_range_m_s[1]/1000:.0f}] km/s → channels "
+              f"[{ch_min}, {ch_max}] ({nch0} -> {new_nch} channels)")
+
     if velocity_resample_km_s is not None:
         if 'VELOCITY' not in clean_combined.dtype.names or 'DELTAV' not in clean_combined.dtype.names:
             raise ValueError("VELOCITY/DELTAV columns not found in FITS data — "
                              "cannot use --velocity-resample")
-        crpix1_orig = float(matrix_hdus[0][1].header.get('CRPIX1', 1.0))
+        crpix1_orig = crpix1_current
         velo_ref_per_row = np.asarray(clean_combined['VELOCITY'], dtype=np.float64)
         deltav_per_row   = np.asarray(clean_combined['DELTAV'],   dtype=np.float64)
         original_spectrum_dtype = clean_combined['SPECTRUM'].dtype

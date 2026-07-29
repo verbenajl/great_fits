@@ -92,6 +92,112 @@ def _print_fits_details(hdul):
             click.echo()
 
 
+def _print_velocity_resolution(hdul):
+    """
+    Print the velocity resolution (channel width) of every HDU that carries a
+    spectral axis - both 3D cubes and CLASS-style spectral tables.
+
+    Cubes are read from the WCS spectral axis (CTYPE3/CDELT3/CUNIT3): a velocity
+    axis is reported directly, a frequency axis is converted via RESTFRQ. Spectral
+    tables are read from the DELTAV column (m/s per channel); if DELTAV is not
+    uniform across rows the min/max spread is reported as well.
+
+    Parameters
+    ----------
+    hdul : astropy.io.fits.HDUList
+        The FITS HDU list to analyze.
+    """
+    C_KMS = 299792.458  # speed of light, km/s
+
+    def _cunit_to_kms(value, cunit):
+        """Convert a velocity increment in the given CUNIT to km/s (or None)."""
+        u = str(cunit).strip().lower()
+        if u in ('m/s', 'm s-1', 'ms-1'):
+            return value / 1000.0
+        if u in ('km/s', 'km s-1', 'kms-1'):
+            return value
+        return None
+
+    printed_header = False
+
+    def _ensure_header():
+        nonlocal printed_header
+        if not printed_header:
+            click.echo("="*70)
+            click.echo("VELOCITY RESOLUTION")
+            click.echo("="*70)
+            printed_header = True
+
+    for i, hdu in enumerate(hdul):
+        header = getattr(hdu, 'header', None)
+        if header is None:
+            continue
+
+        # --- Cubes / images with a spectral third axis ---
+        if not isinstance(hdu, fits.BinTableHDU) and int(header.get('NAXIS', 0)) >= 3:
+            ctype3 = str(header.get('CTYPE3', '')).strip().upper()
+            cdelt3 = header.get('CDELT3', None)
+            cunit3 = header.get('CUNIT3', '')
+            if cdelt3 is not None:
+                _ensure_header()
+                label = f"HDU {i} ({hdu.name or type(hdu).__name__}) [cube, CTYPE3={ctype3 or '?'}]"
+                if ctype3.startswith(('VELO', 'VRAD', 'VOPT', 'FELO')):
+                    dv = _cunit_to_kms(abs(float(cdelt3)), cunit3)
+                    if dv is not None:
+                        click.echo(f"  {label}: {dv:.4f} km/s/channel")
+                    else:
+                        click.echo(f"  {label}: {abs(float(cdelt3)):.6g} {cunit3}/channel "
+                                   f"(unrecognized CUNIT3, not converted)")
+                elif ctype3.startswith('FREQ'):
+                    restfrq = header.get('RESTFRQ', header.get('RESTFREQ', None))
+                    df_hz = abs(float(cdelt3))  # CUNIT3 assumed Hz for FREQ axes
+                    if restfrq:
+                        dv = C_KMS * df_hz / float(restfrq)
+                        click.echo(f"  {label}: {dv:.4f} km/s/channel "
+                                   f"({df_hz/1e6:.4f} MHz, RESTFRQ={float(restfrq)/1e9:.4f} GHz)")
+                    else:
+                        click.echo(f"  {label}: {df_hz/1e6:.4f} MHz/channel "
+                                   f"(no RESTFRQ - cannot convert to km/s)")
+                else:
+                    click.echo(f"  {label}: CDELT3={abs(float(cdelt3)):.6g} {cunit3} "
+                               f"(unrecognized spectral CTYPE3)")
+            continue
+
+        # --- CLASS-style spectral tables (DELTAV column, m/s per channel) ---
+        if isinstance(hdu, fits.BinTableHDU):
+            colnames = hdu.columns.names if hasattr(hdu, 'columns') else []
+            if 'DELTAV' not in colnames:
+                continue
+            try:
+                deltav = np.asarray(hdu.data['DELTAV'], dtype=np.float64)
+            except (OSError, ValueError) as e:
+                _ensure_header()
+                click.echo(f"  HDU {i} ({hdu.name or 'table'}): DELTAV present but unreadable ({e})")
+                continue
+            deltav = deltav[np.isfinite(deltav)]
+            if deltav.size == 0:
+                continue
+            _ensure_header()
+            dv_ref_kms = abs(float(deltav[0])) / 1000.0
+            label = f"HDU {i} ({hdu.name or 'table'}) [spectral table]"
+            spread = float(np.ptp(deltav))
+            if spread > 1e-3 * abs(float(deltav[0])):
+                click.echo(f"  {label}: {dv_ref_kms:.4f} km/s/channel (row 0); "
+                           f"NON-UNIFORM: min {abs(deltav).min()/1000.0:.4f}, "
+                           f"max {abs(deltav).max()/1000.0:.4f} km/s")
+            else:
+                click.echo(f"  {label}: {dv_ref_kms:.4f} km/s/channel")
+
+    if printed_header:
+        click.echo("="*70 + "\n")
+    else:
+        click.echo("="*70)
+        click.echo("VELOCITY RESOLUTION")
+        click.echo("="*70)
+        click.echo("  No spectral axis (cube CDELT3 or table DELTAV) found.")
+        click.echo("="*70 + "\n")
+
+
 def _print_object_info(hdul, object_filter=None):
     """
     Print information about unique objects, AOR_IDs, and MISSION_IDs in the FITS file.
@@ -423,6 +529,7 @@ def print_fits_info(config: Optional[str], fits: Optional[str], reduced: bool, c
             hdul = read_fits_from_config()
         
         _print_fits_details(hdul)
+        _print_velocity_resolution(hdul)
         _print_object_info(hdul, object_filter=object_filter)
         hdul.close()
         
@@ -1554,6 +1661,16 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
          "would only span whatever velocities that flight happens to cover. Only meaningful "
          "together with --velocity-resample."
 )
+@click.option(
+    "--extract",
+    is_flag=True,
+    default=False,
+    help="Extract (trim) the clean-output spectra to the velocity range from config "
+         "[reduction].extract, exactly as reduce_spectra --extract does. Applied to the "
+         "clean output only (the rejected file keeps its original width); every row is "
+         "trimmed to the same channel window. Without this flag the spectrum length is "
+         "left unchanged. If combined with --velocity-resample, extraction happens first."
+)
 def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str],
                 nan_threshold: float, output_clean: Optional[str],
                 output_rejected: Optional[str], remove: Optional[str],
@@ -1566,7 +1683,8 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
                 filter_out_object_exact: Optional[str],
                 exclude_obsmode: Optional[str], couple_tau_tsys: bool,
                 velocity_resample: Optional[float],
-                velocity_resample_range: Optional[Tuple[float, float]]):
+                velocity_resample_range: Optional[Tuple[float, float]],
+                extract: bool):
     """
     Filter FITS data by object, NaN content, all-zero spectra, and/or column values.
     
@@ -1834,6 +1952,27 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
                             "derived from this file's own data, which can differ run to run "
                             "(e.g. across separate per-flight runs) and break combine_fits later.")
 
+        # Resolve --extract from config [reduction].extract (same as reduce_spectra:
+        # flag reads the config range in km/s, converted to m/s here; error if the
+        # flag is set but the config key is missing).
+        extract_velocity_range_m_s = None
+        if extract:
+            extract_cfg = (config_data or {}).get('reduction', {}).get('extract', None)
+            if extract_cfg is None:
+                click.echo(click.style(
+                    "Error: --extract specified but [reduction].extract is not defined in config",
+                    fg='red'), err=True)
+                sys.exit(1)
+            try:
+                extract_velocity_range_m_s = (float(extract_cfg[0]) * 1000.0,
+                                              float(extract_cfg[1]) * 1000.0)
+                click.echo(f"Extracting velocity range [{extract_cfg[0]}, {extract_cfg[1]}] km/s")
+            except (ValueError, TypeError, IndexError):
+                click.echo(click.style(
+                    "Error: could not parse [reduction].extract from config (expected [min, max] km/s)",
+                    fg='red'), err=True)
+                sys.exit(1)
+
         # Filter and save
         clean_path, rejected_path, stats = filter_and_save_fits(
             hdul,
@@ -1856,6 +1995,7 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
             exclude_obsmode=exclude_obsmode_list,
             velocity_resample_km_s=velocity_resample,
             velocity_resample_range_km_s=velocity_resample_range,
+            extract_velocity_range_m_s=extract_velocity_range_m_s,
         )
         
         # Optionally add TSYS_INDEX / TAU_SIG_INDEX to the clean output
@@ -2328,11 +2468,16 @@ def reduce_spectra_cmd(config, fits, clean, unblank, fill_telluric_noise, missio
         if baseline or baseline_from_config:
             # Get baseline order
             if baseline_order is None:
-                baseline_order = baseline_from_config if baseline_from_config else 1
-                try:
-                    baseline_order = int(baseline_order)
-                except Exception:
+                if baseline:
+                    # --baseline given explicitly without --baseline-order → default order 1
                     baseline_order = 1
+                else:
+                    # Baseline triggered only by config: use the config's baseline value
+                    # as the order (falling back to 1 if it isn't a valid integer).
+                    try:
+                        baseline_order = int(baseline_from_config)
+                    except (TypeError, ValueError):
+                        baseline_order = 1
             
             # Get baseline window from line_window in config if not specified via CLI
             if baseline_window is None and baseline_window_from_config is not None:
@@ -6053,6 +6198,164 @@ def print_pca_parameters(fits_path, config):
                 label = param_labels.get(k, k)
                 click.echo(f"    {k:5s}  ({label}) = {v}")
         click.echo()
+
+
+@click.command()
+@click.option('--image', 'image_cube', required=True, type=click.Path(exists=True),
+              help='Gridded FITS datacube drawn as the filled colour map. Its celestial '
+                   'grid is the reference: the contour cube is resampled onto it.')
+@click.option('--contour', 'contour_cube', required=True, type=click.Path(exists=True),
+              help='Gridded FITS datacube drawn as contours over the image cube.')
+@click.option('--velocity-range', type=(float, float), default=None, nargs=2,
+              help='Integration range in km/s (e.g. --velocity-range 0 300). Applied to BOTH '
+                   'cubes on their own velocity axes, so cubes whose channel grids are offset '
+                   'by a fractional channel still integrate the same physical window.')
+@click.option('--mode', default='moment0', show_default=True,
+              type=click.Choice(['moment0', 'peak-intensity'], case_sensitive=False),
+              help='Collapse mode for both cubes. Overridden by --peak-range-int.')
+@click.option('--peak-range-int', 'peak_range_channels',
+              is_flag=False, flag_value=5, default=None, type=int, metavar='N',
+              help='Integrate N channels either side of each pixel peak (2N+1 window) -> K km/s. '
+                   'Without a number, N=5. Overrides --mode.')
+@click.option('--peak-smooth', 'peak_smooth_channels', type=float, default=None, metavar='SIGMA',
+              help='For peak modes: locate the peak on a spectrum smoothed by SIGMA channels, '
+                   'read the RAW cube there.')
+@click.option('--shuffle', is_flag=True, default=False,
+              help='Velocity-field shuffle before collapse. Requires --velocity-range. '
+                   'Applied to each cube independently.')
+@click.option('--shuffle-snr', type=float, default=5.0, show_default=True, metavar='SNR',
+              help='S/N floor for pixels contributing to the shuffle velocity field.')
+@click.option('--shuffle-field-smooth', type=float, default=6.0, show_default=True, metavar='PIX',
+              help='Gaussian sigma (pixels) to smooth/gap-fill the shuffle velocity field.')
+@click.option('--shuffle-window', 'shuffle_window_kms', type=float, default=20.0, show_default=True,
+              metavar='KMS', help='Half-width (km/s) of the aligned window after shuffling.')
+@click.option('--shuffle-ref-velocity', type=float, default=None, metavar='KMS',
+              help='Common velocity (km/s) lines are aligned to. Pin it for comparability.')
+@click.option('--coverage-threshold', type=float, default=0.0, show_default=True,
+              help='Mask pixels below this fraction of peak gridding coverage.')
+@click.option('--trim-edges', 'trim_edges', default=None,
+              help='Peel a border off each coverage footprint (erosion, not a crop).')
+@click.option('--suppress-negative', is_flag=True, default=False,
+              help='Clip negative (noise) pixels to 0 and force vmin=0 (moment0 only).')
+@click.option('--suppress-high', type=float, default=None, metavar='VALUE',
+              help='Clip pixels above VALUE to VALUE.')
+@click.option('--smooth', 'smooth_sigma', type=float, default=None, metavar='SIGMA',
+              help='Gaussian-smooth both display maps by SIGMA pixels before plotting.')
+@click.option('--levels', default=None,
+              help='Explicit contour levels in map units, comma-separated (e.g. "5,10,20,40"). '
+                   'Overrides --level-fractions / --n-levels.')
+@click.option('--level-fractions', default=None,
+              help='Contour levels as comma-separated fractions of the contour map peak '
+                   '(e.g. "0.2,0.4,0.6,0.8").')
+@click.option('--n-levels', type=int, default=8, show_default=True,
+              help='Number of contour levels, evenly spaced over 20-90%% of the contour peak.')
+@click.option('--regrid-kernel', 'regrid_kernel_arcsec', type=float, default=None, metavar='ARCSEC',
+              help='Gaussian FWHM for the cygrid resampling of the contour map. Default: one '
+                   'target pixel. These maps are already beam-convolved, so re-gridding with '
+                   'the full beam would smooth the contours relative to the image beneath them.')
+@click.option('--contour-color', default='white', show_default=True,
+              help='Matplotlib colour for the contour lines.')
+@click.option('--contour-linewidth', type=float, default=0.9, show_default=True,
+              help='Contour line width.')
+@click.option('--label-contours', is_flag=True, default=False,
+              help='Write the level value inline on each contour.')
+@click.option('--colormap', default='rainbow', show_default=True,
+              help='Matplotlib colormap for the image layer (append "_r" to reverse).')
+@click.option('--stretch', default='linear', show_default=True,
+              type=click.Choice(['linear', 'sqrt', 'power', 'asinh', 'symlog', 'log'],
+                                case_sensitive=False),
+              help='Colour stretch for the image layer.')
+@click.option('--gamma', type=float, default=1.0, show_default=True,
+              help='Exponent for --stretch power.')
+@click.option('--percentile-clip', type=(float, float), default=None, nargs=2, metavar='LO HI',
+              help='Percentile range for the colour scale (e.g. 2 98).')
+@click.option('--titles', default=None,
+              help='Comma-separated "image,contour" labels (default: each file name).')
+@click.option('--output', '--plot', 'plot_output', type=click.Path(), default=None,
+              help='Save the overlay figure to this path (PNG).')
+@click.option('--no-show', is_flag=True, default=False,
+              help='Do not open an interactive window (just save/return).')
+def overlay_maps_cmd(image_cube, contour_cube, velocity_range, mode, peak_range_channels,
+                     peak_smooth_channels, shuffle, shuffle_snr, shuffle_field_smooth,
+                     shuffle_window_kms, shuffle_ref_velocity, coverage_threshold,
+                     trim_edges, suppress_negative, suppress_high, smooth_sigma,
+                     levels, level_fractions, n_levels, regrid_kernel_arcsec,
+                     contour_color, contour_linewidth, label_contours,
+                     colormap, stretch, gamma, percentile_clip, titles,
+                     plot_output, no_show):
+    """
+    Overlay two gridded datacubes on one axes: one as colour, one as contours.
+
+    A single-axes companion to compare_maps, which draws cubes side by side.
+    Both cubes are collapsed with identical settings (so the layers show the
+    same quantity over the same window), then the contour cube is resampled
+    onto the image cube's celestial grid with cygrid — the same engine
+    create_datacube grids with.
+
+    That resampling is the point of the command. Two cubes can share a pixel
+    scale and projection yet still differ in NAXIS and sit a fraction of a
+    pixel apart (different CRPIX/CRVAL), in which case contouring one directly
+    over the other draws them silently misaligned.
+
+    Examples:
+
+        overlay_maps --image nonpca_cube.fits --contour dr_cube.fits \\
+            --velocity-range 0 300 --output overlay.png
+
+        overlay_maps --image a.fits --contour b.fits --velocity-range 350 540 \\
+            --level-fractions 0.3,0.5,0.7,0.9 --stretch sqrt --suppress-negative
+    """
+    try:
+        from oi_zeigt.mapping.gridding import overlay_maps
+
+        def _floats(raw):
+            if not raw:
+                return None
+            try:
+                return [float(v) for v in str(raw).replace(' ', '').split(',') if v]
+            except ValueError:
+                raise click.BadParameter(f"could not parse '{raw}' as comma-separated numbers")
+
+        effective_mode = 'peak-range-int' if peak_range_channels is not None else mode.lower()
+        title_list = [t.strip() for t in titles.split(',')] if titles else None
+
+        overlay_maps(
+            image_cube=image_cube,
+            contour_cube=contour_cube,
+            velocity_range=velocity_range,
+            mode=effective_mode,
+            peak_range_channels=peak_range_channels if peak_range_channels is not None else 5,
+            peak_smooth_channels=peak_smooth_channels,
+            shuffle=shuffle,
+            shuffle_snr=shuffle_snr,
+            shuffle_field_smooth=shuffle_field_smooth,
+            shuffle_window_kms=shuffle_window_kms,
+            shuffle_ref_velocity=shuffle_ref_velocity,
+            coverage_threshold=coverage_threshold,
+            trim_edges=trim_edges,
+            suppress_negative=suppress_negative,
+            suppress_high=suppress_high,
+            smooth_sigma=smooth_sigma,
+            levels=_floats(levels),
+            level_fractions=_floats(level_fractions),
+            n_levels=n_levels,
+            regrid_kernel_arcsec=regrid_kernel_arcsec,
+            contour_color=contour_color,
+            contour_linewidth=contour_linewidth,
+            label_contours=label_contours,
+            colormap=colormap,
+            stretch=stretch.lower(),
+            gamma=gamma,
+            percentile_clip=percentile_clip,
+            titles=title_list,
+            plot_output=plot_output,
+            show=not no_show,
+        )
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
