@@ -5739,6 +5739,11 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
               help='Clip pixels above VALUE to VALUE (tame bright artefacts).')
 @click.option('--smooth', 'smooth_sigma', type=float, default=None, metavar='SIGMA',
               help='Gaussian-smooth each display map by SIGMA pixels before plotting.')
+@click.option('--compare-weights', is_flag=True, default=False,
+              help='Compare the 3D WEIGHT_CUBE extensions instead of the science data: '
+                   'each panel is the channel sum of gridded weights (Σ K·w). Requires cubes '
+                   'built with --weight-channels --create-weights-datacube. Line/peak options '
+                   '(--mode peak*, --peak-range-int, --peak-smooth, --shuffle) are ignored.')
 @click.option('--use-wcs', is_flag=True, default=False,
               help='Show each panel in RA/Dec (WCS) instead of pixel indices.')
 @click.option('--colormap', default='rainbow', show_default=True,
@@ -5764,7 +5769,7 @@ def compare_maps_cmd(cube_files, extra_cube_files, velocity_range, mode, peak_ra
                      peak_smooth_channels, shuffle, shuffle_snr, shuffle_field_smooth,
                      shuffle_window_kms, shuffle_ref_velocity, coverage_threshold,
                      trim_edges, suppress_negative, suppress_high, smooth_sigma,
-                     use_wcs, colormap, stretch, gamma, percentile_clip,
+                     compare_weights, use_wcs, colormap, stretch, gamma, percentile_clip,
                      per_panel_scale, titles, plot_output, no_show):
     """
     Collapse several gridded datacubes and draw their maps side by side.
@@ -5813,7 +5818,8 @@ def compare_maps_cmd(cube_files, extra_cube_files, velocity_range, mode, peak_ra
             raise FileNotFoundError("FITS file(s) not found: " + ", ".join(missing))
 
         title_list = [t.strip() for t in titles.split(',')] if titles else None
-        eff_mode = 'peak-range-int' if peak_range_channels is not None else mode
+        eff_mode = 'weights' if compare_weights else (
+            'peak-range-int' if peak_range_channels is not None else mode)
 
         click.echo(f"Comparing {len(cube_files)} cube(s) [{eff_mode}]:")
         for f in cube_files:
@@ -5845,6 +5851,7 @@ def compare_maps_cmd(cube_files, extra_cube_files, velocity_range, mode, peak_ra
             suppress_negative=suppress_negative,
             suppress_high=suppress_high,
             smooth_sigma=smooth_sigma,
+            collapse_weights=compare_weights,
         )
         click.echo(f"\n✓ Comparison of {len(cube_files)} cube(s) done")
         plt.close('all')

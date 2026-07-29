@@ -2462,22 +2462,27 @@ def collapse_cube(
     # ------------------------------------------------------------------
     # 1. Load cube
     # ------------------------------------------------------------------
+    weight_map_only = False
     with fits.open(cube_fits) as hdul:
         if collapse_weights:
             ext_names = [h.name for h in hdul]
-            if 'WEIGHT_CUBE' not in ext_names:
-                has_2d = 'WEIGHT_MAP' in ext_names
+            if 'WEIGHT_CUBE' in ext_names:
+                cube = hdul['WEIGHT_CUBE'].data.astype(float)   # (nvel, ny, nx)
+            elif 'WEIGHT_MAP' in ext_names:
+                # Per-spectrum weighting (no per-channel weights) records a single
+                # 2D WEIGHT_MAP (Σ K·w per pixel) — the analog of CLASS's .wei
+                # file. Load it as a 1-channel cube so the shared collapse/display
+                # machinery renders it unchanged (moment0 of one plane = the plane).
+                cube = hdul['WEIGHT_MAP'].data.astype(float)[np.newaxis, :, :]
+                weight_map_only = True
+            else:
                 raise ValueError(
-                    f"No WEIGHT_CUBE extension in {cube_fits} "
+                    f"No WEIGHT_CUBE or WEIGHT_MAP extension in {cube_fits} "
                     f"(found: {', '.join(n for n in ext_names if n) or 'none'}). "
-                    + ("This cube has a 2D WEIGHT_MAP instead — that is already the "
-                       "collapsed per-spectrum weight, so there is nothing to collapse. "
-                       if has_2d else "")
-                    + "Re-run create_datacube with "
-                      "--weight-channels --create-weights-datacube to write a 3D "
-                      "WEIGHT_CUBE."
+                    f"Re-run create_datacube with --weight-spectra (writes a 2D "
+                    f"WEIGHT_MAP) or --weight-channels --create-weights-datacube "
+                    f"(writes a 3D WEIGHT_CUBE) to record the weights used."
                 )
-            cube = hdul['WEIGHT_CUBE'].data.astype(float)   # (nvel, ny, nx)
         else:
             cube = hdul[0].data.astype(float)   # (nvel, ny, nx)
         header = hdul[0].header.copy()          # WCS lives in the primary header
@@ -2498,6 +2503,10 @@ def collapse_cube(
         if align_peaks:          _incompat.append('--align-peaks');      align_peaks = False
         if noise_map_output:     _incompat.append('--output-noise-map'); noise_map_output = None
         if mode != 'moment0':    _incompat.append(f'--mode {mode}');     mode = 'moment0'
+        # A 2D WEIGHT_MAP (loaded as a single channel) has no spectral axis to
+        # window over, so a velocity range would blank it entirely.
+        if weight_map_only and velocity_range is not None:
+            _incompat.append('--velocity-range'); velocity_range = None
         if _incompat:
             warnings.warn(
                 "collapse_weights: ignoring line/noise-specific option(s) "
@@ -4090,6 +4099,54 @@ def _footprint_trim_ring(footprint, border_px):
     return footprint & ~eroded
 
 
+def _finish_weight_map_2d(tag, weight_map, coverage_map, header,
+                          coverage_threshold=0.0, trim_edges=None,
+                          suppress_negative=False, suppress_high=None,
+                          smooth_sigma=None, verbose=True):
+    """Apply the display masks/scaling to a 2D WEIGHT_MAP and return like
+    collapse_cube_to_map. Used when a cube carries only a 2D per-spectrum
+    WEIGHT_MAP (--weight-spectra) rather than a 3D WEIGHT_CUBE."""
+    ny, nx = weight_map.shape
+    disp = weight_map.astype(np.float32).copy()
+    display_mask = ~np.isfinite(disp)
+
+    if coverage_threshold > 0 and coverage_map is not None and np.nanmax(coverage_map) > 0:
+        display_mask |= coverage_map < coverage_threshold * np.nanmax(coverage_map)
+
+    if trim_edges is not None:
+        pix_as = abs(float(header.get('CDELT2', 1.0))) * 3600.0
+        border_px, desc = _trim_border_px(trim_edges, pix_as, nx, ny)
+        if desc is not None and border_px > 0:
+            footprint = np.isfinite(weight_map)
+            if coverage_map is not None:
+                footprint &= (coverage_map > 0)
+            ring = _footprint_trim_ring(footprint, border_px)
+            if int(ring.sum()) < int(footprint.sum()):
+                display_mask |= ring
+            elif verbose:
+                print(f"  [{tag}] --trim-edges {trim_edges} would blank everything; ignored")
+
+    disp[display_mask] = np.nan
+    if suppress_negative:
+        disp[np.isfinite(disp) & (disp < 0)] = 0.0
+    if suppress_high is not None:
+        disp[np.isfinite(disp) & (disp > suppress_high)] = suppress_high
+    if smooth_sigma is not None and smooth_sigma > 0:
+        from astropy.convolution import Gaussian2DKernel, convolve as _convolve
+        disp = _convolve(disp, Gaussian2DKernel(x_stddev=smooth_sigma),
+                         boundary='fill', fill_value=np.nan,
+                         nan_treatment='interpolate', preserve_nan=True).astype(np.float32)
+
+    header2d = WCS(header).dropaxis(2).to_header()
+    header2d['BUNIT'] = 'weight'
+    if verbose:
+        finite = np.isfinite(disp)
+        rng = (f"[{np.nanmin(disp):.2f}, {np.nanmax(disp):.2f}]" if finite.any() else "[empty]")
+        print(f"  [{tag}] weights (2D WEIGHT_MAP): {ny}×{nx}, "
+              f"{int(finite.sum())} valid px, range {rng} weight")
+    return disp, header2d, 'Per-spectrum weight (Σ K·w)', 'weight', 'weights'
+
+
 def collapse_cube_to_map(
     cube_fits: str,
     velocity_range: Optional[Tuple[float, float]] = None,
@@ -4106,6 +4163,7 @@ def collapse_cube_to_map(
     suppress_negative: bool = False,
     suppress_high: Optional[float] = None,
     smooth_sigma: Optional[float] = None,
+    collapse_weights: bool = False,
     verbose: bool = True,
 ):
     """Collapse ONE gridded cube to a 2D display map — compute only, no plotting.
@@ -4115,14 +4173,46 @@ def collapse_cube_to_map(
     coverage + edge-trim + all-NaN masking (masked → NaN), suppress-negative,
     suppress-high, and Gaussian display smoothing.
 
+    With ``collapse_weights=True`` the weights are shown instead of the primary
+    science cube: the 3D ``WEIGHT_CUBE`` extension is used if present (channel sum
+    of the gridded weights Σ K·w, no channel-width factor), otherwise it falls
+    back to the 2D ``WEIGHT_MAP`` (per-spectrum weights from --weight-spectra, the
+    analog of CLASS's .wei file) shown directly. Line/peak-specific options
+    (shuffle, peak modes/smoothing) are ignored. The velocity axis is read from
+    the primary header (WEIGHT_CUBE shares the same geometry).
+
     Returns
     -------
     (display_map, header2d, map_label, map_units, mode)
     """
     tag = Path(cube_fits).name
     with fits.open(cube_fits) as hdul:
-        cube = hdul[0].data.astype(float)
         header = hdul[0].header.copy()
+        if collapse_weights:
+            ext_names = [e.name for e in hdul]
+            cov_ext = (hdul['COVERAGE'].data.astype(float)
+                       if 'COVERAGE' in ext_names else None)
+            if 'WEIGHT_CUBE' in ext_names:
+                cube = hdul['WEIGHT_CUBE'].data.astype(float)
+            elif 'WEIGHT_MAP' in ext_names:
+                # Per-spectrum weighting (no per-channel weights) records a single
+                # 2D WEIGHT_MAP (Σ K·w per pixel) — the analog of CLASS's .wei
+                # file. There is no spectral axis to collapse, so display it
+                # directly, still honouring the coverage/edge/suppress/smooth
+                # display controls.
+                return _finish_weight_map_2d(
+                    tag, hdul['WEIGHT_MAP'].data.astype(float), cov_ext, header,
+                    coverage_threshold=coverage_threshold, trim_edges=trim_edges,
+                    suppress_negative=suppress_negative, suppress_high=suppress_high,
+                    smooth_sigma=smooth_sigma, verbose=verbose)
+            else:
+                raise ValueError(
+                    f"{tag}: no WEIGHT_CUBE or WEIGHT_MAP extension. Rebuild the cube "
+                    f"with --weight-spectra (writes a 2D WEIGHT_MAP) or with "
+                    f"--weight-channels --create-weights-datacube (writes a 3D "
+                    f"WEIGHT_CUBE) to record the weights used.")
+        else:
+            cube = hdul[0].data.astype(float)
     if cube.ndim != 3:
         raise ValueError(f"{tag}: expected a 3-D datacube, got shape {cube.shape}")
     nvel, ny, nx = cube.shape
@@ -4143,7 +4233,7 @@ def collapse_cube_to_map(
         chan_mask = np.ones(nvel, dtype=bool)
 
     # --- Optional velocity-field shuffle (same as collapse_cube) ---
-    if shuffle:
+    if shuffle and not collapse_weights:
         if velocity_range is None:
             raise ValueError(f"{tag}: --shuffle requires --velocity-range.")
         v0_raw, v0_field, _snr = _velocity_field_from_cube(
@@ -4162,11 +4252,15 @@ def collapse_cube_to_map(
 
     # --- Peak-location smoothing (locate on smoothed, read raw) ---
     cube_pf = cube
-    if peak_smooth_channels and peak_smooth_channels > 0 and mode in ('peak-intensity', 'peak-range-int'):
+    if (not collapse_weights and peak_smooth_channels and peak_smooth_channels > 0
+            and mode in ('peak-intensity', 'peak-range-int')):
         cube_pf = _spectral_smooth_nanaware(cube, float(peak_smooth_channels))
 
     # --- Collapse ---
-    if mode == 'peak-intensity':
+    if collapse_weights:  # plain Σ K·w over channels, no channel-width factor
+        collapsed = np.nansum(cube[chan_mask, :, :], axis=0).astype(np.float32)
+        units, label = 'weight', 'Integrated weight (Σ K·w)'
+    elif mode == 'peak-intensity':
         peak_idx = np.argmax(np.where(np.isnan(cube_pf), -np.inf, cube_pf), axis=0)
         _ry = np.arange(ny)[:, None]; _rx = np.arange(nx)[None, :]
         collapsed = cube[peak_idx, _ry, _rx].astype(np.float32)
@@ -4229,13 +4323,14 @@ def collapse_cube_to_map(
                          boundary='fill', fill_value=np.nan,
                          nan_treatment='interpolate', preserve_nan=True).astype(np.float32)
 
+    effective_mode = 'weights' if collapse_weights else mode
     header2d = WCS(header).dropaxis(2).to_header()
     header2d['BUNIT'] = units
     if verbose:
         finite = np.isfinite(disp)
         rng = (f"[{np.nanmin(disp):.2f}, {np.nanmax(disp):.2f}]" if finite.any() else "[empty]")
-        print(f"  [{tag}] {mode}: {ny}×{nx}, {int(finite.sum())} valid px, range {rng} {units}")
-    return disp, header2d, label, units, mode
+        print(f"  [{tag}] {effective_mode}: {ny}×{nx}, {int(finite.sum())} valid px, range {rng} {units}")
+    return disp, header2d, label, units, effective_mode
 
 
 def _compare_build_norm(stretch, vmin, vmax, gamma, data=None):
