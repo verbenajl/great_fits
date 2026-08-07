@@ -17,6 +17,10 @@ from astropy.table import Table
 import matplotlib.pyplot as plt
 import warnings
 
+# Register GILDAS LUTs (e.g. 'rainbow3') so they are selectable via --colormap.
+from .gildas_luts import register_gildas_luts
+register_gildas_luts()
+
 # Try to import cygrid for optimal gridding
 HAS_CYGRID = False
 try:
@@ -2373,6 +2377,7 @@ def collapse_cube(
     stretch: str = 'linear',
     gamma: float = 1.0,
     smooth_sigma: Optional[float] = None,
+    interpolation: str = 'nearest',
     percentile_clip: Optional[Tuple[float, float]] = None,
     snr_threshold: Optional[float] = None,
     drop_rms: Optional[float] = None,
@@ -3254,7 +3259,7 @@ def collapse_cube(
         cmap_obj = plt.colormaps[cmap].copy() if isinstance(cmap, str) else cmap.copy()
         cmap_obj.set_bad('white')
         im = ax.imshow(data, origin='lower', cmap=cmap_obj,
-                       norm=norm, interpolation='nearest')
+                       norm=norm, interpolation=interpolation)
         ax.set_title(title, fontsize=10)
         _ax_labels(ax, wcs_proj)
         return fig.colorbar(im, ax=ax, label=_map_label, fraction=0.046, pad=0.04)
@@ -4163,6 +4168,7 @@ def collapse_cube_to_map(
     suppress_negative: bool = False,
     suppress_high: Optional[float] = None,
     smooth_sigma: Optional[float] = None,
+    snr_threshold: Optional[float] = None,
     collapse_weights: bool = False,
     verbose: bool = True,
 ):
@@ -4170,7 +4176,8 @@ def collapse_cube_to_map(
 
     Applies the same steps as collapse_cube: velocity-range select, optional
     velocity-field shuffle, moment0 / peak-range-int / peak-intensity collapse,
-    coverage + edge-trim + all-NaN masking (masked → NaN), suppress-negative,
+    coverage + edge-trim + all-NaN masking (masked → NaN), optional per-cube
+    SNR threshold (sub-threshold pixels shown as 0), suppress-negative,
     suppress-high, and Gaussian display smoothing.
 
     With ``collapse_weights=True`` the weights are shown instead of the primary
@@ -4311,8 +4318,36 @@ def collapse_cube_to_map(
 
     display_mask |= np.all(np.isnan(cube[chan_mask, :, :]), axis=0)
 
+    # --- SNR threshold (per cube, from its own line-free channels) ---
+    # Noise map = std over channels OUTSIDE --velocity-range; SNR = signal / noise
+    # (peak: peak/noise; integrated: moment0 / (noise·sqrt(n_chan)·deltav)).
+    # Sub-threshold pixels are shown as 0 (the zero colour), matching collapse_cube,
+    # not blanked to NaN. Requires --velocity-range and does not apply to weights.
+    snr_mask = None
+    if snr_threshold is not None and not collapse_weights:
+        noise_chan_mask = ~chan_mask
+        if int(noise_chan_mask.sum()) >= 2:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                noise_map = np.nanstd(cube[noise_chan_mask, :, :], axis=0)
+                n_signal_chan = int(chan_mask.sum())
+                if mode == 'peak-intensity':
+                    snr_map = collapsed / noise_map
+                else:
+                    snr_map = collapsed / (noise_map * np.sqrt(n_signal_chan) * deltav_kms)
+            snr_mask = np.isfinite(snr_map) & (snr_map < snr_threshold)
+            if verbose:
+                print(f"  [{tag}] SNR threshold {snr_threshold:.1f}: "
+                      f"{int(np.sum(snr_mask & ~display_mask))} pixels below cutoff "
+                      f"shown as 0 ({int(noise_chan_mask.sum())} line-free channels)")
+        elif verbose:
+            print(f"  [{tag}] --snr-threshold ignored: need --velocity-range to "
+                  f"identify line-free channels for the noise map")
+
     disp = collapsed.copy()
     disp[display_mask] = np.nan
+    if snr_mask is not None:
+        disp[snr_mask & ~display_mask] = 0.0
     if suppress_negative:
         disp[np.isfinite(disp) & (disp < 0)] = 0.0
     if suppress_high is not None:
@@ -4353,6 +4388,49 @@ def _compare_build_norm(stretch, vmin, vmax, gamma, data=None):
     return mcolors.Normalize(vmin=vmin, vmax=vmax)
 
 
+def _crop_box_max_empty(mask, tol):
+    """Largest-ish axis-aligned box with empty fraction <= tol.
+
+    Greedily trims whichever current border (top / bottom / left / right) is the
+    emptiest, one line at a time, until the box's empty (no-data) fraction is at
+    or below ``tol``. RA and Dec are therefore trimmed by independent amounts.
+    ``tol=0`` shrinks to a fully-covered rectangle (no empty pixels), biting into
+    the rounded data edges as needed.
+
+    Parameters
+    ----------
+    mask : 2D bool ndarray
+        Coverage mask (True = has data).
+    tol : float
+        Maximum allowed empty fraction of the final box (0..1).
+
+    Returns
+    -------
+    (y0, y1, x0, x1) inclusive index bounds.
+    """
+    ny, nx = mask.shape
+    y0, y1, x0, x1 = 0, ny - 1, 0, nx - 1
+    while y1 > y0 and x1 > x0:
+        sub = mask[y0:y1 + 1, x0:x1 + 1]
+        if (1.0 - sub.mean()) <= tol:
+            break
+        # Empty fraction of each border line; trim the worst offender.
+        top = 1.0 - mask[y0, x0:x1 + 1].mean()
+        bot = 1.0 - mask[y1, x0:x1 + 1].mean()
+        lft = 1.0 - mask[y0:y1 + 1, x0].mean()
+        rgt = 1.0 - mask[y0:y1 + 1, x1].mean()
+        worst = max(top, bot, lft, rgt)
+        if worst == top:
+            y0 += 1
+        elif worst == bot:
+            y1 -= 1
+        elif worst == lft:
+            x0 += 1
+        else:
+            x1 -= 1
+    return y0, y1, x0, x1
+
+
 def compare_maps(
     cube_files: List[str],
     plot_output: Optional[str] = None,
@@ -4363,6 +4441,9 @@ def compare_maps(
     gamma: float = 1.0,
     percentile_clip: Optional[Tuple[float, float]] = None,
     per_panel_scale: bool = False,
+    interpolation: str = 'nearest',
+    tighten: bool = False,
+    crop_empty: bool = False,
     show: bool = True,
     **collapse_kwargs,
 ):
@@ -4374,6 +4455,16 @@ def compare_maps(
     collapse_cube_to_map via **collapse_kwargs. By default every panel shares one
     colour scale + colorbar (comparable brightness); per_panel_scale=True scales
     each to its own range instead.
+
+    tighten=True lays all panels in a single row, pushed together horizontally
+    (wspace=0) with a shared y-axis (only the leftmost keeps y ticks/label), and
+    drops both the per-panel titles and the figure suptitle for a compact strip.
+
+    crop_empty controls trimming of empty (no-coverage) regions: True drops only
+    the fully-empty outer rows/columns (margins only — keeps every data pixel and
+    the rounded corners); a number crops harder until at most that percent of the
+    frame is empty, trimming RA and Dec by independent amounts and biting into the
+    rounded data edges. None/False = no cropping.
     """
     if not cube_files:
         raise ValueError("compare_maps: no cube files given")
@@ -4382,22 +4473,91 @@ def compare_maps(
     for f in cube_files:
         disp, hdr2d, label, units, mode = collapse_cube_to_map(f, **collapse_kwargs)
         maps.append((f, disp, hdr2d, label, units, mode))
+
+    # --- Optional crop of empty (no-coverage) regions from the frame.
+    #   crop_empty is True  -> margins only: drop rows/cols that are ENTIRELY
+    #                          empty, trimming the outer white border while
+    #                          keeping every data pixel (and the rounded corners).
+    #   crop_empty is a number -> crop harder until at most that PERCENT of the
+    #                          frame is empty; the emptiest border is trimmed
+    #                          first, so RA and Dec shrink by independent amounts
+    #                          (this bites into the rounded data edges).
+    # Coverage is the union across panels, so they stay aligned. Skipped on shape
+    # mismatch. ---
+    if crop_empty is not None and crop_empty is not False:
+        shapes = {m[1].shape for m in maps}
+        if len(shapes) == 1:
+            finite_any = np.zeros(maps[0][1].shape, dtype=bool)
+            for m in maps:
+                finite_any |= np.isfinite(m[1])
+            if crop_empty is True:
+                cols = np.where(finite_any.any(axis=0))[0]
+                rows = np.where(finite_any.any(axis=1))[0]
+                y0, y1 = (int(rows[0]), int(rows[-1])) if rows.size else (0, -1)
+                x0, x1 = (int(cols[0]), int(cols[-1])) if cols.size else (0, -1)
+                _desc = "margins only"
+            else:
+                _pct = max(0.0, float(crop_empty))
+                y0, y1, x0, x1 = _crop_box_max_empty(finite_any, _pct / 100.0)
+                _desc = f"≤{_pct:.0f}% empty"
+            if x1 > x0 and y1 > y0:
+                cropped = []
+                for (f, disp, hdr2d, label, units, m_) in maps:
+                    h = hdr2d.copy()
+                    if 'CRPIX1' in h:
+                        h['CRPIX1'] = float(h['CRPIX1']) - x0
+                    if 'CRPIX2' in h:
+                        h['CRPIX2'] = float(h['CRPIX2']) - y0
+                    cropped.append((f, disp[y0:y1 + 1, x0:x1 + 1], h, label, units, m_))
+                maps = cropped
+                _emp = 100.0 * (1.0 - np.isfinite(maps[0][1]).mean())
+                print(f"  Crop ({_desc}): {maps[0][1].shape[1]}×{maps[0][1].shape[0]} "
+                      f"({_emp:.0f}% empty remaining)")
+            else:
+                warnings.warn("compare_maps: crop collapsed the frame; skipped.",
+                              UserWarning)
+        else:
+            warnings.warn("compare_maps: crop skipped — panels have different "
+                          "shapes, cannot crop to a common footprint.", UserWarning)
+
     N = len(maps)
     mode = maps[0][5]
     map_label = maps[0][3]
     suppress_negative = bool(collapse_kwargs.get('suppress_negative', False))
 
-    # --- Auto grid: near-square for N>3, single row for N<=3 (looks nice) ---
+    # --- Auto grid: near-square for N>3, single row for N<=3 (looks nice).
+    # tighten forces a single row so panels can be pushed together horizontally.
     import math
-    if N <= 3:
+    if tighten or N <= 3:
         ncols, nrows = N, 1
     else:
         ncols = int(math.ceil(math.sqrt(N)))
         nrows = int(math.ceil(N / ncols))
     # constrained_layout keeps the (possibly wrapped, multi-line) panel titles,
     # the suptitle and the colorbar from overlapping — without it a two-line
-    # title grows up into the panel/frame above.
-    fig = plt.figure(figsize=(5.2 * ncols, 5.0 * nrows), constrained_layout=True)
+    # title grows up into the panel/frame above. It is disabled for tighten so
+    # subplots_adjust(wspace=0) can butt the panels together.
+    _tighten_layout = None
+    if tighten:
+        # Inch-based layout so the equal-aspect panels butt together (wspace=0)
+        # AND the colorbar gets its own right-hand strip (never over a panel).
+        # Each panel's box is sized to the data aspect ratio; the figure width is
+        # the sum of panel widths plus fixed margins for the left y-labels and the
+        # colorbar strip.
+        _ny0, _nx0 = maps[0][1].shape
+        _aspect = (_nx0 / _ny0) if _ny0 else 1.0
+        _ph = 4.3                       # panel (axes) height, inches
+        _pw = _ph * _aspect             # panel width per aspect ratio
+        _left, _bot, _top = 0.6, 0.55, 0.2   # margins for labels
+        _cgap, _cw, _rpad = 0.12, 0.16, 0.45  # colorbar gap / width / right pad
+        _figw = _left + ncols * _pw + _cgap + _cw + _rpad
+        _figh = _ph + _bot + _top
+        _tighten_layout = dict(ph=_ph, pw=_pw, left=_left, bot=_bot, top=_top,
+                               cgap=_cgap, cw=_cw, figw=_figw, figh=_figh, ncols=ncols)
+        fig = plt.figure(figsize=(_figw, _figh), constrained_layout=False)
+    else:
+        fig = plt.figure(figsize=(5.2 * ncols, 5.0 * nrows),
+                         constrained_layout=True)
 
     # --- Shared colour limits from pooled data (unless per-panel) ---
     def _vlims(arrs):
@@ -4447,44 +4607,87 @@ def compare_maps(
     _cb_registry = []
     axes, images, last_im = [], [], None
     for i, (f, disp, hdr2d, label, units, _m) in enumerate(maps):
+        # tighten: non-WCS panels share the leftmost panel's y-axis so they align
+        # and only the first needs y ticks. (WCSAxes can't take a sharey kwarg, so
+        # there we just hide the repeated Dec labels below.)
+        share_kw = {}
+        if tighten and not use_wcs and axes:
+            share_kw['sharey'] = axes[0]
         if use_wcs:
             ax = fig.add_subplot(nrows, ncols, i + 1, projection=WCS(hdr2d))
         else:
-            ax = fig.add_subplot(nrows, ncols, i + 1)
+            ax = fig.add_subplot(nrows, ncols, i + 1, **share_kw)
         if per_panel_scale:
             vmn, vmx = _vlims([disp])
             norm = _compare_build_norm(stretch, vmn, vmx, gamma, data=disp[np.isfinite(disp)])
         else:
             norm = shared_norm
-        im = ax.imshow(disp, origin='lower', cmap=cmap_obj, norm=norm, interpolation='nearest')
+        im = ax.imshow(disp, origin='lower', cmap=cmap_obj, norm=norm, interpolation=interpolation)
         last_im = im
-        ttl = titles[i] if (titles and i < len(titles)) else Path(f).stem
-        ax.set_title(_wrap_title(ttl), fontsize=9)
+        if not tighten:
+            ttl = titles[i] if (titles and i < len(titles)) else Path(f).stem
+            ax.set_title(_wrap_title(ttl), fontsize=9)
+        hide_y = tighten and i > 0  # keep y ticks/label only on the leftmost panel
         if use_wcs:
-            ax.set_xlabel('RA'); ax.set_ylabel('Dec')
+            ax.set_xlabel('RA')
+            if hide_y:
+                try:
+                    ax.coords[1].set_ticklabel_visible(False)
+                    ax.coords[1].set_axislabel('')
+                except Exception:
+                    pass
+            else:
+                ax.set_ylabel('Dec')
             try:
                 ax.coords.grid(color='gray', alpha=0.25, linewidth=0.5)
             except Exception:
                 pass
+            # Drop tick labels that would overlap — re-evaluated on every draw,
+            # so RA/Dec labels re-space (don't stack) when the view is zoomed.
+            try:
+                ax.coords[0].set_ticklabel(exclude_overlapping=True)
+                ax.coords[1].set_ticklabel(exclude_overlapping=True)
+            except Exception:
+                pass
         else:
-            ax.set_xlabel('pixel'); ax.set_ylabel('pixel')
+            ax.set_xlabel('pixel')
+            if hide_y:
+                ax.tick_params(labelleft=False)
+                ax.set_ylabel('')
+            else:
+                ax.set_ylabel('pixel')
         if per_panel_scale:
             cb = fig.colorbar(im, ax=ax, label=map_label, fraction=0.046, pad=0.04)
             _cb_registry.append({'cb': cb, 'images': [im]})
         axes.append(ax)
         images.append(im)
 
-    if not per_panel_scale and last_im is not None:
-        from matplotlib.cm import ScalarMappable
-        sm = ScalarMappable(norm=shared_norm, cmap=cmap_obj); sm.set_array([])
-        cb = fig.colorbar(sm, ax=axes, label=map_label, fraction=0.046, pad=0.04)
-        _cb_registry.append({'cb': cb, 'images': list(images)})
-
-    scale_note = 'per-panel scale' if per_panel_scale else 'shared scale'
-    fig.suptitle(f"{mode} comparison — {N} cubes ({nrows}×{ncols}, {scale_note})",
-                 fontsize=12, fontweight='bold')
-    # Layout is handled by constrained_layout (set at figure creation); calling
-    # tight_layout here would conflict with it.
+    from matplotlib.cm import ScalarMappable
+    if tighten:
+        # Exact fractional margins (from the inch layout) so panels touch at
+        # wspace=0 and the shared colorbar lives in its own reserved right strip.
+        L = _tighten_layout
+        left_f = L['left'] / L['figw']
+        right_f = (L['left'] + L['ncols'] * L['pw']) / L['figw']
+        bot_f = L['bot'] / L['figh']
+        top_f = 1.0 - L['top'] / L['figh']
+        fig.subplots_adjust(left=left_f, right=right_f, bottom=bot_f, top=top_f, wspace=0)
+        if not per_panel_scale and last_im is not None:
+            sm = ScalarMappable(norm=shared_norm, cmap=cmap_obj); sm.set_array([])
+            cax = fig.add_axes([right_f + L['cgap'] / L['figw'], bot_f,
+                                L['cw'] / L['figw'], top_f - bot_f])
+            cb = fig.colorbar(sm, cax=cax, label=map_label)
+            _cb_registry.append({'cb': cb, 'images': list(images)})
+    else:
+        if not per_panel_scale and last_im is not None:
+            sm = ScalarMappable(norm=shared_norm, cmap=cmap_obj); sm.set_array([])
+            cb = fig.colorbar(sm, ax=axes, label=map_label, fraction=0.046, pad=0.04)
+            _cb_registry.append({'cb': cb, 'images': list(images)})
+        scale_note = 'per-panel scale' if per_panel_scale else 'shared scale'
+        fig.suptitle(f"{mode} comparison — {N} cubes ({nrows}×{ncols}, {scale_note})",
+                     fontsize=12, fontweight='bold')
+    # Layout is handled by constrained_layout (non-tighten) or the explicit
+    # subplots_adjust above (tighten); tight_layout would conflict with both.
 
     # ------------------------------------------------------------------
     # Interactive: click on a colorbar to adjust its colour scale
@@ -4523,14 +4726,92 @@ def compare_maps(
             _apply(entry, new_vmin, new_vmax)
             return
 
+    # --- Interactive region select: RIGHT-click corners on any panel to define a
+    # rectangle; all panels then zoom to the SAME SKY region. Clicks are converted
+    # to world coords (RA/Dec) via the clicked panel's WCS and back to each other
+    # panel's pixels via its own WCS, so the panels correspond even when their
+    # pixel grids differ. Right-click ≥2 corners (e.g. two opposite corners, or
+    # all four) — the zoom is the bounding box of the clicked corners. Press 'r'
+    # to reset. Right-clicks on a colorbar still adjust the colour scale. ---
+    panel_wcs = []
+    for (_f, _d, _h, _l, _u, _m) in maps:
+        try:
+            panel_wcs.append(WCS(_h).celestial)
+        except Exception:
+            panel_wcs.append(None)
+    _orig_lims = [(ax.get_xlim(), ax.get_ylim()) for ax in axes]
+    _corners = []   # world (ra, dec) when use_wcs else pixel (x, y)
+    _markers = []   # marker artists showing the clicked corners
+
+    def _reset_zoom():
+        for ax, (xl, yl) in zip(axes, _orig_lims):
+            ax.set_xlim(*xl); ax.set_ylim(*yl)
+        for mk in _markers:
+            try:
+                mk.remove()
+            except Exception:
+                pass
+        _markers.clear(); _corners.clear()
+        fig.canvas.draw_idle()
+
+    def _apply_region():
+        if len(_corners) < 2:
+            return
+        for j, ax in enumerate(axes):
+            if use_wcs and panel_wcs[j] is not None:
+                pts = [panel_wcs[j].world_to_pixel_values(ra, dec)
+                       for (ra, dec) in _corners]
+                xs = [float(p[0]) for p in pts]; ys = [float(p[1]) for p in pts]
+            else:
+                xs = [c[0] for c in _corners]; ys = [c[1] for c in _corners]
+            ax.set_xlim(min(xs), max(xs)); ax.set_ylim(min(ys), max(ys))
+        fig.canvas.draw_idle()
+
+    def _clear_markers():
+        for mk in _markers:
+            try:
+                mk.remove()
+            except Exception:
+                pass
+        _markers.clear()
+
+    def _on_region_click(event):
+        # Right-click on a panel drops a corner. (Right-click on a colorbar is
+        # handled separately by _on_colorbar_click.) A rectangle is two opposite
+        # corners: the first click shows a marker, the second zooms all panels
+        # and the markers are cleared. The next right-click starts a fresh
+        # selection in the (now zoomed) view, so you can keep zooming further.
+        if event.button != 3 or event.inaxes not in axes or event.xdata is None:
+            return
+        j = axes.index(event.inaxes)
+        _markers.append(event.inaxes.plot(event.xdata, event.ydata, 'x',
+                                          color='magenta', ms=9, mew=2)[0])
+        if use_wcs and panel_wcs[j] is not None:
+            ra, dec = panel_wcs[j].pixel_to_world_values(event.xdata, event.ydata)
+            _corners.append((float(ra), float(dec)))
+        else:
+            _corners.append((float(event.xdata), float(event.ydata)))
+        if len(_corners) >= 2:
+            _apply_region()          # zoom all panels
+            _clear_markers()         # remove the corner ✕ marks
+            _corners.clear()         # ready for the next selection
+        fig.canvas.draw_idle()
+
     def _on_key_press(event):
+        if event.key in ('r', 'R'):
+            _reset_zoom()
+            return
         if event.key != 'b' or not _cb_history:
             return
         entry, prev_vmin, prev_vmax = _cb_history.pop()
         _apply(entry, prev_vmin, prev_vmax)
 
     fig.canvas.mpl_connect('button_press_event', _on_colorbar_click)
+    fig.canvas.mpl_connect('button_press_event', _on_region_click)
     fig.canvas.mpl_connect('key_press_event', _on_key_press)
+    if show:
+        print("  Interactive: right-click corners on any panel to zoom all panels "
+              "to that region; press 'r' to reset.")
 
     if plot_output:
         fig.savefig(plot_output, dpi=150, bbox_inches='tight')
@@ -4607,15 +4888,26 @@ def regrid_map_with_cygrid(src_map: np.ndarray,
     )
     out = grid_to_map(ras=ras, decs=decs, values=vals, **grid_kw)
 
-    # The kernel has 3*FWHM support, so gridding alone spreads signal a few
-    # pixels PAST the source footprint and grid_to_map only blanks pixels with
-    # literally zero coverage. Left as is, contours would be drawn over sky
-    # where the contour cube has no data at all. Re-grid the validity mask
-    # through the identical kernel and keep only pixels a majority-covered by
-    # real samples.
-    edge = grid_to_map(ras=ras, decs=decs,
-                       values=np.ones_like(vals), **grid_kw)
-    out = np.where(np.isfinite(edge) & (edge >= 0.5), out, np.nan).astype(np.float32)
+    # The kernel has 3*FWHM support, so gridding spreads signal a few pixels
+    # PAST the source footprint, and grid_to_map only blanks pixels with
+    # literally zero coverage. Left as is, contours get drawn over sky where
+    # the contour cube has no data at all.
+    #
+    # The footprint has to be measured geometrically, not by re-gridding a
+    # mask: cygrid returns a weight-normalised mean, so gridding an array of
+    # ones yields ~1.0 wherever anything contributed and carries no coverage
+    # information to threshold on. Map each target pixel centre back to the
+    # nearest source pixel instead and keep it only if that pixel held data.
+    dst_wcs = WCS(fits.getheader(dst_cube_fits)).celestial
+    tny, tnx = int(dst['NAXIS2']), int(dst['NAXIS1'])
+    tyy, txx = np.mgrid[0:tny, 0:tnx]
+    back = src_wcs.world_to_pixel(dst_wcs.pixel_to_world(txx, tyy))
+    sj = np.rint(np.asarray(back[0])).astype(int)
+    si = np.rint(np.asarray(back[1])).astype(int)
+    inside = (si >= 0) & (si < ny) & (sj >= 0) & (sj < nx)
+    footprint = np.zeros((tny, tnx), dtype=bool)
+    footprint[inside] = np.isfinite(src_map[si[inside], sj[inside]])
+    out = np.where(footprint, out, np.nan).astype(np.float32)
 
     if verbose:
         engine = 'cygrid' if HAS_CYGRID else 'scipy fallback'
@@ -4630,8 +4922,17 @@ def _overlay_levels(data: np.ndarray,
                     levels: Optional[List[float]],
                     level_fractions: Optional[List[float]],
                     n_levels: int,
+                    reference_percentile: float = 99.0,
                     verbose: bool = True) -> List[float]:
-    """Resolve contour levels: explicit > peak fractions > evenly spaced."""
+    """Resolve contour levels: explicit values, else fractions of a reference.
+
+    The reference defaults to a high PERCENTILE rather than the map maximum.
+    Gridded [CII] maps routinely carry a handful of extreme edge/artefact
+    pixels — in M82 the data-release moment-0 peaks 3.6x its own 99th
+    percentile, with only ~1% of pixels above 20% of the max — so fractions of
+    the true maximum bunch every contour onto those few pixels and the galaxy
+    itself is left untraced. Set reference_percentile=100 for the literal peak.
+    """
     finite = data[np.isfinite(data)]
     if finite.size == 0:
         raise ValueError("regridded contour map has no finite pixels; "
@@ -4639,13 +4940,18 @@ def _overlay_levels(data: np.ndarray,
     if levels:
         out = sorted(float(v) for v in levels)
     else:
+        pct = float(np.clip(reference_percentile, 0.0, 100.0))
+        ref = float(np.percentile(finite, pct))
         peak = float(np.nanmax(finite))
+        if ref <= 0:
+            ref = peak
         fracs = (sorted(float(f) for f in level_fractions) if level_fractions
                  else list(np.linspace(0.2, 0.9, n_levels)))
-        out = [f * peak for f in fracs]
+        out = [f * ref for f in fracs]
         if verbose:
-            print(f"  contour peak {peak:.3g}; levels at "
-                  f"{', '.join(f'{f * 100:.0f}%' for f in fracs)}")
+            how = "max" if pct >= 100 else f"p{pct:g}"
+            print(f"  contour reference {ref:.3g} ({how}; map max {peak:.3g}); "
+                  f"levels at {', '.join(f'{f * 100:.0f}%' for f in fracs)}")
     uniq = sorted(set(out))
     if len(uniq) < len(out) and verbose:
         print(f"  dropped {len(out) - len(uniq)} duplicate level(s)")
@@ -4672,6 +4978,7 @@ def overlay_maps(
     levels: Optional[List[float]] = None,
     level_fractions: Optional[List[float]] = None,
     n_levels: int = 8,
+    level_reference_percentile: float = 99.0,
     regrid_kernel_arcsec: Optional[float] = None,
     contour_color: str = 'white',
     contour_linewidth: float = 0.9,
@@ -4746,7 +5053,9 @@ def overlay_maps(
     if con_r.shape != img.shape:
         raise ValueError(f"regrid produced {con_r.shape}, expected {img.shape}")
 
-    lvls = _overlay_levels(con_r, levels, level_fractions, n_levels, verbose=verbose)
+    lvls = _overlay_levels(con_r, levels, level_fractions, n_levels,
+                           reference_percentile=level_reference_percentile,
+                           verbose=verbose)
 
     finite = img[np.isfinite(img)]
     if finite.size == 0:

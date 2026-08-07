@@ -3763,10 +3763,12 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
               help='Beam size in arcseconds for gridding kernel (e.g. --beamsize 14.1). '
                    'If not specified, reads from config [gridding].beamsize_arcsec.')
 @click.option('--pixsize', type=float, default=None,
-              help='Map pixel size in arcseconds. If not specified, uses beamsize/3 or config [gridding].pixel_size_arcsec.')
+              help='Map pixel size in arcseconds. If not specified, defaults to resolution/2 '
+                   '(GILDAS map%cell convention) or config [gridding].pixel_size_arcsec.')
 @click.option('--pixel-size-arcsec', type=float, default=None,
-              help='Map pixel size in arcseconds (e.g. --pixel-size-arcsec 4.7). '
-                   'Overrides --pixsize and config. Default is beamsize/3 ≈ 4.7″ for a 14.1″ beam.')
+              help='Map pixel size in arcseconds (e.g. --pixel-size-arcsec 7.4). '
+                   'Overrides --pixsize and config. Default is resolution/2 ≈ 7.43″ for a '
+                   '14.1″ beam at the default (beam/3) kernel.')
 @click.option('--output', type=click.Path(), default=None,
               help='Output FITS file path. If not specified, uses "datacube" from config.toml or ./datacube.fits.')
 @click.option('--plot', type=click.Path(), default=None,
@@ -3792,15 +3794,21 @@ def compare_map_integrated_cmd(config, fits_files, clean, reduced, prepared, pca
                    'COVERAGE extensions are written exactly as before whenever --weight-spectra '
                    'is set.')
 @click.option('--kernel-fwhm', type=float, default=None,
-              help='Gridding kernel FWHM in arcseconds. If not specified, uses the beam size '
-                   '(more smoothing, better sensitivity for noise-limited data). Use a value '
-                   'smaller than the beam (e.g. beam/3, matching GILDAS xy_map\'s default) to '
-                   'trade sensitivity for resolution on well-sampled, high-S/N data instead '
-                   '(e.g., --kernel-fwhm 4.7 for a 14.1″ beam).')
+              help='Gridding kernel FWHM in arcseconds. If not specified, defaults to beam/3 '
+                   '(GILDAS xy_map\'s default; output resolution sqrt(beam²+(beam/3)²) ≈ '
+                   '1.054·beam, e.g. 14.86″ for a 14.1″ beam). Pass the full beam for more '
+                   'smoothing/sensitivity on noise-limited data, or a smaller value for sharper '
+                   'output. Ignored if --resolution is set.')
+@click.option('--resolution', type=float, default=None, metavar='ARCSEC',
+              help='Target output resolution in arcseconds (GILDAS MAP%RESO). The gridding '
+                   'kernel is back-solved as FWHM = sqrt(resolution² - beam²), so the finished '
+                   'map has this resolution. Takes precedence over --kernel-fwhm. Must be larger '
+                   'than the beam; GILDAS\'s default output resolution is sqrt(beam²+(beam/3)²) '
+                   '≈ 1.054·beam (e.g. 14.86″ for a 14.1″ beam).')
 @click.option('--telescop', type=str, default=None,
               help='Telescope name written to the FITS header. '
                    'If not specified, reads from config [gridding].telescop (default: IRAM-30M).')
-def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, pixel_size_arcsec, output, plot, n_jobs, weight_spectra, weight_channels, create_weights_datacube, kernel_fwhm, telescop):
+def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beamsize, pixsize, pixel_size_arcsec, output, plot, n_jobs, weight_spectra, weight_channels, create_weights_datacube, kernel_fwhm, resolution, telescop):
     """
     Create a full 3D spectral datacube by gridding spectra across spatial and spectral axes.
     
@@ -3831,6 +3839,7 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         create_datacube --config config.toml --reduced --object M51
         create_datacube --config config.toml --output my_datacube.fits --plot slices.png
         create_datacube --config config.toml --beamsize 14.1 --pixsize 4.7
+        create_datacube --config config.toml --beamsize 14.1 --resolution 14.86  # GILDAS-default output resolution (kernel = beam/3)
         create_datacube --fits postpd.fits --beamsize 14.1 --object M51CENTER --telescop IRAM-30M --output cube.fits
     """
     try:
@@ -3840,21 +3849,73 @@ def create_datacube_cmd(config, fits_file, reduced, pcad, prepared, object, beam
         config_path = config if config else None
         cfg = get_config(config_path) if config_path else {}
 
-        # Get beamsize and pixsize from config if not provided on CLI
-        # Both --beamsize and --pixsize are in arcseconds; convert to degrees here.
-        # --pixel-size-arcsec is an explicit arcsec override for pixsize.
+        # Get beamsize from config if not provided on CLI (arcsec → degrees).
         effective_beamsize = beamsize / 3600.0 if beamsize is not None else None
+
+        # Resolve an EXPLICIT pixel size (arcsec → degrees) from, in priority:
+        # --pixel-size-arcsec, --pixsize, config [gridding].pixel_size_arcsec.
+        # If none is given, pixsize_deg stays None here and is later defaulted to
+        # resolution/2 (GILDAS map%cell convention) once the kernel is known.
         if pixel_size_arcsec is not None:
-            effective_pixsize = pixel_size_arcsec / 3600.0
+            explicit_pixsize_deg = pixel_size_arcsec / 3600.0
         elif pixsize is not None:
-            effective_pixsize = pixsize / 3600.0
+            explicit_pixsize_deg = pixsize / 3600.0
         else:
-            effective_pixsize = None
-        beamsize_deg, pixsize_deg = get_gridding_params_from_config(
+            cfg_pix = cfg.get('gridding', {}).get('pixel_size_arcsec', None)
+            explicit_pixsize_deg = (cfg_pix / 3600.0) if cfg_pix else None
+
+        # get_gridding_params_from_config only for the beamsize (config + default);
+        # its pixel fallback is ignored - we set the pixel size below.
+        beamsize_deg, _ = get_gridding_params_from_config(
             config_path=config_path,
             beamsize_deg=effective_beamsize,
-            pixsize_deg=effective_pixsize
+            pixsize_deg=explicit_pixsize_deg,
         )
+        pixsize_deg = explicit_pixsize_deg
+
+        # --resolution (GILDAS MAP%RESO): back-solve the gridding kernel FWHM from
+        # a target OUTPUT resolution, kernel = sqrt(reso² - beam²). Takes
+        # precedence over --kernel-fwhm. reso must exceed the beam (gridding only
+        # adds blur; it cannot sharpen below the beam).
+        if resolution is not None:
+            beam_arcsec = beamsize_deg * 3600.0
+            if resolution <= beam_arcsec:
+                click.echo(click.style(
+                    f"Error: --resolution {resolution}\" must be larger than the beam "
+                    f"({beam_arcsec:.2f}\") — gridding cannot resolve finer than the beam.",
+                    fg="red"), err=True)
+                sys.exit(1)
+            kernel_from_reso = (resolution ** 2 - beam_arcsec ** 2) ** 0.5
+            if kernel_fwhm is not None:
+                click.echo(f"Note: --resolution {resolution}\" overrides "
+                           f"--kernel-fwhm {kernel_fwhm}\".")
+            kernel_fwhm = kernel_from_reso
+            click.echo(f"Target resolution {resolution}\" → gridding kernel FWHM "
+                       f"{kernel_fwhm:.3f}\" (beam {beam_arcsec:.2f}\").")
+
+        # Default gridding kernel: match GILDAS xy_map, whose default gridding
+        # function FWHM is beam/3, giving an output resolution of
+        # sqrt(beam² + (beam/3)²) ≈ 1.054·beam (a +5.4% beam increase). Applied
+        # only when the user gave neither --resolution nor --kernel-fwhm.
+        if resolution is None and kernel_fwhm is None:
+            beam_arcsec = beamsize_deg * 3600.0
+            kernel_fwhm = beam_arcsec / 3.0
+            reso_arcsec = (beam_arcsec ** 2 + kernel_fwhm ** 2) ** 0.5
+            click.echo(f"Using GILDAS-default gridding kernel FWHM {kernel_fwhm:.3f}\" "
+                       f"(beam/3) → output resolution {reso_arcsec:.2f}\" "
+                       f"(beam {beam_arcsec:.2f}\").")
+
+        # Default pixel size = resolution/2 (GILDAS map%cell convention), where
+        # resolution = sqrt(beam² + kernel²) is the effective output resolution
+        # for whichever kernel was selected above. Applied only when the user did
+        # not set a pixel size explicitly (--pixsize/--pixel-size-arcsec/config).
+        if pixsize_deg is None:
+            beam_arcsec = beamsize_deg * 3600.0
+            _kernel_arcsec = kernel_fwhm if kernel_fwhm is not None else beam_arcsec
+            reso_arcsec = (beam_arcsec ** 2 + _kernel_arcsec ** 2) ** 0.5
+            pixsize_deg = (reso_arcsec / 2.0) / 3600.0
+            click.echo(f"Pixel size defaulted to resolution/2 = {reso_arcsec / 2.0:.3f}\" "
+                       f"(GILDAS map%cell; resolution {reso_arcsec:.2f}\").")
 
         # Determine FITS file to process
         output_cfg = cfg.get('output', {})
@@ -5465,6 +5526,15 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
 @click.option('--smooth', 'smooth_sigma', type=float, default=None, metavar='SIGMA',
               help='Gaussian smooth the display map before plotting. '
                    'SIGMA is the kernel standard deviation in pixels.')
+@click.option('--interpolation', default='nearest', show_default=True,
+              type=click.Choice(['none', 'antialiased', 'nearest', 'bilinear', 'bicubic',
+                                  'spline16', 'spline36', 'hanning', 'hamming', 'hermite',
+                                  'kaiser', 'quadric', 'catrom', 'gaussian', 'bessel',
+                                  'mitchell', 'sinc', 'lanczos', 'blackman'],
+                                 case_sensitive=False),
+              help='Display-only pixel interpolation for imshow (does NOT change the data, '
+                   'unlike --smooth). "nearest" shows hard pixel edges; "bicubic" or '
+                   '"gaussian" blend pixels so the grid is not visible. Purely cosmetic.')
 @click.option('--percentile-clip', type=(float, float), default=None, nargs=2,
               metavar='LO HI',
               help='Percentile range for the colour scale (default: 0 100, full data range). '
@@ -5530,7 +5600,7 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
                       shuffle_ref_velocity, shuffle_field_output,
                       suppress_negative, suppress_high,
                       hex_plot, contour, stretch, gamma,
-                      noise_map_output, smooth_sigma, percentile_clip,
+                      noise_map_output, smooth_sigma, interpolation, percentile_clip,
                       snr_threshold, drop_rms, drop_window,
                       align_peaks, collapse_weights, polygon, polygon_coords):
     """
@@ -5666,6 +5736,7 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
             stretch=stretch,
             gamma=gamma,
             smooth_sigma=smooth_sigma,
+            interpolation=interpolation,
             percentile_clip=percentile_clip,
             snr_threshold=snr_threshold,
             drop_rms=drop_rms,
@@ -5737,8 +5808,21 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
               help='Clip negative (noise) pixels to 0 and force vmin=0 (moment0 only).')
 @click.option('--suppress-high', type=float, default=None, metavar='VALUE',
               help='Clip pixels above VALUE to VALUE (tame bright artefacts).')
+@click.option('--snr-threshold', type=float, default=None, metavar='N',
+              help='Mask pixels below signal-to-noise N (shown as 0). Each cube uses its OWN '
+                   'noise map, measured from the line-free channels outside --velocity-range, '
+                   'so --velocity-range is required. Ignored for --compare-weights.')
 @click.option('--smooth', 'smooth_sigma', type=float, default=None, metavar='SIGMA',
               help='Gaussian-smooth each display map by SIGMA pixels before plotting.')
+@click.option('--interpolation', default='nearest', show_default=True,
+              type=click.Choice(['none', 'antialiased', 'nearest', 'bilinear', 'bicubic',
+                                  'spline16', 'spline36', 'hanning', 'hamming', 'hermite',
+                                  'kaiser', 'quadric', 'catrom', 'gaussian', 'bessel',
+                                  'mitchell', 'sinc', 'lanczos', 'blackman'],
+                                 case_sensitive=False),
+              help='Display-only pixel interpolation for imshow (does NOT change the data, '
+                   'unlike --smooth). "nearest" shows hard pixel edges; "bicubic"/"gaussian" '
+                   'blend pixels so the grid is not visible. Purely cosmetic.')
 @click.option('--compare-weights', is_flag=True, default=False,
               help='Compare the 3D WEIGHT_CUBE extensions instead of the science data: '
                    'each panel is the channel sum of gridded weights (Σ K·w). Requires cubes '
@@ -5759,6 +5843,19 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
 @click.option('--per-panel-scale', is_flag=True, default=False,
               help='Scale each panel to its OWN range (default: one shared scale + colorbar so '
                    'brightness is directly comparable between cubes).')
+@click.option('--tighten-plot', 'tighten_plot', is_flag=True, default=False,
+              help='Compact single-row strip: push panels together horizontally (no gap), '
+                   'share the y-axis (y ticks/label only on the leftmost), and drop the '
+                   'per-panel titles and the main title.')
+@click.option('--crop-empty', 'crop_empty', is_flag=True, default=False,
+              help='Trim the empty (no-data) margins: drop the outer rows/columns that are '
+                   'entirely empty, so the white border shrinks to the galaxy while keeping '
+                   'all data. For deeper cropping use --crop-max-empty. Pairs with --tighten-plot.')
+@click.option('--crop-max-empty', 'crop_max_empty', type=float, default=None, metavar='PCT',
+              help='Crop harder than --crop-empty: keep trimming the emptiest edge until at '
+                   'most PCT%% of the frame is empty (RA and Dec trimmed independently). This '
+                   'bites into the rounded data edges. E.g. --crop-max-empty 15. Overrides '
+                   '--crop-empty.')
 @click.option('--titles', default=None,
               help='Comma-separated panel titles, in file order (default: each file stem).')
 @click.option('--output', '--plot', 'plot_output', type=click.Path(), default=None,
@@ -5768,9 +5865,10 @@ def collapse_cube_cmd(cube_fits, velocity_range, zoom_size_arcmin,
 def compare_maps_cmd(cube_files, extra_cube_files, velocity_range, mode, peak_range_channels,
                      peak_smooth_channels, shuffle, shuffle_snr, shuffle_field_smooth,
                      shuffle_window_kms, shuffle_ref_velocity, coverage_threshold,
-                     trim_edges, suppress_negative, suppress_high, smooth_sigma,
-                     compare_weights, use_wcs, colormap, stretch, gamma, percentile_clip,
-                     per_panel_scale, titles, plot_output, no_show):
+                     trim_edges, suppress_negative, suppress_high, snr_threshold, smooth_sigma,
+                     interpolation, compare_weights, use_wcs, colormap, stretch, gamma,
+                     percentile_clip, per_panel_scale, tighten_plot, crop_empty,
+                     crop_max_empty, titles, plot_output, no_show):
     """
     Collapse several gridded datacubes and draw their maps side by side.
 
@@ -5835,6 +5933,12 @@ def compare_maps_cmd(cube_files, extra_cube_files, velocity_range, mode, peak_ra
             gamma=gamma,
             percentile_clip=percentile_clip,
             per_panel_scale=per_panel_scale,
+            interpolation=interpolation,
+            tighten=tighten_plot,
+            # --crop-max-empty PCT (numeric) bites into edges; --crop-empty (flag)
+            # trims only the fully-empty margins. The numeric form takes priority.
+            crop_empty=(crop_max_empty if crop_max_empty is not None
+                        else (True if crop_empty else None)),
             show=not no_show,
             # forwarded to collapse_cube_to_map:
             velocity_range=velocity_range,
@@ -5850,6 +5954,7 @@ def compare_maps_cmd(cube_files, extra_cube_files, velocity_range, mode, peak_ra
             trim_edges=trim_edges,
             suppress_negative=suppress_negative,
             suppress_high=suppress_high,
+            snr_threshold=snr_threshold,
             smooth_sigma=smooth_sigma,
             collapse_weights=compare_weights,
         )
@@ -6256,6 +6361,12 @@ def print_pca_parameters(fits_path, config):
                    '(e.g. "0.2,0.4,0.6,0.8").')
 @click.option('--n-levels', type=int, default=8, show_default=True,
               help='Number of contour levels, evenly spaced over 20-90%% of the contour peak.')
+@click.option('--level-reference-percentile', type=float, default=99.0, show_default=True,
+              metavar='PCT',
+              help='Percentile of the contour map used as the reference for --level-fractions '
+                   '/ --n-levels. Defaults to p99 rather than the maximum: gridded maps often '
+                   'carry a few extreme edge pixels, and fractions of the true max then bunch '
+                   'every contour onto those. Pass 100 for the literal peak.')
 @click.option('--regrid-kernel', 'regrid_kernel_arcsec', type=float, default=None, metavar='ARCSEC',
               help='Gaussian FWHM for the cygrid resampling of the contour map. Default: one '
                    'target pixel. These maps are already beam-convolved, so re-gridding with '
@@ -6286,7 +6397,8 @@ def overlay_maps_cmd(image_cube, contour_cube, velocity_range, mode, peak_range_
                      peak_smooth_channels, shuffle, shuffle_snr, shuffle_field_smooth,
                      shuffle_window_kms, shuffle_ref_velocity, coverage_threshold,
                      trim_edges, suppress_negative, suppress_high, smooth_sigma,
-                     levels, level_fractions, n_levels, regrid_kernel_arcsec,
+                     levels, level_fractions, n_levels, level_reference_percentile,
+                     regrid_kernel_arcsec,
                      contour_color, contour_linewidth, label_contours,
                      colormap, stretch, gamma, percentile_clip, titles,
                      plot_output, no_show):
@@ -6346,6 +6458,7 @@ def overlay_maps_cmd(image_cube, contour_cube, velocity_range, mode, peak_range_
             levels=_floats(levels),
             level_fractions=_floats(level_fractions),
             n_levels=n_levels,
+            level_reference_percentile=level_reference_percentile,
             regrid_kernel_arcsec=regrid_kernel_arcsec,
             contour_color=contour_color,
             contour_linewidth=contour_linewidth,
