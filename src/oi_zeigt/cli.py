@@ -636,8 +636,8 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
 @click.option(
     "--num-spectra",
     type=int,
-    default=10,
-    help="Number of spectra to plot (default: 10)"
+    default=52,
+    help="Number of spectra to plot (default: 52)"
 )
 @click.option(
     "--output",
