@@ -89,3 +89,7 @@ output
 # Claude Code memory files
 .claude/
 
+
+# Large generated logs
+output.txt
+*.log
