@@ -2115,8 +2115,10 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
     "--yaml",
     "yaml_file",
     type=click.Path(exists=True),
-    default=None,
-    help="Path to mission parameters YAML file (default: mission_id_parameters.yml bundled with the package)."
+    multiple=True,
+    help="Mission parameters YAML with drop: rules; repeat to combine several files, e.g. "
+         "mission_id_parameters.yml and mission_id_pca_parameters.yml "
+         "(default: mission_id_parameters.yml bundled with the package)."
 )
 def filter_missions(fits, output, yaml_file):
     """
@@ -2135,6 +2137,10 @@ def filter_missions(fits, output, yaml_file):
             LFAV_0:
               - 18611
 
+    A top-level all_missions: entry with the same drop: block applies to every
+    mission (see oi_zeigt.drop_rules). Telescope names match exactly or as a
+    prefix up to an underscore (LFAV_3 matches LFAV_3_S).
+
     Rows that match any rule are removed from the output; all other rows are kept unchanged.
 
     Examples:
@@ -2144,24 +2150,13 @@ def filter_missions(fits, output, yaml_file):
         filter_missions --fits clean.fits --output clean_filtered.fits \\
             --yaml /path/to/custom_parameters.yml
     """
-    import yaml as _yaml
     from pathlib import Path as _Path
     from astropy.io import fits as _fits
+    from .drop_rules import load_drop_rules, drop_mask
 
-    # Resolve YAML file
-    if yaml_file is None:
-        yaml_file = _Path(__file__).parent / "pca_analysis" / "mission_id_parameters.yml"
-    else:
-        yaml_file = _Path(yaml_file)
-
-    if not yaml_file.exists():
-        click.echo(click.style(f"Error: YAML file not found: {yaml_file}", fg="red"), err=True)
-        sys.exit(1)
-
-    with open(yaml_file, "r") as f:
-        mission_params = _yaml.safe_load(f) or {}
-
-    click.echo(f"Loaded {len(mission_params)} mission entries from {yaml_file}")
+    yaml_files = [_Path(y) for y in yaml_file] or \
+        [_Path(__file__).parent / "pca_analysis" / "mission_id_parameters.yml"]
+    rules = load_drop_rules(yaml_files, echo=click.echo)
 
     # Load FITS
     click.echo(f"Reading {fits} ...")
@@ -2185,61 +2180,9 @@ def filter_missions(fits, output, yaml_file):
         n_total = len(data)
         click.echo(f"  {n_total} rows total")
 
-        def _to_str(x):
-            if isinstance(x, bytes):
-                return x.decode().strip()
-            return str(x).strip()
-
-        mission_id_col = np.array([_to_str(x) for x in data["MISSION_ID"]])
-        telescop_col   = np.array([_to_str(x) for x in data["TELESCOP"]])
-        scan_col       = np.array([int(x) for x in data["SCAN"]]) if "SCAN" in data.dtype.names else None
-
-        keep = np.ones(n_total, dtype=bool)
-        n_dropped_total = 0
-
-        for mission_id, params in mission_params.items():
-            if not params:
-                continue
-            drop_cfg = params.get("drop") or {}
-            if not drop_cfg:
-                continue
-
-            mission_mask = mission_id_col == mission_id
-
-            # drop.telescope: remove all rows for these telescopes in this mission
-            for tele in (drop_cfg.get("telescope") or []):
-                affected = mission_mask & (telescop_col == tele)
-                n = int(np.sum(affected))
-                if n:
-                    keep &= ~affected
-                    n_dropped_total += n
-                    click.echo(f"  {mission_id} / {tele}: dropped {n} rows (drop.telescope)")
-
-            # drop.scans
-            scans_cfg = drop_cfg.get("scans") or {}
-            if scans_cfg and scan_col is not None:
-
-                # drop.scans.complete: any telescope
-                for scan_num in (scans_cfg.get("complete") or []):
-                    affected = mission_mask & (scan_col == int(scan_num))
-                    n = int(np.sum(affected))
-                    if n:
-                        keep &= ~affected
-                        n_dropped_total += n
-                        click.echo(f"  {mission_id} / scan {scan_num} (all telescopes): dropped {n} rows")
-
-                # drop.scans.telescope.<TELE>: specific telescope
-                for tele, scan_list in ((scans_cfg.get("telescope") or {}).items()):
-                    for scan_num in (scan_list or []):
-                        affected = mission_mask & (telescop_col == tele) & (scan_col == int(scan_num))
-                        n = int(np.sum(affected))
-                        if n:
-                            keep &= ~affected
-                            n_dropped_total += n
-                            click.echo(f"  {mission_id} / {tele} / scan {scan_num}: dropped {n} rows")
-
+        keep = ~drop_mask(data, rules, echo=click.echo)
         n_kept = int(np.sum(keep))
-        click.echo(f"\nDropped {n_dropped_total} rows, keeping {n_kept} / {n_total}")
+        click.echo(f"\nDropped {n_total - n_kept} rows, keeping {n_kept} / {n_total}")
 
         filtered_data = data[keep]
         new_hdu = _fits.BinTableHDU(data=filtered_data, header=header)
@@ -4309,6 +4252,201 @@ def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, obje
 
 
 @click.command()
+@click.option('--config', type=click.Path(exists=True), default=None,
+              help='Path to config.toml file.')
+@click.option('--fits', 'fits_input', type=click.Path(exists=True), default=None,
+              help='FITS file to plot (overrides the config file selection).')
+@click.option('--post-filtered', 'post_filtered', is_flag=True, default=False,
+              help='Use [output].post_filtered_fits from config.')
+@click.option('--reduced', is_flag=True, default=False,
+              help='Use [output].reduced_fits from config.')
+@click.option('--clean', is_flag=True, default=False,
+              help='Use [output].clean_fits from config.')
+@click.option('--object', 'object_filter', type=str, default=None,
+              help='OBJECT substring of the science spectra to average. '
+                   'Defaults to [parameters].object from config.')
+@click.option('--per-polarization', 'per_polarization', is_flag=True, default=False,
+              help='One panel per polarization (H/V) per receiver.')
+@click.option('--per-pixel', 'per_pixel', is_flag=True, default=False,
+              help='One figure per backend (e.g. LFAH, LFAV) with one panel per pixel.')
+@click.option('--weighted', is_flag=True, default=False,
+              help='Weight each spectrum by 1/RMS² (RMS column, else RMS_BASELINE) '
+                   'instead of a plain mean.')
+@click.option('--group-by', 'group_by', type=str, default=None,
+              help='Diagnostic mode: average per scan, subscan and/or telescope, '
+                   'comma-separated (e.g. scan, scan,telescope, subscan). '
+                   'Overrides --per-pixel/--per-polarization.')
+@click.option('--flag-sigma', type=float, default=5.0, show_default=True,
+              help='With --group-by: flag groups whose excess noise is this many '
+                   'robust sigmas above the median.')
+@click.option('--flag-report', 'flag_report', type=click.Path(), default=None,
+              help='With --group-by: also write the recommended drop: rules for the flagged '
+                   'groups (a YAML snippet for mission_id_pca_parameters.yml) to this file. '
+                   'They are always printed on screen.')
+@click.option('--velocity-range', type=(float, float), default=None,
+              help='Velocity range in km/s to show, e.g. --velocity-range 100 400.')
+@click.option('--output', type=click.Path(), default=None,
+              help='Save the plot here (PNG/PDF). With several figures the group label is '
+                   'appended (out.png -> out_LFAH.png). If not given, show on screen.')
+@click.option('--save-plots', 'save_plots', type=click.Path(), default=None,
+              help='Save under a generic prefix, naming each file after its plot: '
+                   'PREFIX_<pixel|polarization|receiver|by_scan_telescope...>[_weighted]'
+                   '[_v<vmin>-<vmax>][_<backend>].png. PREFIX may end in .png/.pdf/.svg to '
+                   'pick the format; if it is a directory (or ends in /), the input FITS '
+                   'name is used as the prefix there. With --group-by the flag report is '
+                   'saved alongside (..._flags.yml) unless --flag-report is given. '
+                   'Not combinable with --output.')
+def plot_spectra_cmd(config, fits_input, post_filtered, reduced, clean, object_filter,
+                     per_polarization, per_pixel, weighted, group_by, flag_sigma,
+                     flag_report, velocity_range, output, save_plots):
+    """
+    Plot averaged spectra per receiver, polarization or pixel.
+
+    Science spectra (SOBSMODE == ON) are grouped on TELESCOP
+    (e.g. LFAH_PX03_S = receiver LFA, polarization H, pixel 3) and averaged
+    channel by channel.  The rms shown per curve excludes
+    [reduction].line_window from config when set.
+
+    Input priority: --fits > --post-filtered > --reduced > --clean > [input].fits_file.
+
+    \b
+      default             one averaged spectrum per receiver (all pixels, both pols)
+      --per-polarization  one panel per polarization; receivers with a single
+                          polarization get a message and a single panel
+      --per-pixel         one figure per backend, one panel per pixel
+                          (takes precedence over --per-polarization)
+      --group-by F[,F..]  diagnostic: one row per scan / scan.subscan /
+                          telescope group (any combination) as a heatmap of
+                          its averaged spectrum, plus each group's excess
+                          noise (line-free rms / radiometric rms); outliers
+                          are flagged and listed, with recommended drop:
+                          rules for the mission YAML (--flag-report FILE
+                          also writes them out); overrides the two above
+
+    Examples:
+
+    \b
+        plot_spectra --config config.toml --post-filtered
+        plot_spectra --config config.toml --post-filtered --per-polarization --weighted
+        plot_spectra --config config.toml --post-filtered --per-pixel --output avg.png
+        plot_spectra --config config.toml --fits data.fits --group-by scan,telescope --output scans.png
+        plot_spectra --config config.toml --fits data.fits --group-by telescope --flag-report drop.yml
+        plot_spectra --fits post_cleaned_pos3.fits --per-pixel --save-plots plots/pos3
+            -> plots/pos3_pixel_LFAH.png, plots/pos3_pixel_LFAV.png
+        plot_spectra --fits data.fits --group-by scan,telescope --save-plots plots/
+            -> plots/data_by_scan_telescope.png (+ plots/data_by_scan_telescope_flags.yml)
+    """
+    try:
+        from .spectra_plots import plot_averaged_spectra
+
+        cfg = get_config(config) if config else {}
+        output_cfg = cfg.get('output', {})
+
+        if fits_input:
+            fits_path = fits_input
+        else:
+            for flag, key in ((post_filtered, 'post_filtered_fits'),
+                              (reduced, 'reduced_fits'),
+                              (clean, 'clean_fits')):
+                if flag:
+                    fits_path = output_cfg.get(key)
+                    if not fits_path:
+                        raise ValueError(f"[output].{key} not defined in config")
+                    break
+            else:
+                fits_path = cfg.get('input', {}).get('fits_file')
+                if not fits_path:
+                    raise ValueError("No input: give --fits, --post-filtered/--reduced/--clean "
+                                     "with --config, or set [input].fits_file")
+        if not Path(fits_path).exists():
+            raise FileNotFoundError(f"FITS file not found: {fits_path}")
+
+        if object_filter is None:
+            object_filter = cfg.get('parameters', {}).get('object')
+
+        line_window = cfg.get('reduction', {}).get('line_window')
+
+        if flag_report and not group_by:
+            raise ValueError("--flag-report needs --group-by")
+        if save_plots and output:
+            raise ValueError("Give either --output or --save-plots, not both")
+
+        group_fields = [f.strip().lower() for f in group_by.split(',') if f.strip()] if group_by else []
+        if per_pixel and per_polarization and not group_by:
+            click.echo("Note: --per-pixel already separates polarizations; ignoring --per-polarization")
+        mode = 'pixel' if per_pixel else 'polarization' if per_polarization else 'receiver'
+
+        if save_plots:
+            from .spectra_plots import GROUP_BY_FIELDS
+            if group_by:
+                # Canonical order, and subscan always brings scan (as the plot does).
+                fields = [f for f in GROUP_BY_FIELDS
+                          if f in group_fields or (f == 'scan' and 'subscan' in group_fields)]
+                kind = 'by_' + '_'.join(fields or group_fields)
+            else:
+                kind = mode
+            if weighted:
+                kind += '_weighted'
+            if velocity_range:
+                kind += f"_v{min(velocity_range):g}-{max(velocity_range):g}"
+            prefix = Path(save_plots)
+            if save_plots.endswith(('/', '\\')) or prefix.is_dir():
+                prefix, ext = prefix / Path(fits_path).stem, '.png'
+            elif prefix.suffix.lower() in ('.png', '.pdf', '.svg', '.jpg', '.jpeg'):
+                prefix, ext = prefix.with_suffix(''), prefix.suffix
+            else:
+                ext = '.png'
+            output = f"{prefix}_{kind}{ext}"
+            if group_by and not flag_report:
+                flag_report = f"{prefix}_{kind}_flags.yml"
+
+        if group_by:
+            from .spectra_plots import plot_grouped_spectra
+            if per_pixel or per_polarization:
+                click.echo("Note: --group-by replaces --per-pixel/--per-polarization; ignoring them")
+            saved = plot_grouped_spectra(
+                input_fits=fits_path,
+                group_by=group_fields,
+                object_filter=object_filter,
+                weighted=weighted,
+                velocity_range=velocity_range,
+                line_window=line_window,
+                flag_sigma=flag_sigma,
+                output=output,
+                flag_report=flag_report,
+                echo=click.echo,
+            )
+            if saved:
+                click.echo(click.style(f"\n✓ Saved {len(saved)} plot(s)", fg="green"))
+            return
+
+        saved = plot_averaged_spectra(
+            input_fits=fits_path,
+            mode=mode,
+            object_filter=object_filter,
+            weighted=weighted,
+            velocity_range=velocity_range,
+            line_window=line_window,
+            output=output,
+            echo=click.echo,
+        )
+        if saved:
+            click.echo(click.style(f"\n✓ Saved {len(saved)} plot(s)", fg="green"))
+
+    except FileNotFoundError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
 @click.option(
     "--config",
     type=click.Path(exists=False),
@@ -4384,7 +4522,9 @@ def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, obje
     "filter_missions",
     is_flag=True,
     default=False,
-    help="Apply drop rules from mission_id_parameters.yml (telescope/scan exclusions per mission)."
+    help="Apply the drop: rules (telescope/scan exclusions per mission, plus an all_missions "
+         "block for every mission) from the mission parameters YAML AND from config "
+         "[input].mission_pca_parameters."
 )
 @click.option(
     "--filter-flight",
@@ -4538,8 +4678,9 @@ def prepare_for_pca(config: Optional[str], fits: Optional[str], output: Optional
 @click.option('--aor-id', 'aor_id', type=str, default=None,
               help='Keep only rows whose AOR_ID contains one of these substrings (comma-separated, e.g. 506,507).')
 @click.option('--filter-missions', 'filter_missions', is_flag=True, default=False,
-              help='Apply telescope/scan drop rules from mission_id_parameters.yml '
-                   '(same rules as prepare_for_pca --filter-missions).')
+              help='Apply telescope/scan drop rules from mission_id_parameters.yml and '
+                   'config [input].mission_pca_parameters (same rules as prepare_for_pca '
+                   '--filter-missions).')
 @click.option('--mission-parameters', 'mission_parameters', type=click.Path(), default=None,
               help='Path to mission_id_parameters YAML. Overrides config [pca]/[input][mission_parameters].')
 @click.option('--whiteness-check', 'whiteness_check', is_flag=True, default=False,
@@ -4695,9 +4836,9 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
             data = data[aor_mask]
 
         if filter_missions:
-            import yaml as _yaml
             from pathlib import Path as _Path
             from .pca_analysis.prepare_for_pca import _default_mission_params_file
+            from .drop_rules import load_drop_rules, drop_mask
 
             if mission_parameters:
                 _yml_path = _Path(mission_parameters)
@@ -4705,82 +4846,14 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                 _yml_path = (cfg.get('pca', {}).get('mission_parameters') or
                              cfg.get('input', {}).get('mission_parameters'))
                 _yml_path = _Path(_yml_path) if _yml_path else _default_mission_params_file()
-
-            if not _yml_path.exists():
-                click.echo(click.style(f"Warning: mission YAML not found: {_yml_path} — skipping --filter-missions", fg='yellow'))
-            else:
-                click.echo(f"Applying mission drop rules from {_yml_path}")
-                with open(_yml_path, 'r') as _f:
-                    _mparams = _yaml.safe_load(_f) or {}
-
-                mission_ids_col = np.array([
-                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
-                    for s in data['MISSION_ID']
-                ]) if 'MISSION_ID' in data.dtype.names else None
-                scan_col = np.array(data['SCAN']) if 'SCAN' in data.dtype.names else None
-                telescop_col = np.array([
-                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
-                    for s in data['TELESCOP']
-                ]) if 'TELESCOP' in data.dtype.names else None
-
-                if mission_ids_col is not None:
-                    keep_mask = np.ones(len(data), dtype=bool)
-                    n_before = len(data)
-
-                    def _tele_match(tele):
-                        return np.array([t == tele or t.startswith(tele + '_')
-                                         for t in telescop_col])
-
-                    for mid, params in _mparams.items():
-                        if not params:
-                            continue
-                        drop_val = params.get('drop')
-                        mid_mask = mission_ids_col == mid
-
-                        # drop: flight — remove every row for this mission/flight
-                        if drop_val == 'flight' or (
-                                isinstance(drop_val, dict) and drop_val.get('flight')):
-                            n = int(np.sum(mid_mask & keep_mask))
-                            if n:
-                                click.echo(f"  drop.flight: {mid} — dropping entire flight "
-                                           f"({n} rows)")
-                                keep_mask &= ~mid_mask
-                            continue
-
-                        drop_cfg = drop_val if isinstance(drop_val, dict) else {}
-                        if not drop_cfg:
-                            continue
-                        if not np.any(mid_mask & keep_mask):
-                            continue
-
-                        for tele in (drop_cfg.get('telescope') or []):
-                            if telescop_col is not None:
-                                drop = keep_mask & mid_mask & _tele_match(tele)
-                                n = int(np.sum(drop))
-                                if n:
-                                    click.echo(f"  drop.telescope: {mid} / {tele} — removing {n} rows")
-                                    keep_mask &= ~drop
-
-                        scans_cfg = drop_cfg.get('scans') or {}
-                        if scans_cfg and scan_col is not None:
-                            for scan_num in (scans_cfg.get('complete') or []):
-                                drop = keep_mask & mid_mask & (scan_col == int(scan_num))
-                                n = int(np.sum(drop))
-                                if n:
-                                    click.echo(f"  drop.scans.complete: {mid} / scan {scan_num} — removing {n} rows")
-                                    keep_mask &= ~drop
-                            for tele, scan_list in ((scans_cfg.get('telescope') or {}).items()):
-                                if telescop_col is not None:
-                                    for scan_num in (scan_list or []):
-                                        drop = keep_mask & mid_mask & _tele_match(tele) & (scan_col == int(scan_num))
-                                        n = int(np.sum(drop))
-                                        if n:
-                                            click.echo(f"  drop.scans.telescope: {mid} / {tele} / scan {scan_num} — removing {n} rows")
-                                            keep_mask &= ~drop
-
-                    data = data[keep_mask]
-                    click.echo(f"Mission drop rules: {n_before} → {len(data)} rows "
-                               f"(removed {n_before - len(data)})")
+            # Same files as prepare_for_pca --filter-missions: the mission YAML plus
+            # the per-mission PCA YAML, each with its all_missions block.
+            _rules = load_drop_rules([_yml_path, cfg.get('input', {}).get('mission_pca_parameters')],
+                                     echo=click.echo)
+            n_before = len(data)
+            data = data[~drop_mask(data, _rules, echo=click.echo)]
+            click.echo(f"Mission drop rules: {n_before} → {len(data)} rows "
+                       f"(removed {n_before - len(data)})")
 
         n_spectra = len(data)
 

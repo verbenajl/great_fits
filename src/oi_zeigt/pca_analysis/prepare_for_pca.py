@@ -262,7 +262,8 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
                             filter_below: Optional[list] = None,
                             filter_above: Optional[list] = None,
                             mission_params_file: Optional[Union[str, Path]] = None,
-                            baseline_order: Optional[int] = None) -> None:
+                            baseline_order: Optional[int] = None,
+                            mission_pca_params_file: Optional[Union[str, Path]] = None) -> None:
     """
     Filter FITS file and optionally fill telluric lines with Gaussian noise.
 
@@ -375,83 +376,19 @@ def fill_telluric_with_noise(fits_file: str, output_fits: str,
             logger.info(f"  Matched AOR_IDs: {matched}")
             logger.info(f"  After AOR_ID filter: {after_filter}/{before_filter} rows kept")
 
-        # Apply mission drop rules from mission_id_parameters.yml
+        # Apply mission drop rules: the drop: blocks of mission_id_parameters.yml
+        # (or the bundled default) AND of the per-mission PCA YAML, plus their
+        # all_missions blocks — see oi_zeigt.drop_rules for the schema.
         if filter_missions:
-            import yaml as _yaml
+            from oi_zeigt.drop_rules import load_drop_rules, drop_mask
             mission_yml = (Path(mission_params_file) if mission_params_file
                            else _default_mission_params_file())
-            if not mission_yml.exists():
-                logger.warning(f"--filter-missions requested but YAML not found: {mission_yml}")
-            else:
-                with open(mission_yml, 'r') as _f:
-                    mission_params = _yaml.safe_load(_f) or {}
-                scan_col = np.array(data['SCAN']) if 'SCAN' in data.dtype.names else None
-                telescop_col = np.array([
-                    s.decode().strip() if isinstance(s, bytes) else str(s).strip()
-                    for s in data['TELESCOP']
-                ]) if 'TELESCOP' in data.dtype.names else None
-                n_before_drop = int(np.sum(combined_mask))
-                for mid, params in mission_params.items():
-                    if not params:
-                        continue
-                    drop_val = params.get('drop')
-                    mid_mask = mission_ids == mid
-
-                    # drop: flight — remove every row for this mission/flight
-                    if drop_val == 'flight' or (
-                            isinstance(drop_val, dict) and drop_val.get('flight')):
-                        n = int(np.sum(mid_mask & combined_mask))
-                        if n:
-                            logger.info(f"  drop.flight: {mid} — dropping entire flight "
-                                        f"({n} rows)")
-                            combined_mask &= ~mid_mask
-                        continue
-
-                    drop_cfg = drop_val if isinstance(drop_val, dict) else {}
-                    if not drop_cfg:
-                        continue
-                    if not np.any(mid_mask & combined_mask):
-                        continue  # mission not present in current data, skip silently
-
-                    # Prefix match: YAML name "LFAV_3" matches FITS "LFAV_3_S" etc.
-                    def _tele_match(tele):
-                        return np.array([t == tele or t.startswith(tele + '_') for t in telescop_col])
-
-                    # drop.telescope
-                    for tele in (drop_cfg.get('telescope') or []):
-                        if telescop_col is not None:
-                            drop = combined_mask & mid_mask & _tele_match(tele)
-                            n = int(np.sum(drop))
-                            if n:
-                                logger.info(f"  drop.telescope: {mid} / {tele} — removing {n} rows")
-                                combined_mask &= ~drop
-                            else:
-                                logger.warning(f"  drop.telescope: {mid} / {tele} — 0 rows matched")
-
-                    # drop.scans
-                    scans_cfg = drop_cfg.get('scans') or {}
-                    if scans_cfg and scan_col is not None:
-                        for scan_num in (scans_cfg.get('complete') or []):
-                            drop = combined_mask & mid_mask & (scan_col == int(scan_num))
-                            n = int(np.sum(drop))
-                            if n:
-                                logger.info(f"  drop.scans.complete: {mid} / scan {scan_num} — removing {n} rows")
-                                combined_mask &= ~drop
-                            else:
-                                logger.warning(f"  drop.scans.complete: {mid} / scan {scan_num} — 0 rows matched")
-                        for tele, scan_list in ((scans_cfg.get('telescope') or {}).items()):
-                            if telescop_col is not None:
-                                for scan_num in (scan_list or []):
-                                    drop = combined_mask & mid_mask & _tele_match(tele) & (scan_col == int(scan_num))
-                                    n = int(np.sum(drop))
-                                    if n:
-                                        logger.info(f"  drop.scans.telescope: {mid} / {tele} / scan {scan_num} — removing {n} rows")
-                                        combined_mask &= ~drop
-                                    else:
-                                        logger.warning(f"  drop.scans.telescope: {mid} / {tele} / scan {scan_num} — 0 rows matched")
-                n_after_drop = int(np.sum(combined_mask))
-                logger.info(f"Mission drop rules: removed {n_before_drop - n_after_drop} rows "
-                            f"({n_before_drop} → {n_after_drop})")
+            rules = load_drop_rules([mission_yml, mission_pca_params_file], echo=logger.info)
+            n_before_drop = int(np.sum(combined_mask))
+            combined_mask &= ~drop_mask(data, rules, within=combined_mask, echo=logger.info)
+            n_after_drop = int(np.sum(combined_mask))
+            logger.info(f"Mission drop rules: removed {n_before_drop - n_after_drop} rows "
+                        f"({n_before_drop} → {n_after_drop})")
 
         # --- Parameter-value filters on the science + PCA-reference spectra -----
         # Mirrors filter_fits' --filter-below / --filter-above (implemented by
@@ -669,7 +606,8 @@ def prepare_for_pca(fits_file: Optional[str] = None,
                    filter_below: Optional[list] = None,
                    filter_above: Optional[list] = None,
                    mission_params_file: Optional[str] = None,
-                   baseline_order: Optional[int] = None) -> None:
+                   baseline_order: Optional[int] = None,
+                   mission_pca_params_file: Optional[str] = None) -> None:
     """
     Main entry point for prepare_for_pca functionality.
     
@@ -747,6 +685,10 @@ def prepare_for_pca(fits_file: Optional[str] = None,
         if not mission_params_file:
             mission_params_file = (cfg.get('pca', {}).get('mission_parameters')
                                    or cfg.get('input', {}).get('mission_parameters'))
+
+        # Per-mission PCA YAML: --filter-missions also honours its drop: blocks.
+        if not mission_pca_params_file:
+            mission_pca_params_file = cfg.get('input', {}).get('mission_pca_parameters')
     
     # Validate required parameters
     if not fits_file:
@@ -774,4 +716,5 @@ def prepare_for_pca(fits_file: Optional[str] = None,
                             filter_flight=filter_flight,
                             filter_below=filter_below, filter_above=filter_above,
                             mission_params_file=mission_params_file,
-                            baseline_order=baseline_order)
+                            baseline_order=baseline_order,
+                            mission_pca_params_file=mission_pca_params_file)
