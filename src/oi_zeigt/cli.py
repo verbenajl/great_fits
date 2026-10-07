@@ -585,110 +585,102 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
         return None
 
 
-@click.command()
-@click.option(
-    "--config",
-    type=click.Path(exists=False),
-    default=None,
-    help="Path to config.toml file"
-)
-@click.option(
-    "--fits",
-    type=click.Path(exists=False),
-    default=None,
-    help="Path to FITS file to read directly (default: input.fits_file from config)"
-)
-@click.option(
-    "--reduced",
-    is_flag=True,
-    default=False,
-    help="Plot from output.reduced_fits in config.toml"
-)
-@click.option(
-    "--clean",
-    is_flag=True,
-    default=False,
-    help="Plot from output.clean_fits in config.toml"
-)
-@click.option(
-    "--prepared",
-    is_flag=True,
-    default=False,
-    help="Plot from output.prepared_for_pca in config.toml"
-)
-@click.option(
-    "--pcad",
-    is_flag=True,
-    default=False,
-    help="Plot from output.pcad_fits in config.toml"
-)
-@click.option(
-    "--post",
-    is_flag=True,
-    default=False,
-    help="Plot from output.post_filtered_fits in config.toml"
-)
-@click.option(
-    "--object",
-    default=None,
-    help="Object name to filter (substring match)"
-)
-@click.option(
-    "--num-spectra",
-    type=int,
-    default=52,
-    help="Number of spectra to plot (default: 52)"
-)
-@click.option(
-    "--output",
-    type=click.Path(),
-    default=None,
-    help="Output file for the plot (PNG or PDF). If not specified, show plot."
-)
-@click.option(
-    "--filter-above",
-    "filter_above_col",
-    default=None,
-    help="Column name: only plot spectra with value above --filter-value. "
-         "If RMSRATIOB is requested but absent, falls back to RMSRATIO."
-)
-@click.option(
-    "--filter-below",
-    "filter_below_col",
-    default=None,
-    help="Column name: only plot spectra with value below --filter-value. "
-         "If RMSRATIOB is requested but absent, falls back to RMSRATIO."
-)
-@click.option(
-    "--filter-value",
-    type=float,
-    default=None,
-    help="Threshold value for --filter-above or --filter-below."
-)
+_SAMPLE_SPECTRA_OPTIONS = [
+    click.option(
+        "--config",
+        type=click.Path(exists=False),
+        default=None,
+        help="Path to config.toml file"
+    ),
+    click.option(
+        "--fits",
+        type=click.Path(exists=False),
+        default=None,
+        help="Path to FITS file to read directly (default: input.fits_file from config)"
+    ),
+    click.option(
+        "--reduced",
+        is_flag=True,
+        default=False,
+        help="Plot from output.reduced_fits in config.toml"
+    ),
+    click.option(
+        "--clean",
+        is_flag=True,
+        default=False,
+        help="Plot from output.clean_fits in config.toml"
+    ),
+    click.option(
+        "--prepared",
+        is_flag=True,
+        default=False,
+        help="Plot from output.prepared_for_pca in config.toml"
+    ),
+    click.option(
+        "--pcad",
+        is_flag=True,
+        default=False,
+        help="Plot from output.pcad_fits in config.toml"
+    ),
+    click.option(
+        "--post",
+        is_flag=True,
+        default=False,
+        help="Plot from output.post_filtered_fits in config.toml"
+    ),
+    click.option(
+        "--object",
+        default=None,
+        help="Object name to filter (substring match)"
+    ),
+    click.option(
+        "--num-spectra",
+        type=int,
+        default=52,
+        help="Number of spectra to plot (default: 52)"
+    ),
+    click.option(
+        "--output",
+        type=click.Path(),
+        default=None,
+        help="Output file for the plot (PNG or PDF). If not specified, show plot."
+    ),
+    click.option(
+        "--filter-above",
+        "filter_above_col",
+        default=None,
+        help="Column name: only plot spectra with value above --filter-value. "
+             "If RMSRATIOB is requested but absent, falls back to RMSRATIO."
+    ),
+    click.option(
+        "--filter-below",
+        "filter_below_col",
+        default=None,
+        help="Column name: only plot spectra with value below --filter-value. "
+             "If RMSRATIOB is requested but absent, falls back to RMSRATIO."
+    ),
+    click.option(
+        "--filter-value",
+        type=float,
+        default=None,
+        help="Threshold value for --filter-above or --filter-below."
+    ),
+]
 
 
-def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
-                       pcad: bool, post: bool, object: Optional[str], num_spectra: int, output: Optional[str],
-                       filter_above_col: Optional[str], filter_below_col: Optional[str],
-                       filter_value: Optional[float]):
-    """
-    Plot a sample of spectra from a FITS file.
-    
-    Optionally filter by object name and limit the number of spectra plotted.
-    If VELOCITY_AXIS column is not present, attempts to create one on-the-fly
-    from FITS header parameters (VELOCITY, DELTAV, CRPIX1).
-    
-    Examples:
-    
-        # Plot 20 spectra from the default FITS file in config.toml
-        plot_sample_spectra --config config.toml
-        
-        # Plot only M51 spectra
-        plot_sample_spectra --config config.toml --object M51
-        
-        # Plot 50 spectra and save as PDF
-        plot_sample_spectra --fits /path/to/file.fits --num-spectra 50 --output plot.pdf
-    """
+def _sample_spectra_options(f):
+    """Apply the options shared by plot_sample_spectra and plot_sample_raw."""
+    for option in reversed(_SAMPLE_SPECTRA_OPTIONS):
+        f = option(f)
+    return f
+
+
+def _plot_sample_column(column: str, ylabel: str, config: Optional[str], fits: Optional[str],
+                         reduced: bool, clean: bool, prepared: bool, pcad: bool, post: bool,
+                         object: Optional[str], num_spectra: int, output: Optional[str],
+                         filter_above_col: Optional[str], filter_below_col: Optional[str],
+                         filter_value: Optional[float]):
+    """Plot a random sample of rows from the given spectral column (e.g. SPECTRUM, RAW)."""
     try:
         # Load config to get object filter and handle output file flags
         config_data = {}
@@ -759,12 +751,12 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
         for hdu in hdul:
             if (hasattr(hdu, 'data') and hdu.data is not None
                     and hdu.data.dtype.names is not None
-                    and 'SPECTRUM' in hdu.data.dtype.names):
+                    and column in hdu.data.dtype.names):
                 matrix_hdu = hdu
                 break
         
         if matrix_hdu is None:
-            raise ValueError("No HDU with SPECTRUM column found")
+            raise ValueError(f"No HDU with {column} column found")
         
         data = matrix_hdu.data
         
@@ -811,11 +803,11 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
         
         spectra_to_plot = [data[i] for i in sampled_indices]
         
-        click.echo(f"Plotting {sample_size} spectra for object '{object}'")
+        click.echo(f"Plotting {sample_size} {column} spectra for object '{object}'")
         click.echo(f"Original FITS row indices (for reference): {original_indices}\n")
         
         # Reconstruct velocity axis from VELOCITY/DELTAV/CRPIX1 columns
-        nchans = data['SPECTRUM'][0].shape[0]
+        nchans = data[column][0].shape[0]
         velocity_axis_from_fits = _create_velocity_axis_from_fits(matrix_hdu, nchans)
         if velocity_axis_from_fits is not None:
             click.echo("✓ Velocity axis reconstructed from FITS parameters")
@@ -837,7 +829,7 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
         
         # Plot each spectrum
         for plot_num, (ax, spectrum_data, orig_idx) in enumerate(zip(axes.flat, spectra_to_plot, original_indices)):
-            spectrum = spectrum_data['SPECTRUM']
+            spectrum = spectrum_data[column]
             obj_name = spectrum_data['OBJECT'].decode().strip() if isinstance(spectrum_data['OBJECT'], bytes) else str(spectrum_data['OBJECT']).strip()
             
             x_axis = None
@@ -880,7 +872,7 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
                         pass
             ax.set_title(title, fontsize=10, color=title_color, weight='bold')
             ax.set_xlabel(x_label)
-            ax.set_ylabel("Intensity")
+            ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
         
         # Hide unused subplots
@@ -916,6 +908,65 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
     except Exception as e:
         click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
         sys.exit(1)
+
+
+@click.command()
+@_sample_spectra_options
+def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
+                       pcad: bool, post: bool, object: Optional[str], num_spectra: int, output: Optional[str],
+                       filter_above_col: Optional[str], filter_below_col: Optional[str],
+                    filter_value: Optional[float]):
+    """
+    Plot a sample of spectra from a FITS file.
+    
+    Optionally filter by object name and limit the number of spectra plotted.
+    If VELOCITY_AXIS column is not present, attempts to create one on-the-fly
+    from FITS header parameters (VELOCITY, DELTAV, CRPIX1).
+    
+    Examples:
+    
+        # Plot 20 spectra from the default FITS file in config.toml
+        plot_sample_spectra --config config.toml
+        
+        # Plot only M51 spectra
+        plot_sample_spectra --config config.toml --object M51
+        
+        # Plot 50 spectra and save as PDF
+        plot_sample_spectra --fits /path/to/file.fits --num-spectra 50 --output plot.pdf
+    """
+    _plot_sample_column("SPECTRUM", "Intensity", config, fits, reduced, clean, prepared, pcad, post,
+                        object, num_spectra, output, filter_above_col, filter_below_col, filter_value)
+
+
+@click.command()
+@_sample_spectra_options
+def plot_sample_raw(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
+                    pcad: bool, post: bool, object: Optional[str], num_spectra: int, output: Optional[str],
+                    filter_above_col: Optional[str], filter_below_col: Optional[str],
+                    filter_value: Optional[float]):
+    """
+    Plot a sample of RAW spectra (the RAW column) from a FITS file.
+
+    Same options as plot_sample_spectra, but plots RAW instead of SPECTRUM.
+    
+    Optionally filter by object name and limit the number of spectra plotted.
+    If VELOCITY_AXIS column is not present, attempts to create one on-the-fly
+    from FITS header parameters (VELOCITY, DELTAV, CRPIX1).
+    
+    Examples:
+    
+        # Plot 52 RAW spectra from the default FITS file in config.toml
+        plot_sample_raw --config config.toml
+        
+        # Plot only M51 spectra
+        plot_sample_raw --config config.toml --object M51
+        
+        # Plot 50 spectra and save as PDF
+        plot_sample_raw --fits /path/to/file.fits --num-spectra 50 --output plot.pdf
+    """
+    _plot_sample_column("RAW", "RAW", config, fits, reduced, clean, prepared, pcad, post,
+                        object, num_spectra, output, filter_above_col, filter_below_col, filter_value)
+
 
 
 @click.command()
@@ -4251,91 +4302,65 @@ def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, obje
         sys.exit(1)
 
 
-@click.command()
-@click.option('--config', type=click.Path(exists=True), default=None,
-              help='Path to config.toml file.')
-@click.option('--fits', 'fits_input', type=click.Path(exists=True), default=None,
-              help='FITS file to plot (overrides the config file selection).')
-@click.option('--post-filtered', 'post_filtered', is_flag=True, default=False,
-              help='Use [output].post_filtered_fits from config.')
-@click.option('--reduced', is_flag=True, default=False,
-              help='Use [output].reduced_fits from config.')
-@click.option('--clean', is_flag=True, default=False,
-              help='Use [output].clean_fits from config.')
-@click.option('--object', 'object_filter', type=str, default=None,
-              help='OBJECT substring of the science spectra to average. '
-                   'Defaults to [parameters].object from config.')
-@click.option('--per-polarization', 'per_polarization', is_flag=True, default=False,
-              help='One panel per polarization (H/V) per receiver.')
-@click.option('--per-pixel', 'per_pixel', is_flag=True, default=False,
-              help='One figure per backend (e.g. LFAH, LFAV) with one panel per pixel.')
-@click.option('--weighted', is_flag=True, default=False,
-              help='Weight each spectrum by 1/RMS² (RMS column, else RMS_BASELINE) '
-                   'instead of a plain mean.')
-@click.option('--group-by', 'group_by', type=str, default=None,
-              help='Diagnostic mode: average per scan, subscan and/or telescope, '
-                   'comma-separated (e.g. scan, scan,telescope, subscan). '
-                   'Overrides --per-pixel/--per-polarization.')
-@click.option('--flag-sigma', type=float, default=5.0, show_default=True,
-              help='With --group-by: flag groups whose excess noise is this many '
-                   'robust sigmas above the median.')
-@click.option('--flag-report', 'flag_report', type=click.Path(), default=None,
-              help='With --group-by: also write the recommended drop: rules for the flagged '
-                   'groups (a YAML snippet for mission_id_pca_parameters.yml) to this file. '
-                   'They are always printed on screen.')
-@click.option('--velocity-range', type=(float, float), default=None,
-              help='Velocity range in km/s to show, e.g. --velocity-range 100 400.')
-@click.option('--output', type=click.Path(), default=None,
-              help='Save the plot here (PNG/PDF). With several figures the group label is '
-                   'appended (out.png -> out_LFAH.png). If not given, show on screen.')
-@click.option('--save-plots', 'save_plots', type=click.Path(), default=None,
-              help='Save under a generic prefix, naming each file after its plot: '
-                   'PREFIX_<pixel|polarization|receiver|by_scan_telescope...>[_weighted]'
-                   '[_v<vmin>-<vmax>][_<backend>].png. PREFIX may end in .png/.pdf/.svg to '
-                   'pick the format; if it is a directory (or ends in /), the input FITS '
-                   'name is used as the prefix there. With --group-by the flag report is '
-                   'saved alongside (..._flags.yml) unless --flag-report is given. '
-                   'Not combinable with --output.')
-def plot_spectra_cmd(config, fits_input, post_filtered, reduced, clean, object_filter,
-                     per_polarization, per_pixel, weighted, group_by, flag_sigma,
-                     flag_report, velocity_range, output, save_plots):
-    """
-    Plot averaged spectra per receiver, polarization or pixel.
+_PLOT_SPECTRA_OPTIONS = [
+    click.option('--config', type=click.Path(exists=True), default=None,
+                 help='Path to config.toml file.'),
+    click.option('--fits', 'fits_input', type=click.Path(exists=True), default=None,
+                 help='FITS file to plot (overrides the config file selection).'),
+    click.option('--post-filtered', 'post_filtered', is_flag=True, default=False,
+                 help='Use [output].post_filtered_fits from config.'),
+    click.option('--reduced', is_flag=True, default=False,
+                 help='Use [output].reduced_fits from config.'),
+    click.option('--clean', is_flag=True, default=False,
+                 help='Use [output].clean_fits from config.'),
+    click.option('--object', 'object_filter', type=str, default=None,
+                 help='OBJECT substring of the science spectra to average. '
+                      'Defaults to [parameters].object from config.'),
+    click.option('--per-polarization', 'per_polarization', is_flag=True, default=False,
+                 help='One panel per polarization (H/V) per receiver.'),
+    click.option('--per-pixel', 'per_pixel', is_flag=True, default=False,
+                 help='One figure per backend (e.g. LFAH, LFAV) with one panel per pixel.'),
+    click.option('--weighted', is_flag=True, default=False,
+                 help='Weight each spectrum by 1/RMS² (RMS column, else RMS_BASELINE) '
+                      'instead of a plain mean.'),
+    click.option('--group-by', 'group_by', type=str, default=None,
+                 help='Diagnostic mode: average per scan, subscan and/or telescope, '
+                      'comma-separated (e.g. scan, scan,telescope, subscan). '
+                      'Overrides --per-pixel/--per-polarization.'),
+    click.option('--flag-sigma', type=float, default=5.0, show_default=True,
+                 help='With --group-by: flag groups whose excess noise is this many '
+                      'robust sigmas above the median.'),
+    click.option('--flag-report', 'flag_report', type=click.Path(), default=None,
+                 help='With --group-by: also write the recommended drop: rules for the flagged '
+                      'groups (a YAML snippet for mission_id_pca_parameters.yml) to this file. '
+                      'They are always printed on screen.'),
+    click.option('--velocity-range', type=(float, float), default=None,
+                 help='Velocity range in km/s to show, e.g. --velocity-range 100 400.'),
+    click.option('--output', type=click.Path(), default=None,
+                 help='Save the plot here (PNG/PDF). With several figures the group label is '
+                      'appended (out.png -> out_LFAH.png). If not given, show on screen.'),
+    click.option('--save-plots', 'save_plots', type=click.Path(), default=None,
+                 help='Save under a generic prefix, naming each file after its plot: '
+                      'PREFIX_<pixel|polarization|receiver|by_scan_telescope...>[_weighted]'
+                      '[_v<vmin>-<vmax>][_<backend>].png. PREFIX may end in .png/.pdf/.svg to '
+                      'pick the format; if it is a directory (or ends in /), the input FITS '
+                      'name is used as the prefix there. With --group-by the flag report is '
+                      'saved alongside (..._flags.yml) unless --flag-report is given. '
+                      'Not combinable with --output.'),
+]
 
-    Science spectra (SOBSMODE == ON) are grouped on TELESCOP
-    (e.g. LFAH_PX03_S = receiver LFA, polarization H, pixel 3) and averaged
-    channel by channel.  The rms shown per curve excludes
-    [reduction].line_window from config when set.
 
-    Input priority: --fits > --post-filtered > --reduced > --clean > [input].fits_file.
+def _plot_spectra_options(f):
+    """Apply the options shared by plot_spectra and plot_raw."""
+    for option in reversed(_PLOT_SPECTRA_OPTIONS):
+        f = option(f)
+    return f
 
-    \b
-      default             one averaged spectrum per receiver (all pixels, both pols)
-      --per-polarization  one panel per polarization; receivers with a single
-                          polarization get a message and a single panel
-      --per-pixel         one figure per backend, one panel per pixel
-                          (takes precedence over --per-polarization)
-      --group-by F[,F..]  diagnostic: one row per scan / scan.subscan /
-                          telescope group (any combination) as a heatmap of
-                          its averaged spectrum, plus each group's excess
-                          noise (line-free rms / radiometric rms); outliers
-                          are flagged and listed, with recommended drop:
-                          rules for the mission YAML (--flag-report FILE
-                          also writes them out); overrides the two above
 
-    Examples:
-
-    \b
-        plot_spectra --config config.toml --post-filtered
-        plot_spectra --config config.toml --post-filtered --per-polarization --weighted
-        plot_spectra --config config.toml --post-filtered --per-pixel --output avg.png
-        plot_spectra --config config.toml --fits data.fits --group-by scan,telescope --output scans.png
-        plot_spectra --config config.toml --fits data.fits --group-by telescope --flag-report drop.yml
-        plot_spectra --fits post_cleaned_pos3.fits --per-pixel --save-plots plots/pos3
-            -> plots/pos3_pixel_LFAH.png, plots/pos3_pixel_LFAV.png
-        plot_spectra --fits data.fits --group-by scan,telescope --save-plots plots/
-            -> plots/data_by_scan_telescope.png (+ plots/data_by_scan_telescope_flags.yml)
-    """
+def _plot_spectra_column(column, config, fits_input, post_filtered, reduced, clean, object_filter,
+                         per_polarization, per_pixel, weighted, group_by, flag_sigma,
+                         flag_report, velocity_range, output, save_plots):
+    """Shared body of plot_spectra / plot_raw: average and plot the given spectral column."""
     try:
         from .spectra_plots import plot_averaged_spectra
 
@@ -4385,6 +4410,8 @@ def plot_spectra_cmd(config, fits_input, post_filtered, reduced, clean, object_f
                 kind = 'by_' + '_'.join(fields or group_fields)
             else:
                 kind = mode
+            if column != 'SPECTRUM':
+                kind = f"{column.lower()}_{kind}"
             if weighted:
                 kind += '_weighted'
             if velocity_range:
@@ -4414,6 +4441,7 @@ def plot_spectra_cmd(config, fits_input, post_filtered, reduced, clean, object_f
                 flag_sigma=flag_sigma,
                 output=output,
                 flag_report=flag_report,
+                column=column,
                 echo=click.echo,
             )
             if saved:
@@ -4428,6 +4456,7 @@ def plot_spectra_cmd(config, fits_input, post_filtered, reduced, clean, object_f
             velocity_range=velocity_range,
             line_window=line_window,
             output=output,
+            column=column,
             echo=click.echo,
         )
         if saved:
@@ -4437,6 +4466,136 @@ def plot_spectra_cmd(config, fits_input, post_filtered, reduced, clean, object_f
         click.echo(click.style(f"Error: {e}", fg="red"), err=True)
         sys.exit(1)
     except ValueError as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@_plot_spectra_options
+def plot_spectra_cmd(config, fits_input, post_filtered, reduced, clean, object_filter,
+                     per_polarization, per_pixel, weighted, group_by, flag_sigma,
+                     flag_report, velocity_range, output, save_plots):
+    """
+    Plot averaged spectra per receiver, polarization or pixel.
+
+    Science spectra (SOBSMODE == ON) are grouped on TELESCOP
+    (e.g. LFAH_PX03_S = receiver LFA, polarization H, pixel 3) and averaged
+    channel by channel.  The rms shown per curve excludes
+    [reduction].line_window from config when set.
+
+    Input priority: --fits > --post-filtered > --reduced > --clean > [input].fits_file.
+
+    \b
+      default             one averaged spectrum per receiver (all pixels, both pols)
+      --per-polarization  one panel per polarization; receivers with a single
+                          polarization get a message and a single panel
+      --per-pixel         one figure per backend, one panel per pixel
+                          (takes precedence over --per-polarization)
+      --group-by F[,F..]  diagnostic: one row per scan / scan.subscan /
+                          telescope group (any combination) as a heatmap of
+                          its averaged spectrum, plus each group's excess
+                          noise (line-free rms / radiometric rms); outliers
+                          are flagged and listed, with recommended drop:
+                          rules for the mission YAML (--flag-report FILE
+                          also writes them out); overrides the two above
+
+    Examples:
+
+    \b
+        plot_spectra --config config.toml --post-filtered
+        plot_spectra --config config.toml --post-filtered --per-polarization --weighted
+        plot_spectra --config config.toml --post-filtered --per-pixel --output avg.png
+        plot_spectra --config config.toml --fits data.fits --group-by scan,telescope --output scans.png
+        plot_spectra --config config.toml --fits data.fits --group-by telescope --flag-report drop.yml
+        plot_spectra --fits post_cleaned_pos3.fits --per-pixel --save-plots plots/pos3
+            -> plots/pos3_pixel_LFAH.png, plots/pos3_pixel_LFAV.png
+        plot_spectra --fits data.fits --group-by scan,telescope --save-plots plots/
+            -> plots/data_by_scan_telescope.png (+ plots/data_by_scan_telescope_flags.yml)
+    """
+    _plot_spectra_column('SPECTRUM', config, fits_input, post_filtered, reduced, clean, object_filter,
+                         per_polarization, per_pixel, weighted, group_by, flag_sigma,
+                         flag_report, velocity_range, output, save_plots)
+
+
+@click.command()
+@_plot_spectra_options
+def plot_raw_cmd(config, fits_input, post_filtered, reduced, clean, object_filter,
+                 per_polarization, per_pixel, weighted, group_by, flag_sigma,
+                 flag_report, velocity_range, output, save_plots):
+    """
+    Plot averaged RAW spectra per receiver, polarization or pixel.
+
+    Same as plot_spectra (same options and modes), but averages the RAW
+    column instead of SPECTRUM.  RAW is uncalibrated, so values and rms
+    are shown without units.  With --save-plots, file names get a 'raw_'
+    tag (PREFIX_raw_pixel.png, ...) so they do not overwrite plot_spectra output.
+
+    Examples:
+
+    \b
+        plot_raw --config config.toml --post-filtered
+        plot_raw --config config.toml --post-filtered --per-pixel --output raw_avg.png
+        plot_raw --fits data.fits --group-by scan,telescope --save-plots plots/
+            -> plots/data_raw_by_scan_telescope.png (+ plots/data_raw_by_scan_telescope_flags.yml)
+    """
+    _plot_spectra_column('RAW', config, fits_input, post_filtered, reduced, clean, object_filter,
+                         per_polarization, per_pixel, weighted, group_by, flag_sigma,
+                         flag_report, velocity_range, output, save_plots)
+
+
+@click.command()
+@click.argument('fits_files', nargs=-1, required=True, type=click.Path(exists=True))
+@click.option('--object', 'object_name', type=str, default='S-H_OBS', show_default=True,
+              help='OBJECT of the spectra to plot (exact match), e.g. S-H_FIT.')
+@click.option('--column', type=str, default='SPECTRUM', show_default=True,
+              help='Spectral column to average (SPECTRUM or RAW).')
+@click.option('--window', type=(float, float), default=None,
+              help='Velocity window in km/s to average over, e.g. --window 460 480.')
+@click.option('--channel-window', 'channel_window', type=(int, int), default=None,
+              help='Channel window (0-based, inclusive) to average over. '
+                   'Default when neither window is given: the 11 central channels.')
+@click.option('--x', 'x_axis', type=click.Choice(['index', 'time']), default='index', show_default=True,
+              help="x axis: 'index' (spectrum number within each receiver, file order) or 'time' (DATE-OBS + UT).")
+@click.option('--ncols', type=click.IntRange(min=1), default=5, show_default=True,
+              help='Panels per row.')
+@click.option('--output', type=click.Path(dir_okay=False), default=None,
+              help='Save the plot here (PNG/PDF). If not given, show it on screen.')
+def plot_shobs_window_cmd(fits_files, object_name, column, window, channel_window, x_axis, ncols, output):
+    """
+    Scatter plot of S-H_OBS intensities averaged over a small window.
+
+    Every OBJECT == S-H_OBS spectrum is reduced to its mean over the window.
+    One figure with one panel per receiver (TELESCOP, e.g. LFAH_PX03_S,
+    5 per row by default); each panel overlays that receiver's spectra from
+    all input FITS files, colored per file.
+
+    Examples:
+
+    \b
+        plot_shobs_window a.fits b.fits --output shobs.png
+        plot_shobs_window a.fits b.fits --window -80 -75 --x time --output shobs.png
+        plot_shobs_window a.fits b.fits --object S-H_FIT
+    """
+    try:
+        from .spectra_plots import plot_window_intensity
+
+        if window and channel_window:
+            raise ValueError("Give either --window or --channel-window, not both")
+
+        plot_window_intensity(list(fits_files), object_name=object_name, column=column,
+                              window=window, channel_window=channel_window,
+                              x_axis=x_axis, ncols=ncols, output=output, echo=click.echo)
+        if output:
+            click.echo(click.style(f"\n✓ Saved {output}", fg="green"))
+        else:
+            plt.show()
+
+    except (FileNotFoundError, ValueError) as e:
         click.echo(click.style(f"Error: {e}", fg="red"), err=True)
         sys.exit(1)
     except Exception as e:

@@ -98,6 +98,10 @@ from the config instead of an explicit `--fits` path.
 | `print_pca_parameters` | Unique `PCAPARAM` values in a file |
 | `analyze_blanks` | Identify the value used as blank/missing marker |
 | `plot_sample_spectra` | Plot a sample of spectra, optionally filtered by object |
+| `plot_sample_raw` | Same as `plot_sample_spectra`, but plots the `RAW` column |
+| `plot_spectra` | Averaged spectra per receiver, polarization or pixel; `--group-by` scan/telescope diagnostics |
+| `plot_raw` | Same as `plot_spectra`, but averages the `RAW` column |
+| `plot_shobs_window` | Scatter of S-H_OBS intensity averaged over a small window; one panel per receiver (TELESCOP), one colour per input FITS |
 | `plot_skies` | Plot sky/reference spectra (`SKYCHOPDIFF`, `SKY-DIFF`) |
 | `plot_skyobsfit` | Compare observed vs fitted sky spectra |
 | `examine_telluric` | Average telluric spectrum per mission/pixel |
