@@ -2707,7 +2707,9 @@ def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
             sp_arr = avg_results['avg_spectrum']
             std_arr = avg_results['std_spectrum']
             x = xaxis if xaxis is not None else np.arange(len(sp_arr))
-            ax.plot(x, sp_arr, linewidth=1.5, color='steelblue', label=f"Average (N={avg_results['count']})")
+            # Histogram style (CLASS convention): each channel is a flat bin centred on its velocity.
+            ax.step(x, sp_arr, where='mid', linewidth=1.0, color='steelblue',
+                    label=f"Average (N={avg_results['count']})")
             ax.legend(fontsize=9)
             click.echo(f"  N spectra averaged: {avg_results['count']}")
             click.echo(f"  Mean RMS: {avg_results['rms']:.4f} K")
@@ -2716,7 +2718,7 @@ def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
             for group_name, gdata in sorted(avg_results.items()):
                 sp_arr = gdata['avg_spectrum']
                 x = xaxis if xaxis is not None else np.arange(len(sp_arr))
-                ax.plot(x, sp_arr, linewidth=1.2, alpha=0.85,
+                ax.step(x, sp_arr, where='mid', linewidth=1.0, alpha=0.85,
                         label=f"{group_name} (N={gdata['count']})")
                 click.echo(f"  {group_name}: N={gdata['count']}, RMS={gdata['rms']:.4f} K")
             ax.legend(fontsize=8, loc='best')
