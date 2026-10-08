@@ -4605,6 +4605,188 @@ def plot_shobs_window_cmd(fits_files, object_name, column, window, channel_windo
         sys.exit(1)
 
 
+def _int_list(ctx, param, value):
+    """Click callback: '39646,39650' -> [39646, 39650]; None stays None."""
+    if not value:
+        return None
+    try:
+        return [int(v) for v in value.split(',') if v.strip()]
+    except ValueError:
+        raise click.BadParameter(f"expected comma-separated integers, got '{value}'")
+
+
+def _cycle_list(ctx, param, value):
+    """Click callback: '39658.1,39646.5' -> [(39658, 1), (39646, 5)]; None stays None."""
+    if not value:
+        return None
+    from .sky_fit_plots import parse_cycle
+    try:
+        return [parse_cycle(v) for v in value.split(',') if v.strip()]
+    except ValueError as e:
+        raise click.BadParameter(str(e))
+
+
+def _skyfit_selection_suffix(scans, subscans, cycles, telescops, velocity_range) -> str:
+    """
+    File-name suffix describing a plot_skyfit_pairs selection, so different
+    selections do not overwrite each other: '' for everything, else e.g.
+    '_cycle39658.1', '_scan39646_sub1_5', '_LFAV_PX02_S', '_v-350_-150'.
+    """
+    parts = []
+    if cycles:
+        parts.append('cycle' + '_'.join(f"{s}.{ss}" for s, ss in sorted(set(cycles))))
+    if scans:
+        parts.append('scan' + '_'.join(str(s) for s in sorted(set(scans))))
+    if subscans:
+        parts.append('sub' + '_'.join(str(s) for s in sorted(set(subscans))))
+    if telescops:
+        parts.append('_'.join(sorted({t.upper() for t in telescops})))
+    if velocity_range:
+        parts.append(f"v{min(velocity_range):g}_{max(velocity_range):g}")
+    return ''.join(f"_{p}" for p in parts)
+
+
+_CYCLE_HELP = ('Only these calibration cycles, as SCAN.SUBSCAN, comma-separated (e.g. 39658.1 or '
+               '39658.1,39646.5). A cycle is one calibration subscan: in each scan, calibration '
+               'subscans 1, 5, 9, 13 (sky/hot/cold loads -> S-H_OBS, S-H_FIT) alternate with science '
+               'subscans 2, 6, 10, 14. kalibrate fits the atmosphere once per cycle, for all pixels '
+               'together, so CHI_SQR and MH2O have one value per cycle.')
+
+
+@click.command()
+@click.argument('fits_files', nargs=-1, required=True, type=click.Path(exists=True))
+@click.option('--output-dir', 'output_dir', type=click.Path(file_okay=False), default=None,
+              help='Save one multi-page PDF per input as <output-dir>/<fits stem>_skyfit<selection>.pdf, '
+                   'where <selection> names any --cycle/--scan/--subscan/--telescop/--velocity-range '
+                   '(e.g. _cycle39658.1), so different selections do not overwrite each other. '
+                   'If not given, show the pages on screen (at most 5; narrow with --cycle or --scan/--subscan).')
+@click.option('--scan', 'scans', type=str, default=None, callback=_int_list,
+              help='Only these scans, comma-separated (e.g. 39646,39650).')
+@click.option('--subscan', 'subscans', type=str, default=None, callback=_int_list,
+              help='Only these subscans, comma-separated (e.g. 1,5).')
+@click.option('--cycle', 'cycles', type=str, default=None, callback=_cycle_list, help=_CYCLE_HELP)
+@click.option('--telescop', 'telescops', type=str, default=None,
+              help='Only these receivers, comma-separated (e.g. LFAH_PX00_S,LFAV_PX03_S).')
+@click.option('--velocity-range', type=(float, float), default=None,
+              help='Velocity range in km/s to show; the residual rms is computed over it.')
+@click.option('--obs-object', type=str, default='S-H_OBS', show_default=True,
+              help='OBJECT of the observed sky spectra.')
+@click.option('--fit-object', type=str, default='S-H_FIT', show_default=True,
+              help='OBJECT of the fitted sky spectra.')
+@click.option('--column', type=str, default='SPECTRUM', show_default=True,
+              help='Spectral column to plot.')
+@click.option('--ncols', type=click.IntRange(min=1), default=5, show_default=True,
+              help='Panels per row.')
+def plot_skyfit_pairs_cmd(fits_files, output_dir, scans, subscans, cycles, telescops, velocity_range,
+                          obs_object, fit_object, column, ncols):
+    """
+    Overlay each observed sky (S-H_OBS) with its fitted sky (S-H_FIT).
+
+    S-H_OBS and S-H_FIT rows are paired on TELESCOP + SCAN + SUBSCAN.  One
+    page per calibration cycle (scan.subscan, see --cycle), one panel per
+    receiver: OBS and FIT overlaid,
+    with the OBS − FIT residual (and its rms) underneath.  χ² from CHI_SQR
+    is shown in each panel title.
+
+    Afterwards the CHI_SQR report of chi_sqr_skyfit is printed for the same
+    files and --scan/--subscan/--cycle selection; with --output-dir it is also saved
+    (with the per-cycle table) as <output-dir>/chi_sqr_report<selection>.txt.
+
+    Examples:
+
+    \b
+        plot_skyfit_pairs a.fits b.fits --output-dir skyfit/
+            -> skyfit/a_skyfit.pdf, skyfit/b_skyfit.pdf (one page per cycle)
+        plot_skyfit_pairs a.fits b.fits --cycle 39658.1 --output-dir skyfit/
+            -> skyfit/a_skyfit_cycle39658.1.pdf, ..., skyfit/chi_sqr_report_cycle39658.1.txt
+        plot_skyfit_pairs a.fits --scan 39646 --subscan 1
+        plot_skyfit_pairs a.fits b.fits --cycle 39658.1
+            -> one page per file on screen for cycle 39658.1
+        plot_skyfit_pairs a.fits --output-dir skyfit/ --velocity-range -150 0
+    """
+    try:
+        from .sky_fit_plots import plot_sky_fit_pairs, chi_sqr_report
+
+        tels = [t.strip() for t in telescops.split(',') if t.strip()] if telescops else None
+        suffix = _skyfit_selection_suffix(scans, subscans, cycles, tels, velocity_range)
+        for fits_path in fits_files:
+            output = (Path(output_dir) / f"{Path(fits_path).stem}_skyfit{suffix}.pdf") if output_dir else None
+            plot_sky_fit_pairs(fits_path, output=output, obs_object=obs_object, fit_object=fit_object,
+                               column=column, scans=scans, subscans=subscans, cycles=cycles,
+                               telescops=tels, velocity_range=velocity_range, ncols=ncols,
+                               echo=click.echo)
+
+        click.echo("\n" + chi_sqr_report(fits_files, obs_object, scans, subscans, cycles))
+        if output_dir:
+            report_path = Path(output_dir) / f"chi_sqr_report{suffix}.txt"
+            report_path.write_text(chi_sqr_report(fits_files, obs_object, scans, subscans, cycles,
+                                                  per_cycle=True) + "\n")
+            click.echo(f"\n  Report saved: {report_path}")
+            click.echo(click.style(f"\n✓ Saved {len(fits_files)} PDF(s) to {output_dir}", fg="green"))
+        else:
+            plt.show()
+
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@click.command()
+@click.argument('fits_files', nargs=-1, required=True, type=click.Path(exists=True))
+@click.option('--scan', 'scans', type=str, default=None, callback=_int_list,
+              help='Only these scans, comma-separated (e.g. 39646,39650).')
+@click.option('--subscan', 'subscans', type=str, default=None, callback=_int_list,
+              help='Only these subscans, comma-separated (e.g. 1,5).')
+@click.option('--cycle', 'cycles', type=str, default=None, callback=_cycle_list, help=_CYCLE_HELP)
+@click.option('--obs-object', type=str, default='S-H_OBS', show_default=True,
+              help='OBJECT of the rows to read CHI_SQR from.')
+@click.option('--per-cycle', 'per_cycle', is_flag=True, default=False,
+              help='Also list every cycle\'s CHI_SQR per file (always included in --output).')
+@click.option('--output', type=click.Path(dir_okay=False), default=None,
+              help='Also save the report (with the per-cycle table) to this text file.')
+def chi_sqr_skyfit_cmd(fits_files, scans, subscans, cycles, obs_object, per_cycle, output):
+    """
+    Compare the sky-fit CHI_SQR of one or more files.
+
+    kalibrate stores one CHI_SQR per calibration cycle (scan.subscan, see
+    --cycle), the same on every pixel.  Per file: number of cycles and median / mean / min /
+    max CHI_SQR.  With several files, the cycles they share are compared one
+    by one (which file is lowest how often, median difference), and the
+    file with the better fits is named.  plot_skyfit_pairs prints this
+    report too.
+
+    Examples:
+
+    \b
+        chi_sqr_skyfit a.fits b.fits
+        chi_sqr_skyfit a.fits b.fits --per-cycle
+        chi_sqr_skyfit a.fits b.fits --output gain_drift/chi_sqr_report.txt
+    """
+    try:
+        from .sky_fit_plots import chi_sqr_report
+
+        click.echo(chi_sqr_report(fits_files, obs_object, scans, subscans, cycles, per_cycle=per_cycle))
+        if output:
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            Path(output).write_text(chi_sqr_report(fits_files, obs_object, scans, subscans, cycles,
+                                                   per_cycle=True) + "\n")
+            click.echo(click.style(f"\n✓ Report saved: {output}", fg="green"))
+
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(click.style(f"Error: {e}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Unexpected error: {e}", fg="red"), err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 @click.command()
 @click.option(
     "--config",

@@ -102,6 +102,8 @@ from the config instead of an explicit `--fits` path.
 | `plot_spectra` | Averaged spectra per receiver, polarization or pixel; `--group-by` scan/telescope diagnostics |
 | `plot_raw` | Same as `plot_spectra`, but averages the `RAW` column |
 | `plot_shobs_window` | Scatter of S-H_OBS intensity averaged over a small window; one panel per receiver (TELESCOP), one colour per input FITS |
+| `plot_skyfit_pairs` | S-H_OBS overlaid with its paired S-H_FIT (+ residual), one page per scan.subscan, multi-page PDF per input |
+| `chi_sqr_skyfit` | Compare sky-fit CHI_SQR (one per scan.subscan) between files: stats, cycle-by-cycle wins, verdict; also printed by `plot_skyfit_pairs` |
 | `plot_skies` | Plot sky/reference spectra (`SKYCHOPDIFF`, `SKY-DIFF`) |
 | `plot_skyobsfit` | Compare observed vs fitted sky spectra |
 | `examine_telluric` | Average telluric spectrum per mission/pixel |
