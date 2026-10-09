@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from astropy.io import fits
 
+from .basic_io import row_crpix1
 from .spectra_plots import _column_units, _find_spectrum_hdu, _to_str
 
 PairKey = Tuple[str, int, int]  # (TELESCOP, SCAN, SUBSCAN)
@@ -78,7 +79,7 @@ def pair_rows(data, obs_object: str = 'S-H_OBS',
 
 def _velocity(hdu, row: int, nchan: int) -> np.ndarray:
     """Velocity axis (km/s) of one row, from its own VELOCITY/DELTAV and CRPIX1."""
-    crpix1 = float(hdu.header.get('CRPIX1', 1.0))
+    crpix1 = row_crpix1(hdu.data[row:row + 1], hdu.header)[0]
     ch = np.arange(nchan, dtype=float) - (crpix1 - 1.0)
     return (float(hdu.data['VELOCITY'][row]) + ch * float(hdu.data['DELTAV'][row])) / 1000.0
 

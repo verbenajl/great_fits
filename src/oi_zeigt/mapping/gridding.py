@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import warnings
 
 # Register GILDAS LUTs (e.g. 'rainbow3') so they are selectable via --colormap.
+from ..basic_io import table_crpix1
 from .gildas_luts import register_gildas_luts
 register_gildas_luts()
 
@@ -500,8 +501,11 @@ def _get_spectral_axis_params(hdul: fits.HDUList) -> Tuple[float, float, float, 
     else:
         raise ValueError("SPECTRUM column not found in FITS table")
 
-    # Extract reference pixel for spectral axis (CRPIX1)
-    if 'CRPIX1' in table_header:
+    # Extract reference pixel for spectral axis: per-row CRPIX1 column
+    # (median over rows) if present, else the headers.
+    if 'CRPIX1' in table.names:
+        crpix1_spec = table_crpix1(table)
+    elif 'CRPIX1' in table_header:
         crpix1_spec = float(table_header['CRPIX1'])
     elif 'CRPIX1' in primary_header:
         crpix1_spec = float(primary_header['CRPIX1'])
@@ -520,9 +524,13 @@ def _get_celestial_coords(hdul: fits.HDUList) -> Tuple[np.ndarray, np.ndarray]:
     the actual celestial coordinates of the observations. The LONGITUDE/LATITUDE
     columns represent telescope position, not celestial position.
     
-    Follows the formula:
-        RA = CRVAL2 + CDELT2
+    CDELT2/CDELT3 are kalibrate's map offsets: offsets in the CLASS "radio"
+    projection (kalibrate writes position.proj = PROJ_RADIO), i.e. projected
+    sky offsets x = (RA - RA0) cos(Dec0), y = Dec - Dec0. The exact inverse is:
+        RA = CRVAL2 + CDELT2 / cos(CRVAL3)
         Dec = CRVAL3 + CDELT3
+    Adding CDELT2 to RA without the 1/cos(Dec0) compresses every RA offset by
+    cos(Dec0) (68% at M51, Dec 47.2 deg): the LFA hexagon comes out distorted.
     
     Parameters
     ----------
@@ -557,11 +565,12 @@ def _get_celestial_coords(hdul: fits.HDUList) -> Tuple[np.ndarray, np.ndarray]:
     crval2 = header.get('CRVAL2', 0.0)  # RA reference in degrees
     crval3 = header.get('CRVAL3', 0.0)  # Dec reference in degrees
     
-    # Extract delta values from data columns
-    # RA = CRVAL2 + CDELT2 (in degrees)
+    # Extract delta values from data columns (radio projection, see docstring)
+    # RA = CRVAL2 + CDELT2 / cos(CRVAL3) (in degrees)
     # Dec = CRVAL3 + CDELT3 (in degrees)
-    ras = crval2 + data['CDELT2']
-    decs = crval3 + data['CDELT3']
+    # float64: the columns are float32, which resolves RA ~200 deg only to ~0.05".
+    ras = crval2 + np.asarray(data['CDELT2'], dtype=np.float64) / np.cos(np.radians(crval3))
+    decs = crval3 + np.asarray(data['CDELT3'], dtype=np.float64)
 
     return ras, decs
 
@@ -1001,7 +1010,7 @@ def create_integrated_map(hdul: fits.HDUList,
                     velo_ref = velo_ref / 1000.0  # Convert m/s to km/s
                     deltav = deltav / 1000.0
             
-            crpix1_spec = header.get('CRPIX1', 1.0)
+            crpix1_spec = table_crpix1(data, header)
             
             # Compute velocity axis in km/s
             channel_indices = np.arange(n_channels, dtype=np.float64)

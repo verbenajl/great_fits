@@ -16,15 +16,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
 
-from .basic_io import reconstruct_velocity_axis
+from .basic_io import reconstruct_velocity_axis, row_crpix1
 
 
 # <receiver><pol>_PX<nn>[_<suffix>], e.g. LFAH_PX00_S, HFAV_PX06_S.
 # The receiver is the name minus its last letter (LFAH -> LFA, HFAV -> HFA).
 _TELESCOP_RE = re.compile(r'^(?P<receiver>[A-Z0-9]+?)(?P<pol>[HVI])_PX(?P<pixel>\d+)(?:_\w+)?$')
 
-# OBJECT values of housekeeping rows, used only when SOBSMODE is absent.
-_CALIBRATION_OBJECTS = ('TSYS', 'TAU_SIG', 'SKY-DIFF', 'SKYCHOPDIFF', 'TREC', 'S-H')
+# OBJECT values (prefixes) of housekeeping rows, never treated as science.
+# HOT-COLD rows carry SOBSMODE = 'ON', so they must be excluded by name.
+_CALIBRATION_OBJECTS = ('TSYS', 'TAU_SIG', 'SKY-DIFF', 'SKYCHOPDIFF', 'TREC', 'S-H', 'HOT-COLD')
 
 # Columns tried, in order, for the per-spectrum noise used by weighted averaging.
 WEIGHT_RMS_COLUMNS = ('RMS', 'RMS_BASELINE')
@@ -53,18 +54,18 @@ def select_science_rows(data, object_filter: Optional[str] = None) -> np.ndarray
     """
     Boolean mask of science spectra, optionally restricted to an OBJECT substring.
 
-    Science rows are SOBSMODE == 'ON' when that column exists; otherwise rows
-    whose OBJECT is a known calibration/housekeeping name are dropped.
+    Science rows are SOBSMODE == 'ON' when that column exists, and in every case
+    rows whose OBJECT is a known calibration/housekeeping name are dropped.
     """
     names = data.dtype.names
     objects = np.array([_to_str(o).upper() for o in data['OBJECT']]) if 'OBJECT' in names else None
 
     if 'SOBSMODE' in names:
         mask = np.array([_to_str(s).upper() == 'ON' for s in data['SOBSMODE']])
-    elif objects is not None:
-        mask = ~np.array([any(o.startswith(c) for c in _CALIBRATION_OBJECTS) for o in objects])
     else:
         mask = np.ones(len(data), dtype=bool)
+    if objects is not None:
+        mask &= ~np.array([any(o.startswith(c) for c in _CALIBRATION_OBJECTS) for o in objects])
 
     if object_filter and objects is not None:
         mask &= np.array([object_filter.upper() in o for o in objects])
@@ -663,8 +664,8 @@ def window_mean(hdu, rows: np.ndarray, column: str = 'SPECTRUM',
     nchan = spectra.shape[1]
     if window is not None:
         vmin, vmax = sorted(window)
-        crpix1 = float(hdu.header.get('CRPIX1', 1.0))
-        ch = np.arange(nchan, dtype=float) - (crpix1 - 1.0)
+        crpix1 = row_crpix1(hdu.data[rows], hdu.header)[:, None]
+        ch = np.arange(nchan, dtype=float)[None, :] - (crpix1 - 1.0)
         vel = (np.asarray(hdu.data['VELOCITY'][rows], dtype=float)[:, None]
                + ch * np.asarray(hdu.data['DELTAV'][rows], dtype=float)[:, None]) / 1000.0
         in_win = (vel >= vmin) & (vel <= vmax)

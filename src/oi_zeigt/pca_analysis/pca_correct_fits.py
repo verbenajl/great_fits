@@ -3122,7 +3122,7 @@ class PCACorrector:
             # Original mean
             ax1 = _ax([padding, 0.90 - spectral_height, plot_width, spectral_height])
             _shade_masks(ax1)
-            ax1.plot(x_axis, original_mean, 'r-', lw=1.5)
+            ax1.step(x_axis, original_mean, 'r-', where='mid', lw=1.5)
             ax1.set_title('Original Mean', fontsize=10)
             ax1.set_ylim(min_val, max_val)
             ax1.grid(True, alpha=0.3)
@@ -3131,8 +3131,8 @@ class PCACorrector:
             # Corrected mean
             ax2 = _ax([padding, 0.90 - 2*spectral_height, plot_width, spectral_height])
             _shade_masks(ax2)
-            ax2.plot(x_axis, original_mean, 'r-', lw=1, alpha=0.5, label='Orig')
-            ax2.plot(x_axis, corrected_mean, 'g-', lw=1.5, label='Corr')
+            ax2.step(x_axis, original_mean, 'r-', where='mid', lw=1, alpha=0.5, label='Orig')
+            ax2.step(x_axis, corrected_mean, 'g-', where='mid', lw=1.5, label='Corr')
             ax2.set_title('Corrected Mean  [red=excl. subtraction (incl. telluric) | blue=line fit-excl.]', fontsize=9)
             ax2.set_ylim(min_val, max_val)
             ax2.legend(fontsize=8, loc='upper right')
@@ -3146,9 +3146,9 @@ class PCACorrector:
             # "mean" row, shown between corrected_mean and component 1.
             ax_mean = _ax([padding, 0.90 - 3*spectral_height, plot_width, spectral_height])
             if mean_spectrum_to_plot is not None and len(x_axis) > 0 and len(mean_spectrum_to_plot) == len(x_axis):
-                ax_mean.plot(x_axis, mean_spectrum_to_plot, 'k-', lw=1)
+                ax_mean.step(x_axis, mean_spectrum_to_plot, 'k-', where='mid', lw=1)
             elif mean_spectrum_to_plot is not None:
-                ax_mean.plot(mean_spectrum_to_plot, 'k-', lw=1)
+                ax_mean.step(np.arange(len(mean_spectrum_to_plot)), mean_spectrum_to_plot, 'k-', where='mid', lw=1)
             else:
                 ax_mean.text(0.5, 0.5, 'no mean_spectrum stored', ha='center', va='center',
                              transform=ax_mean.transAxes, fontsize=8, color='red')
@@ -3676,9 +3676,9 @@ class PCACorrector:
                 # Progressive: show state before and after this component
                 before = progressive[comp_idx]
                 after  = progressive[comp_idx + 1]
-                ax_ex_comp.plot(x_axis, before, 'k-', lw=1.5, alpha=0.6,
+                ax_ex_comp.step(x_axis, before, 'k-', where='mid', lw=1.5, alpha=0.6,
                                 label='Before' if comp_idx == 0 else '_', zorder=1)
-                ax_ex_comp.plot(x_axis, after, color='green', lw=1.5, alpha=0.9,
+                ax_ex_comp.step(x_axis, after, where='mid', color='green', lw=1.5, alpha=0.9,
                                 label='After' if comp_idx == 0 else '_', zorder=2)
                 ax_ex_comp.plot(x_axis, scaled_comps[comp_idx], 'b-', lw=1,
                                 label='Comp' if comp_idx == 0 else '_')

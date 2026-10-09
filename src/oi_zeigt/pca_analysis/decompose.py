@@ -15,6 +15,7 @@ from typing import Tuple, List, Optional, Dict, Union
 from dataclasses import dataclass, asdict
 import pickle
 
+from ..basic_io import table_crpix1
 from .config import ConfigLoader
 from .fits_indexing import FITSIndexer, load_spectral_data
 from .utilities import (
@@ -363,7 +364,7 @@ class DecompositionDataLoader:
                                 deltav   = float(data['DELTAV'][0])
                                 nchans   = data['SPECTRUM'].shape[1] if 'SPECTRUM' in data.dtype.names else None
                                 if nchans is not None:
-                                    crpix1 = float(header.get('CRPIX1', 1.0)) if header else 1.0
+                                    crpix1 = table_crpix1(data, header if header else None)
                                     ch = np.arange(nchans, dtype=np.float64)
                                     velocity_axis = velo_ref + (ch - (crpix1 - 1.0)) * deltav
                                     logger.debug("Velocity axis reconstructed from FITS parameters")

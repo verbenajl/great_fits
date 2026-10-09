@@ -545,8 +545,9 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
     """
     Create velocity axis on-the-fly from FITS header parameters if available.
     
-    Attempts to extract VELOCITY, DELTAV, and CRPIX1 parameters from the FITS
-    header and create a velocity axis. Returns None if parameters are missing.
+    Attempts to extract VELOCITY, DELTAV, and CRPIX1 (per-row column if
+    present, else header) and create a velocity axis. Returns None if
+    parameters are missing.
     
     Parameters
     ----------
@@ -570,10 +571,9 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
         else:
             return None
         
-        # Get reference pixel from header
-        crpix1_spec = 1.0
-        if 'CRPIX1' in table_hdu.header:
-            crpix1_spec = float(table_hdu.header['CRPIX1'])
+        # Reference pixel: per-row CRPIX1 column (median) if present, else header
+        from .basic_io import table_crpix1
+        crpix1_spec = table_crpix1(table_hdu.data, table_hdu.header)
         
         # Create velocity axis
         channel_indices = np.arange(nchans, dtype=np.float64)

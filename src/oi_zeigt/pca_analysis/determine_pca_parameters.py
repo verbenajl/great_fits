@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """determine_pca_parameters — recommend per-flight PCA n_components from reduced data.
 
-Given a directory of reduced_data_*.fits, this ALWAYS re-runs the per-pixel PCA
+Given a directory of reduced_data*.fits, this ALWAYS re-runs the per-pixel PCA
 decomposition (via `pca_decompose`) for every flight, then chooses each flight's
 n_components by PIXEL-TO-PIXEL COHERENCE of the resulting components.
 
@@ -161,10 +161,10 @@ def _keep(name, only, exclude):
 
 
 def run_decompositions(reduced_dir, config, n_components, verbose, only, exclude,
-                       file_glob="reduced_data_*.fits"):
+                       file_glob="reduced_data*.fits"):
     """Re-run pca_decompose for every input FITS in reduced_dir.
 
-    file_glob selects which files to feed (default reduced_data_*.fits); pass e.g.
+    file_glob selects which files to feed (default reduced_data*.fits); pass e.g.
     "post_cleaned_nopca_*.fits" to score already post-processed/filtered inputs.
     Returns the wall-clock start time so the caller can restrict scoring to the
     pickles this run (re)wrote.
@@ -274,9 +274,21 @@ def merge_into_yaml(path, results, gates, n_components_only=False):
     this to refresh coherence-derived n_components without disturbing gates that
     were tuned by hand or that the gate-override flags can't express (e.g. a
     float line_cutoff_std).
+
+    If `path` does not exist it is created (with parent directories) holding a
+    full block per flight; `n_components_only` is ignored then, since there are
+    no hand-tuned gates to protect.
     """
-    text = Path(path).read_text()
-    lines = text.split("\n")
+    path = Path(path)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# Per-flight PCA parameters, created by determine_pca_parameters.",
+                 "# n_components from pixel-to-pixel coherence; standard gates.",
+                 ""]
+        n_components_only = False
+        print(f"{path} does not exist; creating it")
+    else:
+        lines = path.read_text().split("\n")
     blocks = list(_flight_blocks(lines))
     present = {name for name, _, _ in blocks}
     # Update existing blocks in reverse so earlier slices stay valid.
@@ -301,7 +313,7 @@ def merge_into_yaml(path, results, gates, n_components_only=False):
         if lines and lines[-1].strip() != "":
             lines.append("")
         lines.extend(block)
-    Path(path).write_text("\n".join(lines))
+    path.write_text("\n".join(lines) + ("" if lines[-1] == "" else "\n"))
     updated = sum(1 for n in results if n in present)
     appended = len(results) - updated
     print(f"✓ wrote {path}: {updated} entr{'y' if updated == 1 else 'ies'} updated, "
@@ -311,16 +323,16 @@ def merge_into_yaml(path, results, gates, n_components_only=False):
 def main_cli():
     parser = argparse.ArgumentParser(
         description="Recommend per-flight PCA n_components from a directory of "
-                    "reduced_data_*.fits, by re-running the per-pixel decomposition "
+                    "reduced_data*.fits, by re-running the per-pixel decomposition "
                     "and scoring pixel-to-pixel coherence.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("--dir", required=True,
                         help="Directory containing the input FITS (see --file-glob)")
-    parser.add_argument("--file-glob", default="reduced_data_*.fits", dest="file_glob",
+    parser.add_argument("--file-glob", default="reduced_data*.fits", dest="file_glob",
                         help="Filename glob selecting inputs inside --dir. Default: "
-                             "reduced_data_*.fits. Use e.g. 'post_cleaned_nopca_*.fits' "
+                             "reduced_data*.fits. Use e.g. 'post_cleaned_nopca_*.fits' "
                              "to score already post-processed/filtered data.")
     parser.add_argument("--config", default="config.toml",
                         help="config.toml (for pca_source, smoothing, components_dir, "
@@ -349,7 +361,7 @@ def main_cli():
                         help="Merge n_components + standard gates into the params yaml "
                              "(config [input][mission_pca_parameters]), preserving comments.")
     parser.add_argument("--params-file", default=None, dest="params_file",
-                        help="Params yaml to update with --write "
+                        help="Params yaml to update with --write (created if missing) "
                              "(default: config [input][mission_pca_parameters])")
     parser.add_argument("--n-components-only", action="store_true",
                         dest="n_components_only",

@@ -3,6 +3,7 @@ Input/output utilities for reading FITS files and configuration.
 """
 
 import os
+import warnings
 from pathlib import Path
 from typing import Optional, Union
 
@@ -16,14 +17,58 @@ except ImportError:
 from astropy.io import fits
 
 
+def row_crpix1(data, header=None) -> np.ndarray:
+    """
+    Reference pixel (1-indexed) of every row, shape ``(n_rows,)``.
+
+    Taken from the per-row CRPIX1 column when the table has one, else the
+    header CRPIX1 for all rows.  The header holds only one row's value: for
+    HFA, whose LO is not Doppler-tracked, kalibrate writes the true reference
+    pixel per row and the header one can be off by >10 km/s.
+    """
+    if data.dtype.names and 'CRPIX1' in data.dtype.names:
+        return np.asarray(data['CRPIX1'], dtype=np.float64)
+    crpix1 = float(header.get('CRPIX1', 1.0)) if header is not None else 1.0
+    return np.full(len(data), crpix1)
+
+
+def table_crpix1(data, header=None, warn: bool = True) -> float:
+    """
+    One reference pixel for a whole table: the median per-row CRPIX1.
+
+    For code that needs a single axis per file.  Rows whose reference pixel
+    differs by more than half a channel cannot share one axis; with ``warn``
+    that is reported (``filter_fits --velocity-resample`` aligns them).
+    """
+    crpix = row_crpix1(data, header)
+    crpix = crpix[np.isfinite(crpix)]
+    if crpix.size == 0:
+        return float(header.get('CRPIX1', 1.0)) if header is not None else 1.0
+    med = float(np.median(crpix))
+    if warn and np.ptp(crpix) > 0.5:
+        warnings.warn(
+            f"Per-row CRPIX1 spans {crpix.min():.1f}-{crpix.max():.1f}; using the median "
+            f"{med:.2f} as one axis for all rows. Rows far from it are misplaced in velocity; "
+            "resample with filter_fits --velocity-resample to align them.", UserWarning)
+    return med
+
+
+def row_velocity_axis(data, row: int, header=None) -> np.ndarray:
+    """Velocity axis (m/s) of one row, from its own VELOCITY, DELTAV and CRPIX1."""
+    crpix1 = row_crpix1(data[row:row + 1], header)[0]
+    ch = np.arange(data['SPECTRUM'].shape[1], dtype=np.float64)
+    return float(data['VELOCITY'][row]) + (ch - (crpix1 - 1.0)) * float(data['DELTAV'][row])
+
+
 def reconstruct_velocity_axis(hdu) -> np.ndarray:
     """
-    Reconstruct the velocity axis (m/s) from FITS header/column parameters.
+    Reconstruct the velocity axis (m/s) from FITS column/header parameters.
 
     Uses the VELOCITY column (reference velocity at CRPIX1), DELTAV column
-    (channel spacing), and CRPIX1 header key (reference pixel, 1-indexed).
-    These values are always present and already account for any channel
-    extraction or decimation applied by ``reduce_spectra``.
+    (channel spacing) and the reference pixel (1-indexed) from the per-row
+    CRPIX1 column when present (median over rows, see :func:`table_crpix1`),
+    else the CRPIX1 header key.  Both are kept up to date by the channel
+    extraction / decimation / resampling steps.
 
     Parameters
     ----------
@@ -38,7 +83,7 @@ def reconstruct_velocity_axis(hdu) -> np.ndarray:
     data     = hdu.data
     velo_ref = float(data['VELOCITY'][0])
     deltav   = float(data['DELTAV'][0])
-    crpix1   = float(hdu.header.get('CRPIX1', 1.0))
+    crpix1   = table_crpix1(data, hdu.header)
     nchans   = data['SPECTRUM'].shape[1]
     ch       = np.arange(nchans, dtype=np.float64)
     return velo_ref + (ch - (crpix1 - 1.0)) * deltav

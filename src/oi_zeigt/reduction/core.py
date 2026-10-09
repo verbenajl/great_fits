@@ -1234,8 +1234,14 @@ def filter_and_save_fits(hdul: fits.HDUList,
     # statistics like NaN fraction/peak threshold are computed at the
     # original resolution), and only ever touches clean_combined — the
     # rejected file keeps its original resolution.
+    # Reference pixel per row (CRPIX1 column if present, else header) and the
+    # single value used for the table-wide axis (median of the rows).
+    from oi_zeigt.basic_io import row_crpix1, table_crpix1
     new_crpix1 = None
-    crpix1_current = float(matrix_hdus[0][1].header.get('CRPIX1', 1.0))
+    has_crpix1_col = 'CRPIX1' in clean_combined.dtype.names
+    crpix1_rows = row_crpix1(clean_combined, matrix_hdus[0][1].header)
+    crpix1_current = table_crpix1(clean_combined, matrix_hdus[0][1].header,
+                                  warn=velocity_resample_km_s is None)
 
     # Extract (trim) the surviving spectra to a velocity window, if requested.
     # Mirrors reduce_spectra's [reduction].extract step exactly: same
@@ -1273,6 +1279,9 @@ def filter_and_save_fits(hdul: fits.HDUList,
         clean_combined = extracted_combined
         # Reference channel shifts left by ch_min; VELOCITY/DELTAV are unchanged.
         crpix1_current = crpix1_current - ch_min
+        crpix1_rows = crpix1_rows - ch_min
+        if has_crpix1_col:
+            clean_combined['CRPIX1'] = crpix1_rows
         new_crpix1 = crpix1_current
         print(f"Extracted velocity range [{extract_velocity_range_m_s[0]/1000:.0f}, "
               f"{extract_velocity_range_m_s[1]/1000:.0f}] km/s → channels "
@@ -1282,7 +1291,7 @@ def filter_and_save_fits(hdul: fits.HDUList,
         if 'VELOCITY' not in clean_combined.dtype.names or 'DELTAV' not in clean_combined.dtype.names:
             raise ValueError("VELOCITY/DELTAV columns not found in FITS data — "
                              "cannot use --velocity-resample")
-        crpix1_orig = crpix1_current
+        crpix1_orig = crpix1_rows
         velo_ref_per_row = np.asarray(clean_combined['VELOCITY'], dtype=np.float64)
         deltav_per_row   = np.asarray(clean_combined['DELTAV'],   dtype=np.float64)
         original_spectrum_dtype = clean_combined['SPECTRUM'].dtype
@@ -1308,6 +1317,8 @@ def filter_and_save_fits(hdul: fits.HDUList,
                 resampled_combined[name] = grid_velo_ref
             elif name == 'DELTAV':
                 resampled_combined[name] = grid_deltav
+            elif name == 'CRPIX1':
+                resampled_combined[name] = 1.0
             else:
                 resampled_combined[name] = clean_combined[name]
         clean_combined = resampled_combined
@@ -1342,7 +1353,11 @@ def filter_and_save_fits(hdul: fits.HDUList,
                 pass
 
     # If resampling ran, every row now starts at the same VELOCITY with
-    # CRPIX1=1 — overrides whatever CRPIX1 the original header had.
+    # CRPIX1=1 — overrides whatever CRPIX1 the original header had. With a
+    # per-row CRPIX1 column the header gets the rows' median otherwise: the
+    # input header may hold only one row's value (HFA).
+    if new_crpix1 is None and has_crpix1_col:
+        new_crpix1 = crpix1_current
     if new_crpix1 is not None:
         hdu_clean.header['CRPIX1'] = new_crpix1
 
@@ -1750,7 +1765,8 @@ def _extract_spectral_params(hdul: fits.HDUList) -> dict:
         Dictionary with keys:
         - 'velo_ref': Reference velocity in m/s (from VELOCITY column)
         - 'deltav': Velocity spacing per channel in m/s (from DELTAV column)
-        - 'crpix1_spec': Reference pixel index, 1-indexed (from CRPIX1 header)
+        - 'crpix1_spec': Reference pixel index, 1-indexed (median of the
+          per-row CRPIX1 column if present, else CRPIX1 header)
         - 'nchans': Number of spectral channels (from SPECTRUM column)
     
     Notes
@@ -1775,12 +1791,11 @@ def _extract_spectral_params(hdul: fits.HDUList) -> dict:
     velo_ref = float(table['VELOCITY'][0]) if 'VELOCITY' in table.dtype.names else 0.0
     deltav = float(table['DELTAV'][0]) if 'DELTAV' in table.dtype.names else 1.0
     
-    # Extract reference pixel from header
-    crpix1_spec = 1.0  # Default
-    if table_hdu is not None and 'CRPIX1' in table_hdu.header:
-        crpix1_spec = float(table_hdu.header['CRPIX1'])
-    elif len(hdul) > 0 and 'CRPIX1' in hdul[0].header:
-        crpix1_spec = float(hdul[0].header['CRPIX1'])
+    # Reference pixel: per-row CRPIX1 column (median over rows) if present,
+    # else the table header, else the primary header.
+    from oi_zeigt.basic_io import table_crpix1
+    header = table_hdu.header if 'CRPIX1' in table_hdu.header else hdul[0].header
+    crpix1_spec = table_crpix1(table, header)
     
     # Get number of spectral channels
     nchans = table['SPECTRUM'].shape[1]
@@ -1861,7 +1876,7 @@ def _velocity_to_channel_index(velocity: float, velo_ref: float, deltav: float,
 
 
 def _resample_spectra_to_grid(spectra: np.ndarray, velo_ref_per_row: np.ndarray,
-                              deltav_per_row: np.ndarray, crpix1_orig: float,
+                              deltav_per_row: np.ndarray, crpix1_orig,
                               resolution_km_s: float,
                               fixed_range_km_s: Optional[Tuple[float, float]] = None
                               ) -> Tuple[np.ndarray, float, float]:
@@ -1897,11 +1912,14 @@ def _resample_spectra_to_grid(spectra: np.ndarray, velo_ref_per_row: np.ndarray,
     spectra : np.ndarray, shape (n_rows, n_channels_orig)
         Original spectra.
     velo_ref_per_row : np.ndarray, shape (n_rows,)
-        Each row's own VELOCITY (m/s), i.e. velocity at channel `crpix1_orig`.
+        Each row's own VELOCITY (m/s), i.e. velocity at its `crpix1_orig`.
     deltav_per_row : np.ndarray, shape (n_rows,)
         Each row's own DELTAV (m/s/channel). May be negative.
-    crpix1_orig : float
-        Reference pixel (1-indexed) shared by all rows' original grid.
+    crpix1_orig : float or np.ndarray, shape (n_rows,)
+        Reference pixel (1-indexed) of the original grid: one value for all
+        rows, or each row's own (per-row CRPIX1 column, e.g. HFA, whose rows
+        can have different reference pixels).  Each row is placed on the new
+        grid with its own value, so rows come out aligned.
     resolution_km_s : float
         Target channel spacing, in km/s. Must be positive.
     fixed_range_km_s : (float, float), optional
@@ -1929,6 +1947,7 @@ def _resample_spectra_to_grid(spectra: np.ndarray, velo_ref_per_row: np.ndarray,
         raise ValueError("resolution_km_s must be positive")
 
     n_rows, n_chans_orig = spectra.shape
+    crpix1_orig = np.broadcast_to(np.asarray(crpix1_orig, dtype=np.float64), (n_rows,))
     res_m_s = resolution_km_s * 1000.0
     ch = np.arange(n_chans_orig, dtype=np.float64)
 
@@ -1941,8 +1960,8 @@ def _resample_spectra_to_grid(spectra: np.ndarray, velo_ref_per_row: np.ndarray,
         v_min_global = np.inf
         v_max_global = -np.inf
         for i in range(n_rows):
-            v0 = velo_ref_per_row[i] + (ch[0] - (crpix1_orig - 1.0)) * deltav_per_row[i]
-            v1 = velo_ref_per_row[i] + (ch[-1] - (crpix1_orig - 1.0)) * deltav_per_row[i]
+            v0 = velo_ref_per_row[i] + (ch[0] - (crpix1_orig[i] - 1.0)) * deltav_per_row[i]
+            v1 = velo_ref_per_row[i] + (ch[-1] - (crpix1_orig[i] - 1.0)) * deltav_per_row[i]
             v_min_global = min(v_min_global, v0, v1)
             v_max_global = max(v_max_global, v0, v1)
 
@@ -1966,7 +1985,7 @@ def _resample_spectra_to_grid(spectra: np.ndarray, velo_ref_per_row: np.ndarray,
     # keeps that assumption true.
     resampled = np.full((n_rows, n_chans_new), np.nan, dtype=np.float64)
     for i in range(n_rows):
-        row_velocities = velo_ref_per_row[i] + (ch - (crpix1_orig - 1.0)) * deltav_per_row[i]
+        row_velocities = velo_ref_per_row[i] + (ch - (crpix1_orig[i] - 1.0)) * deltav_per_row[i]
         row_spectrum = spectra[i]
 
         bin_idx = np.round((row_velocities - v_min_snapped) / res_m_s).astype(np.int64)
@@ -2491,18 +2510,26 @@ def reduce_spectra(hdul: fits.HDUList,
 
     # Recalculate CRPIX1 to account for channel extraction and/or decimation.
     # Original CRPIX1 is 1-indexed; convert to 0-based, apply shifts, convert back.
+    # The per-row CRPIX1 column (if any) gets the same transformation.
     if '_extract_ch_min' in methods or '_decimate_factor' in methods:
-        old_crpix1 = float(new_hdu.header.get('CRPIX1', 1.0))
-        # Convert to 0-based index
-        ref_ch = old_crpix1 - 1.0
-        # Shift for channel extraction: reference channel moves left by ch_min
-        if '_extract_ch_min' in methods:
-            ref_ch -= methods['_extract_ch_min']
-        # Scale for decimation: reference channel index divides by factor
-        if '_decimate_factor' in methods:
-            ref_ch /= methods['_decimate_factor']
-        # Convert back to 1-based FITS pixel
-        new_hdu.header['CRPIX1'] = ref_ch + 1.0
+        def _shift_crpix1(old_crpix1):
+            # Convert to 0-based index
+            ref_ch = old_crpix1 - 1.0
+            # Shift for channel extraction: reference channel moves left by ch_min
+            if '_extract_ch_min' in methods:
+                ref_ch = ref_ch - methods['_extract_ch_min']
+            # Scale for decimation: reference channel index divides by factor
+            if '_decimate_factor' in methods:
+                ref_ch = ref_ch / methods['_decimate_factor']
+            # Convert back to 1-based FITS pixel
+            return ref_ch + 1.0
+
+        new_hdu.header['CRPIX1'] = _shift_crpix1(float(new_hdu.header.get('CRPIX1', 1.0)))
+        if 'CRPIX1' in new_hdu.data.dtype.names:
+            new_hdu.data['CRPIX1'] = _shift_crpix1(np.asarray(new_hdu.data['CRPIX1'], dtype=np.float64))
+            # The input header may hold only one row's value (HFA); keep the
+            # header close to the rows for tools that only read the header.
+            new_hdu.header['CRPIX1'] = float(np.nanmedian(new_hdu.data['CRPIX1']))
 
     new_hdul = fits.HDUList([primary, new_hdu])
 
