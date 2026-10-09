@@ -526,11 +526,13 @@ def _get_celestial_coords(hdul: fits.HDUList) -> Tuple[np.ndarray, np.ndarray]:
     
     CDELT2/CDELT3 are kalibrate's map offsets: offsets in the CLASS "radio"
     projection (kalibrate writes position.proj = PROJ_RADIO), i.e. projected
-    sky offsets x = (RA - RA0) cos(Dec0), y = Dec - Dec0. The exact inverse is:
-        RA = CRVAL2 + CDELT2 / cos(CRVAL3)
+    sky offsets x = (RA - RA0) cos(Dec), y = Dec - Dec0. The exact inverse, as
+    in GILDAS rel_to_abs (kernel/lib/gwcs/projec.f90, case p_radio), is:
         Dec = CRVAL3 + CDELT3
-    Adding CDELT2 to RA without the 1/cos(Dec0) compresses every RA offset by
-    cos(Dec0) (68% at M51, Dec 47.2 deg): the LFA hexagon comes out distorted.
+        RA = CRVAL2 + CDELT2 / cos(Dec)
+    Adding CDELT2 to RA without the 1/cos(Dec) compresses every RA offset by
+    cos(Dec) (68% at M51, Dec 47.2 deg): the LFA hexagon comes out distorted.
+    See docs/ra_offset_projection_bug.md.
     
     Parameters
     ----------
@@ -566,11 +568,11 @@ def _get_celestial_coords(hdul: fits.HDUList) -> Tuple[np.ndarray, np.ndarray]:
     crval3 = header.get('CRVAL3', 0.0)  # Dec reference in degrees
     
     # Extract delta values from data columns (radio projection, see docstring)
-    # RA = CRVAL2 + CDELT2 / cos(CRVAL3) (in degrees)
     # Dec = CRVAL3 + CDELT3 (in degrees)
+    # RA = CRVAL2 + CDELT2 / cos(Dec) (in degrees)
     # float64: the columns are float32, which resolves RA ~200 deg only to ~0.05".
-    ras = crval2 + np.asarray(data['CDELT2'], dtype=np.float64) / np.cos(np.radians(crval3))
     decs = crval3 + np.asarray(data['CDELT3'], dtype=np.float64)
+    ras = crval2 + np.asarray(data['CDELT2'], dtype=np.float64) / np.cos(np.radians(decs))
 
     return ras, decs
 
