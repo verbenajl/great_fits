@@ -1361,6 +1361,12 @@ def filter_and_save_fits(hdul: fits.HDUList,
     if new_crpix1 is not None:
         hdu_clean.header['CRPIX1'] = new_crpix1
 
+    # Resampling changed DELTAV; scale FREQRES/CDELT1 to match, else they keep
+    # describing the native channels (stale for CLASS and other external readers).
+    if velocity_resample_km_s is not None:
+        from oi_zeigt.basic_io import rescale_frequency_axis
+        rescale_frequency_axis(hdu_clean.data, hdu_clean.header, deltav_per_row, grid_deltav)
+
     # Create FITS file for clean data
     n_clean = len(clean_combined)
     hdul_clean = fits.HDUList([primary_hdu, hdu_clean])
@@ -2175,6 +2181,20 @@ def reduce_spectra(hdul: fits.HDUList,
             nan_fractions.append(nan_frac)
         nan_fractions = np.array(nan_fractions)
         keep_mask = nan_fractions < nan_threshold
+        n_dropped = int(np.sum(~keep_mask))
+        if n_dropped:
+            print(f"Unblank: dropped {n_dropped}/{len(keep_mask)} spectra with NaN fraction "
+                  f">= {nan_threshold:.2f}")
+        if not np.any(keep_mask):
+            # Usually every row shares the same NaN channels: the velocity window is
+            # wider than the band the spectra cover.
+            all_nan = np.all(np.isnan(spectra), axis=0)
+            raise ValueError(
+                f"unblank dropped ALL {len(keep_mask)} spectra (NaN fraction "
+                f"{nan_fractions.min():.2f}-{nan_fractions.max():.2f}, threshold {nan_threshold:.2f}); "
+                f"{int(all_nan.sum())}/{len(all_nan)} channels are NaN in every spectrum. "
+                f"Check that the velocity window (extract / --velocity-resample-range) lies "
+                f"inside the band the data cover.")
         spectra = filtered_spectra
         # Re-align every full-length, per-row array to the now-shorter spectra —
         # without this, science_mask's True/False positions no longer correspond
@@ -2293,9 +2313,10 @@ def reduce_spectra(hdul: fits.HDUList,
             # that residual, outside the telluric window.
             baseline_order = methods.get('baseline', {}).get('order', 1)
 
-            # Never overwrite SKYCHOPDIFF's telluric line with noise — it's the
-            # actual signal PCA decomposes, so it must stay real.
-            noise_fill_mask = science_mask & (obj_strs != 'SKYCHOPDIFF')
+            # Never overwrite the sky reference's telluric line with noise — it's
+            # the actual signal PCA decomposes, so it must stay real. kalibrate
+            # spells it SKYCHOPDIFF, SKYDIFF or SKY-DIFF depending on the project.
+            noise_fill_mask = science_mask & ~np.isin(obj_strs, ['SKYCHOPDIFF', 'SKYDIFF', 'SKY-DIFF'])
 
             n_filled = 0
             for mid, (ch_start, ch_end) in telluric_windows_by_mission.items():
@@ -2307,16 +2328,22 @@ def reduce_spectra(hdul: fits.HDUList,
                 tel_bool[ch_start:ch_end] = True
                 batch = spectra[idx]
                 residual = _reduce_baseline(batch.astype(np.float64), order=baseline_order, window=(ch_start, ch_end))
+                # The fill runs BEFORE baselining, so the noise must sit on the
+                # spectrum's own continuum (the quick-fit baseline), not on zero:
+                # zero-mean noise leaves a step of minus the continuum level once
+                # the main baseline step removes the offset everywhere else.
+                continuum = batch.astype(np.float64) - residual
                 with np.errstate(invalid='ignore'):
                     noise_levels = np.nanstd(residual[:, ~tel_bool], axis=1)
                 for j, row_idx in enumerate(idx):
                     nl = noise_levels[j]
                     if np.isfinite(nl) and nl > 0:
-                        spectra[row_idx, ch_start:ch_end] = np.random.normal(0, nl, n_tel)
+                        spectra[row_idx, ch_start:ch_end] = (continuum[j, ch_start:ch_end]
+                                                             + np.random.normal(0, nl, n_tel))
                         n_filled += 1
             print(f"Filled telluric line with noise (per-mission window) in "
                   f"{n_filled}/{int(np.sum(noise_fill_mask))} science spectra "
-                  f"(SKYCHOPDIFF excluded), before baselining")
+                  f"(sky reference SKYCHOPDIFF/SKY-DIFF excluded), before baselining")
 
     # Calculate RMS outside baseline window (after baseline subtraction)
     rms_baseline_values = None
@@ -2530,6 +2557,15 @@ def reduce_spectra(hdul: fits.HDUList,
             # The input header may hold only one row's value (HFA); keep the
             # header close to the rows for tools that only read the header.
             new_hdu.header['CRPIX1'] = float(np.nanmedian(new_hdu.data['CRPIX1']))
+
+    # Decimation scaled DELTAV and FREQRES above; the header CDELT1 and any
+    # per-row CDELT1 column must follow (FREQRES is already done, so skip it).
+    if '_decimate_factor' in methods:
+        factor = methods['_decimate_factor']
+        if 'CDELT1' in new_hdu.data.dtype.names:
+            new_hdu.data['CDELT1'] = np.asarray(new_hdu.data['CDELT1'], dtype=np.float64) * factor
+        if 'CDELT1' in new_hdu.header:
+            new_hdu.header['CDELT1'] = float(new_hdu.header['CDELT1']) * factor
 
     new_hdul = fits.HDUList([primary, new_hdu])
 

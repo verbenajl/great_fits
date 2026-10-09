@@ -89,6 +89,33 @@ def reconstruct_velocity_axis(hdu) -> np.ndarray:
     return velo_ref + (ch - (crpix1 - 1.0)) * deltav
 
 
+def rescale_frequency_axis(data, header, deltav_old, deltav_new) -> None:
+    """
+    Keep the frequency-axis keywords in step with a change of DELTAV.
+
+    kalibrate describes the channel spacing twice: in velocity (DELTAV column)
+    and in frequency (FREQRES column [MHz], per-row CDELT1 column and header
+    CDELT1 [Hz]).  oi_zeigt only reads DELTAV, but CLASS and other external
+    readers build the axis from the frequency keywords, so whenever DELTAV
+    changes (resampling, decimation) these must be scaled by the same signed
+    factor — the sign also covers a flip of the channel order.  CTYPE1/CRVAL1
+    need no change: the reference pixel still carries RESTFREQ at VELOCITY.
+
+    Modifies ``data`` and ``header`` in place.  ``deltav_old``/``deltav_new``
+    are per-row arrays or scalars (m/s).
+    """
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = np.asarray(deltav_new, dtype=np.float64) / np.asarray(deltav_old, dtype=np.float64)
+    ratio = np.broadcast_to(ratio, (len(data),))
+    for col in ('FREQRES', 'CDELT1'):
+        if data.dtype.names and col in data.dtype.names:
+            data[col] = np.asarray(data[col], dtype=np.float64) * ratio
+    if header is not None and 'CDELT1' in header:
+        finite = ratio[np.isfinite(ratio)]
+        if finite.size:
+            header['CDELT1'] = float(header['CDELT1']) * float(np.median(finite))
+
+
 def get_config(config_path: Optional[Union[str, Path]] = None) -> dict:
     """
     Load configuration from a TOML file.

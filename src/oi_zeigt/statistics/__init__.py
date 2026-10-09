@@ -9,10 +9,12 @@ from .quality import (
     get_spechistogram,
     get_rmsratio_histogram,
     rmsratio_statistics,
+    ripple_ratio,
 )
 
 __all__ = [
     'get_spechistogram',
     'get_rmsratio_histogram',
     'rmsratio_statistics',
+    'ripple_ratio',
 ]

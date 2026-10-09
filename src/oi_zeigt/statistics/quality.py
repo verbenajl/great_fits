@@ -5,6 +5,7 @@ Provides tools for analyzing spectral quality metrics such as RMS ratios,
 signal-to-noise ratios, and other quality indicators.
 """
 
+import warnings
 from typing import Optional, Union, Tuple, List, Dict
 from pathlib import Path
 
@@ -406,3 +407,67 @@ def rmsratio_statistics(hdul: fits.HDUList,
         'percentile_5': np.percentile(rmsratio_values, 5),
         'percentile_95': np.percentile(rmsratio_values, 95),
     }
+
+
+def ripple_ratio(spectra: np.ndarray, linefree_mask: np.ndarray) -> np.ndarray:
+    """
+    Baseline-ripple statistic per spectrum: total RMS / white-noise RMS.
+
+    The white-noise RMS comes from channel-to-channel differences,
+    std(diff(x)) / sqrt(2), which slow structure (ripples, standing waves,
+    curvature, band-edge droop) barely changes. The total RMS includes that
+    structure. For pure white noise the ratio is ~1; correlated baseline
+    structure pushes it above 1. Unlike the Allan WHITENESS test, the scale is
+    absolute: it does not depend on the rest of the file.
+
+    Only line-free channels are used, and differences are never taken across a
+    gap in `linefree_mask` (e.g. across the line window). Each contiguous
+    segment is mean-subtracted separately, so an offset between the two sides
+    of the line window does not count as ripple. NaN channels are dropped.
+
+    Smoothed spectra are NOT white (neighbouring channels are correlated), so
+    the ratio is only meaningful on unsmoothed spectra.
+
+    Parameters
+    ----------
+    spectra : np.ndarray
+        2D array (n_spectra, n_channels).
+    linefree_mask : np.ndarray of bool
+        1D (n_channels,) mask, True for the channels to use.
+
+    Returns
+    -------
+    np.ndarray
+        Ratio per spectrum (float64); NaN where fewer than 8 usable channels.
+    """
+    spectra = np.asarray(spectra, dtype=np.float64)
+    linefree_mask = np.asarray(linefree_mask, dtype=bool)
+    # Contiguous runs of line-free channels
+    edges = np.diff(np.r_[0, linefree_mask.astype(np.int8), 0])
+    starts, stops = np.where(edges == 1)[0], np.where(edges == -1)[0]
+
+    sum_sq = np.zeros(len(spectra))
+    n_tot = np.zeros(len(spectra))
+    diffs = []
+    for a, b in zip(starts, stops):
+        if b - a < 2:
+            continue
+        seg = spectra[:, a:b]
+        with np.errstate(invalid='ignore'), warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            dev = seg - np.nanmean(seg, axis=1, keepdims=True)
+        sum_sq += np.nansum(dev ** 2, axis=1)
+        n_tot += np.sum(np.isfinite(seg), axis=1)
+        diffs.append(np.diff(seg, axis=1))   # NaN wherever either channel is NaN
+    if not diffs:
+        return np.full(len(spectra), np.nan)
+
+    d = np.concatenate(diffs, axis=1)
+    n_d = np.sum(np.isfinite(d), axis=1)
+    with np.errstate(invalid='ignore', divide='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        sigma_total = np.sqrt(sum_sq / n_tot)
+        sigma_white = np.nanstd(d, axis=1) / np.sqrt(2.0)
+        ratio = sigma_total / sigma_white
+    ratio[(n_tot < 8) | (n_d < 8) | ~(sigma_white > 0)] = np.nan
+    return ratio

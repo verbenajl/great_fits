@@ -3,7 +3,7 @@ Cascade (waterfall) plots of spectra, grouped by MISSION_ID/SCAN/TELESCOP.
 """
 
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -38,7 +38,8 @@ def draw_cascade_plots(input_fits: Union[str, Path],
                        hdu_index: Optional[int] = None,
                        max_figsize_height: float = 30.0,
                        panel_cols: int = 4,
-                       object_filter: Optional[str] = None) -> List[Path]:
+                       object_filter: Optional[str] = None,
+                       velocity_range: Optional[Tuple[float, float]] = None) -> List[Path]:
     """
     Draw cascade (waterfall) plots of spectra, one per MISSION_ID/SCAN/TELESCOP
     group found in the input FITS file.
@@ -67,6 +68,10 @@ def draw_cascade_plots(input_fits: Union[str, Path],
     object_filter : str, optional
         Only include rows whose OBJECT contains this substring (case-insensitive).
         If None (default), all rows are included regardless of OBJECT.
+    velocity_range : (vmin, vmax), optional
+        Only draw the channels inside this velocity range (km/s). The colour
+        scale then follows the data inside the range. Ignored (with a warning)
+        when the file has no velocity axis.
 
     Returns
     -------
@@ -109,6 +114,16 @@ def draw_cascade_plots(input_fits: Union[str, Path],
         except (KeyError, IndexError):
             velocity_axis = np.arange(spectra.shape[1])
             x_label = 'Channel'
+            if velocity_range is not None:
+                print("Warning: no velocity axis in this file; --velocity-range ignored")
+                velocity_range = None
+
+        if velocity_range is not None:
+            vsel = (velocity_axis >= min(velocity_range)) & (velocity_axis <= max(velocity_range))
+            if not np.any(vsel):
+                raise ValueError(f"No channels inside velocity range {velocity_range} km/s "
+                                 f"(file covers {velocity_axis.min():.1f} to {velocity_axis.max():.1f})")
+            spectra, velocity_axis = spectra[:, vsel], velocity_axis[vsel]
 
         if object_filter:
             if 'OBJECT' not in data.dtype.names:

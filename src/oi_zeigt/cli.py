@@ -585,6 +585,38 @@ def _create_velocity_axis_from_fits(table_hdu: fits.BinTableHDU, nchans: int) ->
         return None
 
 
+def _velocity_range_option(f):
+    """--velocity-range option shared by the spectrum plotting commands."""
+    return click.option(
+        '--velocity-range', type=(float, float), default=None,
+        help='Velocity range in km/s to show, e.g. --velocity-range 100 400. '
+             'The y-axis is scaled to the data inside this range.')(f)
+
+
+def _apply_velocity_range(axes, x, spectra, velocity_range) -> None:
+    """Limit the x-axis to velocity_range (km/s) and fit the y-axis to the data inside it.
+
+    x is the velocity axis in km/s (None when only channel numbers are available,
+    in which case the range is ignored); spectra are the arrays drawn on the axes.
+    """
+    if velocity_range is None:
+        return
+    if x is None:
+        click.echo(click.style("Warning: no velocity axis in this file; --velocity-range ignored",
+                               fg="yellow"), err=True)
+        return
+    lo, hi = min(velocity_range), max(velocity_range)
+    x = np.asarray(x, dtype=np.float64)
+    sel = (x >= lo) & (x <= hi)
+    vals = np.concatenate([np.asarray(s, dtype=np.float64)[sel] for s in spectra]) if spectra else np.array([])
+    vals = vals[np.isfinite(vals)]
+    for ax in np.atleast_1d(axes):
+        ax.set_xlim(lo, hi)
+        if vals.size:
+            pad = 0.05 * ((vals.max() - vals.min()) or 1.0)
+            ax.set_ylim(vals.min() - pad, vals.max() + pad)
+
+
 _SAMPLE_SPECTRA_OPTIONS = [
     click.option(
         "--config",
@@ -665,6 +697,7 @@ _SAMPLE_SPECTRA_OPTIONS = [
         default=None,
         help="Threshold value for --filter-above or --filter-below."
     ),
+    _velocity_range_option,
 ]
 
 
@@ -679,7 +712,7 @@ def _plot_sample_column(column: str, ylabel: str, config: Optional[str], fits: O
                          reduced: bool, clean: bool, prepared: bool, pcad: bool, post: bool,
                          object: Optional[str], num_spectra: int, output: Optional[str],
                          filter_above_col: Optional[str], filter_below_col: Optional[str],
-                         filter_value: Optional[float]):
+                         filter_value: Optional[float], velocity_range=None):
     """Plot a random sample of rows from the given spectral column (e.g. SPECTRUM, RAW)."""
     try:
         # Load config to get object filter and handle output file flags
@@ -813,7 +846,9 @@ def _plot_sample_column(column: str, ylabel: str, config: Optional[str], fits: O
             click.echo("✓ Velocity axis reconstructed from FITS parameters")
         else:
             click.echo("  No velocity parameters found; using channel indices for x-axis")
-        
+            _apply_velocity_range([], None, [], velocity_range)  # warn once
+            velocity_range = None
+
         # Create plot
         num_to_plot = len(spectra_to_plot)
         cols = 4
@@ -874,6 +909,7 @@ def _plot_sample_column(column: str, ylabel: str, config: Optional[str], fits: O
             ax.set_xlabel(x_label)
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
+            _apply_velocity_range(ax, x_axis, [spectrum], velocity_range)
         
         # Hide unused subplots
         for idx in range(num_to_plot, len(axes.flat)):
@@ -915,7 +951,7 @@ def _plot_sample_column(column: str, ylabel: str, config: Optional[str], fits: O
 def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
                        pcad: bool, post: bool, object: Optional[str], num_spectra: int, output: Optional[str],
                        filter_above_col: Optional[str], filter_below_col: Optional[str],
-                    filter_value: Optional[float]):
+                    filter_value: Optional[float], velocity_range):
     """
     Plot a sample of spectra from a FITS file.
     
@@ -935,7 +971,8 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
         plot_sample_spectra --fits /path/to/file.fits --num-spectra 50 --output plot.pdf
     """
     _plot_sample_column("SPECTRUM", "Intensity", config, fits, reduced, clean, prepared, pcad, post,
-                        object, num_spectra, output, filter_above_col, filter_below_col, filter_value)
+                        object, num_spectra, output, filter_above_col, filter_below_col, filter_value,
+                        velocity_range)
 
 
 @click.command()
@@ -943,7 +980,7 @@ def plot_sample_spectra(config: Optional[str], fits: Optional[str], reduced: boo
 def plot_sample_raw(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
                     pcad: bool, post: bool, object: Optional[str], num_spectra: int, output: Optional[str],
                     filter_above_col: Optional[str], filter_below_col: Optional[str],
-                    filter_value: Optional[float]):
+                    filter_value: Optional[float], velocity_range):
     """
     Plot a sample of RAW spectra (the RAW column) from a FITS file.
 
@@ -965,7 +1002,8 @@ def plot_sample_raw(config: Optional[str], fits: Optional[str], reduced: bool, c
         plot_sample_raw --fits /path/to/file.fits --num-spectra 50 --output plot.pdf
     """
     _plot_sample_column("RAW", "RAW", config, fits, reduced, clean, prepared, pcad, post,
-                        object, num_spectra, output, filter_above_col, filter_below_col, filter_value)
+                        object, num_spectra, output, filter_above_col, filter_below_col, filter_value,
+                        velocity_range)
 
 
 
@@ -1012,8 +1050,9 @@ def plot_sample_raw(config: Optional[str], fits: Optional[str], reduced: bool, c
     default=None,
     help="Output file for the plot (PNG or PDF). If not specified, show plot."
 )
+@_velocity_range_option
 def plot_skies(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, prepared: bool,
-              num_spectra: int, output: Optional[str]):
+              num_spectra: int, output: Optional[str], velocity_range):
     """
     Plot a sample of sky/background spectra (SKYCHOPDIFF or SKY-DIFF observations).
     
@@ -1093,6 +1132,14 @@ def plot_skies(config: Optional[str], fits: Optional[str], reduced: bool, clean:
         
         click.echo(f"Plotting {sample_size} sky spectra")
         click.echo(f"Original FITS row indices (for reference): {original_indices}\n")
+
+        # Velocity axis (km/s) if the file has VELOCITY/DELTAV; channel numbers otherwise
+        vel = _create_velocity_axis_from_fits(matrix_hdu, data['SPECTRUM'][0].shape[0])
+        x_axis = vel / 1000.0 if vel is not None else None
+        x_label = "Velocity (km/s)" if vel is not None else "Channel"
+        if x_axis is None:
+            _apply_velocity_range([], None, [], velocity_range)  # warn once
+            velocity_range = None
         
         # Create plot
         num_to_plot = len(spectra_to_plot)
@@ -1115,7 +1162,10 @@ def plot_skies(config: Optional[str], fits: Optional[str], reduced: bool, clean:
             # Calculate NaN fraction for this spectrum
             nan_mask, nan_frac = detect_nan_channels(spectrum)
             
-            ax.plot(spectrum, linewidth=0.8)
+            if x_axis is not None:
+                ax.plot(x_axis, spectrum, linewidth=0.8)
+            else:
+                ax.plot(spectrum, linewidth=0.8)
             
             # Color code the title based on NaN fraction
             if nan_frac == 0:
@@ -1137,9 +1187,10 @@ def plot_skies(config: Optional[str], fits: Optional[str], reduced: bool, clean:
                 color=title_color,
                 weight='bold'
             )
-            ax.set_xlabel("Channel")
+            ax.set_xlabel(x_label)
             ax.set_ylabel("Intensity")
             ax.grid(True, alpha=0.3)
+            _apply_velocity_range(ax, x_axis, [spectrum], velocity_range)
         
         # Hide unused subplots
         for idx in range(num_to_plot, len(axes.flat)):
@@ -1219,8 +1270,9 @@ def plot_skies(config: Optional[str], fits: Optional[str], reduced: bool, clean:
     default=None,
     help="Output file for the plot (PNG or PDF). If not specified, show plot."
 )
+@_velocity_range_option
 def plot_skyobsfit(config: Optional[str], fits: Optional[str], reduced: bool, clean: bool, 
-                   prepared: bool, num_plots: int, output: Optional[str]):
+                   prepared: bool, num_plots: int, output: Optional[str], velocity_range):
     """
     Compare observed vs fitted sky spectra (S-H_OBS vs S-H_SKY/S-H_FIT).
     
@@ -1318,6 +1370,14 @@ def plot_skyobsfit(config: Optional[str], fits: Optional[str], reduced: bool, cl
         
         click.echo(f"Plotting {len(pairs)} S-H_OBS vs S-H_SKY comparisons")
         click.echo(f"(Found {len(obs_indices)} observed and {len(sky_indices)} fitted sky spectra)\n")
+
+        # Velocity axis (km/s) if the file has VELOCITY/DELTAV; channel numbers otherwise
+        vel = _create_velocity_axis_from_fits(matrix_hdu, data['SPECTRUM'][0].shape[0])
+        x_axis = vel / 1000.0 if vel is not None else None
+        x_label = "Velocity (km/s)" if vel is not None else "Channel"
+        if x_axis is None:
+            _apply_velocity_range([], None, [], velocity_range)  # warn once
+            velocity_range = None
         
         # Create plot with side-by-side comparisons
         fig, axes = plt.subplots(len(pairs), 2, figsize=(14, 3.5*len(pairs)))
@@ -1334,12 +1394,14 @@ def plot_skyobsfit(config: Optional[str], fits: Optional[str], reduced: bool, cl
             obs_obj = data[obs_idx]['OBJECT'].decode().strip() if isinstance(data[obs_idx]['OBJECT'], bytes) else str(data[obs_idx]['OBJECT']).strip()
             sky_obj = data[sky_idx]['OBJECT'].decode().strip() if isinstance(data[sky_idx]['OBJECT'], bytes) else str(data[sky_idx]['OBJECT']).strip()
             
+            x_chan = np.arange(len(obs_spectrum))
             obs_nan_mask, obs_nan_frac = detect_nan_channels(obs_spectrum)
             sky_nan_mask, sky_nan_frac = detect_nan_channels(sky_spectrum)
             
             # Left plot: observed sky
             ax_obs = axes[pair_num, 0]
-            ax_obs.plot(obs_spectrum, linewidth=0.8, label='S-H_OBS', color='blue')
+            ax_obs.plot(x_chan if x_axis is None else x_axis, obs_spectrum,
+                        linewidth=0.8, label='S-H_OBS', color='blue')
             
             # Color code by NaN fraction
             if obs_nan_frac == 0:
@@ -1361,14 +1423,16 @@ def plot_skyobsfit(config: Optional[str], fits: Optional[str], reduced: bool, cl
                 color=title_color_obs,
                 weight='bold'
             )
-            ax_obs.set_xlabel("Channel")
+            ax_obs.set_xlabel(x_label)
             ax_obs.set_ylabel("Intensity")
             ax_obs.grid(True, alpha=0.3)
+            _apply_velocity_range(ax_obs, x_axis, [obs_spectrum], velocity_range)
             ax_obs.legend(loc='upper right', fontsize=9)
             
             # Right plot: fitted sky
             ax_sky = axes[pair_num, 1]
-            ax_sky.plot(sky_spectrum, linewidth=0.8, label='S-H_SKY/FIT', color='orange')
+            ax_sky.plot(x_chan if x_axis is None else x_axis, sky_spectrum,
+                        linewidth=0.8, label='S-H_SKY/FIT', color='orange')
             
             # Color code by NaN fraction
             if sky_nan_frac == 0:
@@ -1390,9 +1454,10 @@ def plot_skyobsfit(config: Optional[str], fits: Optional[str], reduced: bool, cl
                 color=title_color_sky,
                 weight='bold'
             )
-            ax_sky.set_xlabel("Channel")
+            ax_sky.set_xlabel(x_label)
             ax_sky.set_ylabel("Intensity")
             ax_sky.grid(True, alpha=0.3)
+            _apply_velocity_range(ax_sky, x_axis, [sky_spectrum], velocity_range)
             ax_sky.legend(loc='upper right', fontsize=9)
         
         # Add legend explaining NaN indicators
@@ -1611,6 +1676,19 @@ def analyze_blanks(config: Optional[str], fits: Optional[str], sample_size: int)
          "Example: --filter-below-adaptive-rmsratio 80 --filter-below-adaptive-rmsratio-limit 1.7."
 )
 @click.option(
+    "--filter-ripple",
+    "filter_ripple",
+    type=float,
+    default=None,
+    metavar="MAX",
+    help="Drop science spectra with baseline ripples: keep rows with RIPPLE <= MAX. "
+         "RIPPLE (written by post_process_data) is the line-free RMS over the white-noise "
+         "RMS from channel differences: ~1 for white noise, > 1 for ripples, standing "
+         "waves or curvature. post_process_data prints the white-noise reference for "
+         "the file; 1.3-1.5 is a reasonable start. Same as --filter-below RIPPLE MAX; "
+         "rows with NaN RIPPLE (non-science) always pass."
+)
+@click.option(
     "--filter-spectrum-peaks",
     "spectrum_peak_threshold",
     type=float,
@@ -1729,6 +1807,7 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
                 filter_below: tuple, filter_above: tuple,
                 filter_below_adaptive_rmsratio: Optional[float],
                 filter_below_adaptive_rmsratio_limit: Optional[float],
+                filter_ripple: Optional[float],
                 spectrum_peak_threshold: Optional[float], filter_tau: bool,
                 filter_flight: tuple, mission_id: tuple, aor_id: tuple, filter_object_exact: Optional[str],
                 filter_out_object_exact: Optional[str],
@@ -1887,6 +1966,10 @@ def filter_fits(config: Optional[str], fits: Optional[str], object: Optional[str
         for col, val in filter_above:
             param_filters.append((col, 'above', val))
             click.echo(f"Parameter filter: keep {col} >= {val}")
+        if filter_ripple is not None:
+            param_filters.append(('RIPPLE', 'below', filter_ripple))
+            click.echo(f"Ripple filter: keep RIPPLE <= {filter_ripple} "
+                       f"(RIPPLE comes from post_process_data)")
 
         # Adaptive RMSRATIOB cut: derive the --filter-below threshold from this
         # file's own RMSRATIOB distribution so a fixed number won't over-prune a
@@ -2599,9 +2682,10 @@ def reduce_spectra_cmd(config, fits, clean, unblank, fill_telluric_noise, missio
                    'Defaults to [parameters].object from config if not specified.')
 @click.option('--no-group', is_flag=True, default=False,
               help='Ignore OBJECT grouping and average all selected spectra into one.')
+@_velocity_range_option
 @click.option('--plot', type=click.Path(), default=None,
               help='Save plot to this path. If not specified, plot is shown interactively.')
-def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
+def average_cmd(config, fits_input, reduced, output, object, no_group, velocity_range, plot):
     """
     Average spectra from a FITS file and optionally plot the result.
 
@@ -2615,6 +2699,7 @@ def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
         average --fits postpd.fits --plot avg.png
         average --fits postpd.fits --object M51CENTER --output avg.fits
         average --config config.toml --reduced --no-group --plot avg.png
+        average --fits postpd.fits --object M51CENTER --velocity-range 400 600
     """
     import matplotlib.pyplot as plt
     try:
@@ -2701,6 +2786,7 @@ def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
 
         # --- Plot ---
         fig, ax = plt.subplots(figsize=(12, 5))
+        plotted = []
 
         if isinstance(avg_results, dict) and 'avg_spectrum' in avg_results:
             # Single global average
@@ -2710,6 +2796,7 @@ def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
             # Histogram style (CLASS convention): each channel is a flat bin centred on its velocity.
             ax.step(x, sp_arr, where='mid', linewidth=1.0, color='steelblue',
                     label=f"Average (N={avg_results['count']})")
+            plotted.append(sp_arr)
             ax.legend(fontsize=9)
             click.echo(f"  N spectra averaged: {avg_results['count']}")
             click.echo(f"  Mean RMS: {avg_results['rms']:.4f} K")
@@ -2720,6 +2807,7 @@ def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
                 x = xaxis if xaxis is not None else np.arange(len(sp_arr))
                 ax.step(x, sp_arr, where='mid', linewidth=1.0, alpha=0.85,
                         label=f"{group_name} (N={gdata['count']})")
+                plotted.append(sp_arr)
                 click.echo(f"  {group_name}: N={gdata['count']}, RMS={gdata['rms']:.4f} K")
             ax.legend(fontsize=8, loc='best')
 
@@ -2728,6 +2816,7 @@ def average_cmd(config, fits_input, reduced, output, object, no_group, plot):
         ax.axhline(0, color='k', linewidth=0.5, linestyle='--')
         ax.grid(True, alpha=0.3)
         ax.set_title('Averaged spectrum' + (f' — {", ".join(object_filter)}' if object_filter else ''))
+        _apply_velocity_range(ax, xaxis, plotted, velocity_range)
         fig.tight_layout()
 
         if plot:
@@ -4250,7 +4339,9 @@ def combine_fits(input_paths, output, single_hdu):
     help="Only include spectra whose OBJECT contains this substring (case-insensitive). "
          "Default: no filtering, all rows included regardless of OBJECT."
 )
-def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, object_filter):
+@_velocity_range_option
+def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, object_filter,
+                  velocity_range):
     """
     Draw cascade (waterfall) plots of spectra, one plot per
     MISSION_ID / SCAN / TELESCOP group.
@@ -4270,6 +4361,8 @@ def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, obje
         cascade_plots --input input.fits
 
         cascade_plots --input input.fits --output-folder plots/dir --object M51CENTER
+
+        cascade_plots --input input.fits --velocity-range 400 600
     """
     try:
         from .cascade_plots import draw_cascade_plots
@@ -4284,6 +4377,7 @@ def cascade_plots(input_fits, output_folder, hdu_index, max_figsize_height, obje
             hdu_index=hdu_index,
             max_figsize_height=max_figsize_height,
             object_filter=object_filter,
+            velocity_range=velocity_range,
         )
 
         if output_folder is not None:
@@ -5373,6 +5467,13 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
                     if _nv >= 2:
                         rms_baseline_values[_i] = np.nanstd(_ch.astype(np.float64))
 
+        # --- Baseline-ripple statistic (RIPPLE), always computed ---
+        # Total line-free RMS over the white-noise RMS from channel differences:
+        # ~1 for white noise, > 1 for ripples / standing waves / curvature. Measured
+        # BEFORE --smooth, which correlates neighbouring channels and would inflate it.
+        from .statistics.quality import ripple_ratio
+        ripple_values = ripple_ratio(spectra, outside_mask)
+
         # --- Optional boxcar smoothing (after baseline, before RMS) ---
         # Same kernel as reduce_spectra (_reduce_smooth → smooth_spectrum, a
         # normalised boxcar via np.convolve). Applied to science rows only —
@@ -5617,6 +5718,24 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         n_above = int(np.sum(valid_ratio > thresholds[-1]))
         click.echo(f"    >  {thresholds[-1]:.1f} : {n_above:6d} spectra")
 
+        # RIPPLE: science rows only (NaN elsewhere, so filter_fits cuts never touch
+        # calibration rows). White-noise reference from simulated noise with the
+        # same line-free channel layout, as a guide for choosing a cut.
+        ripple_values = np.where(is_science_all, ripple_values, np.nan)
+        _row("RIPPLE", ripple_values[is_science_all])
+        _null = ripple_ratio(np.where(outside_mask, np.random.default_rng(0).normal(
+            size=(2000, len(outside_mask))), np.nan), outside_mask)
+        _null = _null[np.isfinite(_null)]
+        if len(_null):
+            _rs = ripple_values[is_science_all]
+            _rs = _rs[np.isfinite(_rs)]
+            click.echo(f"\n  RIPPLE (total / white-noise RMS; 1 = white, > 1 = baseline structure):"
+                       f"\n    white-noise reference: median {np.median(_null):.3f}, "
+                       f"99th pct {np.percentile(_null, 99):.3f}, 99.9th pct {np.percentile(_null, 99.9):.3f}")
+            click.echo("    science spectra above: " + "  ".join(
+                f">{t:g}: {int(np.sum(_rs > t))}" for t in (1.2, 1.3, 1.5, 2.0)) +
+                f"   (of {len(_rs)}; cut with filter_fits --filter-ripple MAX)")
+
         if whiteness_check and np.isfinite(white_R_crit):
             k   = max(2, int(whiteness_bin))
             nbl = int(np.sum(outside_mask))
@@ -5676,6 +5795,8 @@ def post_process_data_cmd(config, pcad, clean, prepared, reduced, fits_input, ou
         table['RMS']             = rms_measured
         table['RMS_THEORETICAL'] = rms_theoretical
         table['RMSRATIOB']       = rms_ratio    # ratio of measured RMS to theoretical radiometer RMS
+        table['RIPPLE']          = ripple_values.astype(np.float32)  # total / white-noise RMS (science rows)
+        click.echo("  Written RIPPLE: baseline-ripple statistic (NaN for non-science rows)")
 
         if whiteness_check:
             w_name = 'WHITENESS'
@@ -6449,8 +6570,9 @@ def compare_maps_cmd(cube_files, extra_cube_files, velocity_range, mode, peak_ra
     default=None,
     help="Path to mission_id_parameters YAML.  Implies --mask-telluric."
 )
+@_velocity_range_option
 def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, output,
-                     no_show, mask_telluric, telluric_file):
+                     no_show, mask_telluric, telluric_file, velocity_range):
     """
     Plot the averaged telluric spectrum per mission_id/telescop combination.
 
@@ -6513,6 +6635,8 @@ def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, out
         except Exception as e:
             click.echo(f"Warning: could not reconstruct velocity axis ({e}); using channel numbers.")
             vel_kms = None
+            _apply_velocity_range([], None, [], velocity_range)  # warn once
+            velocity_range = None
 
         # Determine target OBJECT string
         target_obj = "S-H_FIT" if sky.lower() == "fit" else "S-H_OBS"
@@ -6620,6 +6744,8 @@ def examine_telluric(config, fits_file, reduced, clean, prepared, pcad, sky, out
                 ax.axvspan(t_min, t_max, alpha=0.25, color="orange", zorder=0,
                            label=f"telluric {t_min:.0f}–{t_max:.0f} km/s")
                 ax.legend(fontsize=5, loc="upper left")
+
+            _apply_velocity_range(ax, vel_kms, [avg], velocity_range)
 
         # Hide unused axes
         for idx in range(n_groups, n_rows * n_cols):
