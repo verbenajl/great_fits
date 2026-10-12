@@ -3179,6 +3179,16 @@ def collapse_cube(
     _ax_full_pos = ax_full.get_position().frozen()
     _ax_zoom_pos = ax_zoom.get_position().frozen()
 
+    def _clear_map_ax(ax):
+        # Axes.cla() removes every artist, including WCSAxes' internal
+        # _wcsaxesartist that draws the RA/Dec ticks, tick labels and axis
+        # labels — so after a redraw the WCS coordinates silently vanish.
+        # Re-attach it so the cleared panel keeps its sky coordinates.
+        ax.cla()
+        wcs_artist = getattr(ax, '_wcsaxesartist', None)
+        if wcs_artist is not None and wcs_artist not in ax.artists:
+            ax.add_artist(wcs_artist)
+
     if not has_zoom:
         ax_zoom.set_visible(False)
     if not has_region:
@@ -3713,7 +3723,7 @@ def collapse_cube(
                         fig.delaxes(ax_zoom)
                         ax_zoom = fig.add_subplot(2, 2, 2, projection=wcs2d_zoom)
                     else:
-                        ax_zoom.cla()
+                        _clear_map_ax(ax_zoom)
                     ax_zoom.set_position(_ax_zoom_pos)
                     ax_zoom.set_visible(True)   # may have started hidden (no --zoom)
                     _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
@@ -3770,7 +3780,7 @@ def collapse_cube(
             # Redraw full map
             if _cb_full[0] is not None:
                 _cb_full[0].remove()
-            ax_full.cla()
+            _clear_map_ax(ax_full)
             ax_full.set_position(_ax_full_pos)
             _cb_full[0] = _plot_map(ax_full, new_col_disp, new_title, wcs_proj=wcs2d_obj)
             if crop_to_selection:
@@ -3795,7 +3805,7 @@ def collapse_cube(
                 if _cb_zoom[0] is not None:
                     _cb_zoom[0].remove()
                 new_zoomed = new_col_disp[_zb['y0']:_zb['y1'], _zb['x0']:_zb['x1']]
-                ax_zoom.cla()
+                _clear_map_ax(ax_zoom)
                 ax_zoom.set_position(_ax_zoom_pos)
                 _cb_zoom[0] = _plot_map(ax_zoom, new_zoomed,
                                         f"Zoom ({_zb['x0']}:{_zb['x1']}, {_zb['y0']}:{_zb['y1']})",
