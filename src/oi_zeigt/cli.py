@@ -7020,5 +7020,126 @@ def overlay_maps_cmd(image_cube, contour_cube, velocity_range, mode, peak_range_
         sys.exit(1)
 
 
+@click.command()
+@click.option('--a', 'cube_a', required=True, type=click.Path(exists=True),
+              help='Gridded FITS datacube A (minuend). Its celestial grid is the reference: '
+                   'cube B is resampled onto it.')
+@click.option('--b', 'cube_b', required=True, type=click.Path(exists=True),
+              help='Gridded FITS datacube B (subtrahend). The map shown is A - B.')
+@click.option('--velocity-range', type=(float, float), default=None, nargs=2,
+              help='Integration range in km/s (e.g. --velocity-range 350 550). Applied to BOTH '
+                   'cubes on their own velocity axes, so cubes with different channel widths '
+                   'still integrate the same physical window.')
+@click.option('--mode', default='moment0', show_default=True,
+              type=click.Choice(['moment0', 'peak-intensity'], case_sensitive=False),
+              help='Collapse mode for both cubes. Overridden by --peak-range-int.')
+@click.option('--peak-range-int', 'peak_range_channels',
+              is_flag=False, flag_value=5, default=None, type=int, metavar='N',
+              help='Integrate N channels either side of each pixel peak (2N+1 window) -> K km/s. '
+                   'Without a number, N=5. Overrides --mode.')
+@click.option('--peak-smooth', 'peak_smooth_channels', type=float, default=None, metavar='SIGMA',
+              help='For peak modes: locate the peak on a spectrum smoothed by SIGMA channels, '
+                   'read the RAW cube there.')
+@click.option('--shuffle', is_flag=True, default=False,
+              help='Velocity-field shuffle before collapse. Requires --velocity-range. '
+                   'Applied to each cube independently.')
+@click.option('--shuffle-snr', type=float, default=5.0, show_default=True, metavar='SNR',
+              help='S/N floor for pixels contributing to the shuffle velocity field.')
+@click.option('--shuffle-field-smooth', type=float, default=6.0, show_default=True, metavar='PIX',
+              help='Gaussian sigma (pixels) to smooth/gap-fill the shuffle velocity field.')
+@click.option('--shuffle-window', 'shuffle_window_kms', type=float, default=20.0, show_default=True,
+              metavar='KMS', help='Half-width (km/s) of the aligned window after shuffling.')
+@click.option('--shuffle-ref-velocity', type=float, default=None, metavar='KMS',
+              help='Common velocity (km/s) lines are aligned to. Pin it for comparability.')
+@click.option('--coverage-threshold', type=float, default=0.0, show_default=True,
+              help='Mask pixels below this fraction of peak gridding coverage (per cube).')
+@click.option('--trim-edges', 'trim_edges', default=None,
+              help='Peel a border off each coverage footprint (erosion, not a crop).')
+@click.option('--smooth', 'smooth_sigma', type=float, default=None, metavar='SIGMA',
+              help='Gaussian-smooth both collapsed maps by SIGMA pixels before subtracting.')
+@click.option('--regrid-kernel', 'regrid_kernel_arcsec', type=float, default=None, metavar='ARCSEC',
+              help='Gaussian FWHM for the cygrid resampling of map B. Default: one target pixel.')
+@click.option('--show-inputs', is_flag=True, default=False,
+              help='Also draw A and regridded B (shared colour scale) next to the difference.')
+@click.option('--colormap', default='RdBu_r', show_default=True,
+              help='Diverging colormap for the difference (centred on 0).')
+@click.option('--input-colormap', default='rainbow', show_default=True,
+              help='Colormap for the A and B panels (with --show-inputs).')
+@click.option('--percentile-clip', type=(float, float), default=None, nargs=2, metavar='LO HI',
+              help='Colour limits from percentiles: the difference uses +/- the HI percentile '
+                   'of |A-B|; the input panels use LO..HI.')
+@click.option('--diff-limit', type=float, default=None, metavar='VALUE',
+              help='Symmetric colour limit +/-VALUE for the difference map (overrides '
+                   '--percentile-clip for that panel).')
+@click.option('--titles', default=None,
+              help='Comma-separated "A,B" labels (default: each file stem).')
+@click.option('--fits-output', type=click.Path(), default=None,
+              help='Write A-B to this FITS file (primary HDU; MAP_A and MAP_B_REGRID '
+                   'extensions hold the inputs on the common grid).')
+@click.option('--output', '--plot', 'plot_output', type=click.Path(), default=None,
+              help='Save the figure to this path (PNG).')
+@click.option('--no-show', is_flag=True, default=False,
+              help='Do not open an interactive window (just save/return).')
+def subtract_maps_cmd(cube_a, cube_b, velocity_range, mode, peak_range_channels,
+                      peak_smooth_channels, shuffle, shuffle_snr, shuffle_field_smooth,
+                      shuffle_window_kms, shuffle_ref_velocity, coverage_threshold,
+                      trim_edges, smooth_sigma, regrid_kernel_arcsec, show_inputs,
+                      colormap, input_colormap, percentile_clip, diff_limit, titles,
+                      fits_output, plot_output, no_show):
+    """
+    Difference map A - B of two gridded datacubes.
+
+    Both cubes are collapsed with identical settings (as in overlay_maps), B
+    is resampled onto A's celestial grid with cygrid, and B is subtracted
+    from A. Cubes that differ in channel width, NAXIS, or sit a fraction of a
+    pixel apart (different CRVAL/CRPIX) are therefore handled correctly.
+
+    Examples:
+
+        subtract_maps --a cube_pca.fits --b cube_nopca.fits \\
+            --velocity-range 350 550 --show-inputs --output diff.png
+
+        subtract_maps --a a.fits --b b.fits --velocity-range 350 550 \\
+            --diff-limit 20 --fits-output diff.fits --no-show
+    """
+    try:
+        from oi_zeigt.mapping.gridding import subtract_maps
+
+        effective_mode = 'peak-range-int' if peak_range_channels is not None else mode.lower()
+        title_list = [t.strip() for t in titles.split(',')] if titles else None
+
+        subtract_maps(
+            cube_a=cube_a,
+            cube_b=cube_b,
+            velocity_range=velocity_range,
+            mode=effective_mode,
+            peak_range_channels=peak_range_channels if peak_range_channels is not None else 5,
+            peak_smooth_channels=peak_smooth_channels,
+            shuffle=shuffle,
+            shuffle_snr=shuffle_snr,
+            shuffle_field_smooth=shuffle_field_smooth,
+            shuffle_window_kms=shuffle_window_kms,
+            shuffle_ref_velocity=shuffle_ref_velocity,
+            coverage_threshold=coverage_threshold,
+            trim_edges=trim_edges,
+            smooth_sigma=smooth_sigma,
+            regrid_kernel_arcsec=regrid_kernel_arcsec,
+            show_inputs=show_inputs,
+            colormap=colormap,
+            input_colormap=input_colormap,
+            percentile_clip=percentile_clip,
+            diff_limit=diff_limit,
+            titles=title_list,
+            fits_output=fits_output,
+            plot_output=plot_output,
+            show=not no_show,
+        )
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     print_fits_info()

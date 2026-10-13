@@ -5119,3 +5119,187 @@ def overlay_maps(
     if show:
         plt.show()
     return fig
+
+
+def subtract_maps(
+    cube_a: str,
+    cube_b: str,
+    velocity_range: Optional[Tuple[float, float]] = None,
+    mode: str = 'moment0',
+    peak_range_channels: int = 5,
+    peak_smooth_channels: Optional[float] = None,
+    shuffle: bool = False,
+    shuffle_snr: float = 5.0,
+    shuffle_field_smooth: float = 6.0,
+    shuffle_window_kms: float = 20.0,
+    shuffle_ref_velocity: Optional[float] = None,
+    coverage_threshold: float = 0.0,
+    trim_edges: Optional[str] = None,
+    smooth_sigma: Optional[float] = None,
+    regrid_kernel_arcsec: Optional[float] = None,
+    show_inputs: bool = False,
+    colormap: str = 'RdBu_r',
+    input_colormap: str = 'rainbow',
+    percentile_clip: Optional[Tuple[float, float]] = None,
+    diff_limit: Optional[float] = None,
+    titles: Optional[List[str]] = None,
+    fits_output: Optional[str] = None,
+    plot_output: Optional[str] = None,
+    show: bool = True,
+    verbose: bool = True,
+):
+    """Difference map A − B of two gridded cubes, on A's celestial grid.
+
+    Both cubes are collapsed with identical settings via collapse_cube_to_map
+    (velocity window in km/s on each cube's own axis, so cubes with different
+    channel widths or a fractional channel offset still integrate the same
+    physical window), then B is resampled onto A's grid with
+    regrid_map_with_cygrid — the same alignment step overlay_maps uses — and
+    subtracted. If both cubes already share the same celestial grid (and no
+    regrid kernel is forced), B is used as is. Pixels outside either footprint are NaN.
+
+    Display-only clipping (suppress_negative / suppress_high) is deliberately
+    not offered: it would bias the difference.
+
+    The difference is drawn with a diverging colormap centred on zero
+    (symmetric limits from diff_limit, else from percentile_clip of |A − B|,
+    else max |A − B|). show_inputs=True adds A and regridded B as two extra
+    panels on a shared colour scale.
+
+    Returns
+    -------
+    (diff_map, header2d, figure)
+    """
+    from matplotlib import colors as mcolors
+
+    for tag, path in (('A', cube_a), ('B', cube_b)):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"cube {tag} not found: {path}")
+
+    collapse_kw = dict(
+        velocity_range=velocity_range, mode=mode,
+        peak_range_channels=peak_range_channels,
+        peak_smooth_channels=peak_smooth_channels,
+        shuffle=shuffle, shuffle_snr=shuffle_snr,
+        shuffle_field_smooth=shuffle_field_smooth,
+        shuffle_window_kms=shuffle_window_kms,
+        shuffle_ref_velocity=shuffle_ref_velocity,
+        coverage_threshold=coverage_threshold, trim_edges=trim_edges,
+        smooth_sigma=smooth_sigma, verbose=verbose,
+    )
+
+    if verbose:
+        print(f"A (reference grid): {Path(cube_a).name}")
+    map_a, hdr2d, label, units_a, _ = collapse_cube_to_map(cube_a, **collapse_kw)
+    if verbose:
+        print(f"B (subtracted)    : {Path(cube_b).name}")
+    map_b, _hdr_b, _label_b, units_b, _ = collapse_cube_to_map(cube_b, **collapse_kw)
+    if units_a != units_b:
+        raise ValueError(f"unit mismatch: A is {units_a}, B is {units_b}")
+
+    # Regridding with even a one-pixel kernel smooths B relative to A, so skip
+    # it when the two celestial grids already coincide.
+    hdr_a, hdr_b = _celestial_header_dict(cube_a), _celestial_header_dict(cube_b)
+    same_grid = (regrid_kernel_arcsec is None and hdr_a.keys() == hdr_b.keys() and all(
+        np.isclose(hdr_a[k], hdr_b[k], rtol=0, atol=1e-9) if isinstance(hdr_a[k], float)
+        else hdr_a[k] == hdr_b[k] for k in hdr_a))
+    if same_grid:
+        map_b_r = map_b
+        if verbose:
+            print("  identical celestial grids: B used as is (no regrid)")
+    else:
+        map_b_r = regrid_map_with_cygrid(map_b, cube_b, cube_a,
+                                         kernel_fwhm_arcsec=regrid_kernel_arcsec,
+                                         verbose=verbose)
+    if map_b_r.shape != map_a.shape:
+        raise ValueError(f"regrid produced {map_b_r.shape}, expected {map_a.shape}")
+
+    diff = (map_a - map_b_r).astype(np.float32)
+    finite = np.isfinite(diff)
+    if not finite.any():
+        raise ValueError("difference map is entirely blank: the two cubes do not overlap "
+                         "(check --velocity-range and the footprints).")
+
+    vals = diff[finite]
+    if verbose:
+        print(f"  A − B: {int(finite.sum())} valid px, mean {np.mean(vals):.3g}, "
+              f"median {np.median(vals):.3g}, std {np.std(vals):.3g}, "
+              f"range [{vals.min():.3g}, {vals.max():.3g}] {units_a}")
+
+    title_a = titles[0] if titles and len(titles) > 0 else Path(cube_a).stem
+    title_b = titles[1] if titles and len(titles) > 1 else Path(cube_b).stem
+    vr = (f"{velocity_range[0]:g}–{velocity_range[1]:g} km/s"
+          if velocity_range else "full band")
+
+    if fits_output:
+        out_hdr = hdr2d.copy()
+        src_hdr = fits.getheader(cube_a)
+        for key in ('BMAJ', 'BMIN', 'BPA', 'OBJECT', 'TELESCOP', 'RESTFRQ', 'SPECSYS'):
+            if key in src_hdr:
+                out_hdr[key] = src_hdr[key]
+        out_hdr['BUNIT'] = units_a
+        out_hdr['BTYPE'] = 'Intensity difference'
+        out_hdr['ORIGIN'] = 'OI-ZEIGT'
+        out_hdr['DIFFMODE'] = (mode, 'collapse mode of both cubes')
+        if velocity_range:
+            out_hdr['DIFFVMIN'] = (float(velocity_range[0]), '[km/s] collapse window min')
+            out_hdr['DIFFVMAX'] = (float(velocity_range[1]), '[km/s] collapse window max')
+        out_hdr['HISTORY'] = f"subtract_maps: A - B, B regridded onto A with cygrid"
+        out_hdr['HISTORY'] = f"A = {Path(cube_a).name}"
+        out_hdr['HISTORY'] = f"B = {Path(cube_b).name}"
+        hdus = [fits.PrimaryHDU(diff, header=out_hdr),
+                fits.ImageHDU(map_a.astype(np.float32), header=hdr2d, name='MAP_A'),
+                fits.ImageHDU(map_b_r.astype(np.float32), header=hdr2d, name='MAP_B_REGRID')]
+        fits.HDUList(hdus).writeto(fits_output, overwrite=True)
+        print(f"  Difference map saved: {fits_output}")
+
+    # --- Plot ---
+    if diff_limit is not None:
+        lim = abs(float(diff_limit))
+    elif percentile_clip:
+        lim = float(np.percentile(np.abs(vals), float(percentile_clip[1])))
+    else:
+        lim = float(np.max(np.abs(vals)))
+    lim = lim or 1e-6
+    diff_norm = mcolors.TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim)
+
+    wcs2d = WCS(hdr2d)
+    npanel = 3 if show_inputs else 1
+    fig = plt.figure(figsize=(6.5 * npanel, 6.0))
+
+    if show_inputs:
+        both = np.concatenate([map_a[np.isfinite(map_a)], map_b_r[np.isfinite(map_b_r)]])
+        if percentile_clip:
+            lo = float(np.percentile(both, percentile_clip[0]))
+            hi = float(np.percentile(both, percentile_clip[1]))
+        else:
+            lo, hi = float(both.min()), float(both.max())
+        in_norm = mcolors.Normalize(vmin=lo, vmax=hi)
+        for k, (m, t) in enumerate(((map_a, f"A: {title_a}"),
+                                    (map_b_r, f"B: {title_b}" + ("" if same_grid else " (regridded)")))):
+            ax = fig.add_subplot(1, 3, k + 1, projection=wcs2d)
+            im = ax.imshow(m, origin='lower', cmap=input_colormap, norm=in_norm,
+                           interpolation='nearest')
+            ax.set_title(t, fontsize=9)
+            ax.set_xlabel('RA (J2000)')
+            ax.set_ylabel('Dec (J2000)' if k == 0 else ' ')
+            ax.coords.grid(color='grey', ls=':', alpha=0.5)
+            fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046).set_label(label)
+
+    ax = fig.add_subplot(1, npanel, npanel, projection=wcs2d)
+    im = ax.imshow(diff, origin='lower', cmap=colormap, norm=diff_norm,
+                   interpolation='nearest')
+    cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
+    cbar.set_label(f"A − B ({units_a})")
+    ax.set_xlabel('RA (J2000)')
+    ax.set_ylabel('Dec (J2000)')
+    ax.set_title(f"A − B   ({mode}, {vr})\nA: {title_a}\nB: {title_b}", fontsize=9)
+    ax.coords.grid(color='grey', ls=':', alpha=0.5)
+
+    fig.tight_layout()
+    if plot_output:
+        fig.savefig(plot_output, dpi=150, bbox_inches='tight')
+        print(f"  Difference figure saved: {plot_output}")
+    if show:
+        plt.show()
+    return diff, hdr2d, fig

@@ -295,7 +295,8 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
                               smoothing_kernel_size: int = None,
                               reject_lined_rows: bool = False,
                               reject_line_sigma: float = 3.0,
-                              pca_source: str = 'SKYCHOPDIFF') -> DecompositionResult:
+                              pca_source: str = 'SKYCHOPDIFF',
+                              line_core_fill: str = 'zero') -> DecompositionResult:
     """
     Perform PCA decomposition on spectra from a single mission/telescope combination.
     
@@ -563,7 +564,16 @@ def decompose_mission_spectra(mission_id: str, telescope: str, spectra: np.ndarr
         # (pca_correct subtracts coeff*component only — pca_correct_fits.py:566,
         # 1503), so a zero component alone fully protects the core. Supersedes the
         # 2026-07-13 "interpolate, don't zero" choice, which assumed similar flanks.
-        if fit_win_mask is not None and np.any(fit_win_mask):
+        # line_core_fill='interpolate' (--line-core-fill interpolate) skips the
+        # zeroing: the core stays held OUT of the fit but the components keep the
+        # straight-line interpolation across it, so pca_correct DOES correct under
+        # the line (with that chord — see CAVEAT above).
+        if (fit_win_mask is not None and np.any(fit_win_mask)
+                and line_core_fill == 'interpolate'):
+            logger.info(f"  ✓ Science core ({int(np.sum(fit_win_mask))} ch) excluded from "
+                        f"the fit but INTERPOLATED, not zeroed (line_core_fill=interpolate) "
+                        f"— correction is applied across the line window")
+        elif fit_win_mask is not None and np.any(fit_win_mask):
             idx = np.where(fit_win_mask)[0]
             lo, hi = int(idx.min()), int(idx.max())
             width = hi - lo + 1
@@ -742,7 +752,7 @@ def main_cli():
              "stay in the fit as baseline, but the destructive peak never enters "
              "the basis — prevents pca_correct over-subtracting the bright "
              "central line. Without this flag the whole line window is included "
-             "in the fit."
+             "in the fit. Also [pca].exclude_narrow_line_window = true."
     )
     parser.add_argument(
         "--reject-lined-references",
@@ -764,6 +774,19 @@ def main_cli():
              "treated as lined and dropped (default 3.0, or [pca].reject_line_sigma). "
              "Per-mission override via the YAML key reject_line_sigma. Lower = "
              "more aggressive rejection."
+    )
+    parser.add_argument(
+        "--line-core-fill",
+        choices=["zero", "interpolate"],
+        default=None,
+        dest="line_core_fill",
+        help="How the components are filled across the window held out by "
+             "--exclude-narrow-line-window. 'zero' (default): components are "
+             "zeroed there (cosine-tapered), so pca_correct does NOT correct "
+             "inside the window. 'interpolate': the window is still excluded "
+             "from the FIT, but the components are linearly interpolated across "
+             "it, so the correction IS applied under the line. Also "
+             "[pca].line_core_fill."
     )
 
     args = parser.parse_args()
@@ -871,7 +894,13 @@ def main_cli():
         # [pca].narrow_line_window; if that key is absent we fall back to the
         # central 40% of the wide science window so the flag works out-of-the-box.
         fit_exclude_window_kms = None
-        if args.exclude_narrow_line:
+        line_core_fill = args.line_core_fill or pca_config.get('line_core_fill', 'zero')
+        if line_core_fill not in ('zero', 'interpolate'):
+            raise ValueError(f"[pca].line_core_fill must be 'zero' or 'interpolate', "
+                             f"got {line_core_fill!r}")
+        exclude_narrow_line = bool(args.exclude_narrow_line
+                                   or pca_config.get('exclude_narrow_line_window', False))
+        if exclude_narrow_line:
             _nw = pca_config.get('narrow_line_window')
             if _nw and len(_nw) == 2:
                 fit_exclude_window_kms = (float(_nw[0]), float(_nw[1]))
@@ -1080,6 +1109,7 @@ def main_cli():
                 reject_lined_rows=reject_lined_rows,
                 reject_line_sigma=eff_reject_sigma,
                 pca_source=pca_source,
+                line_core_fill=line_core_fill,
             )
             
             if result is None:

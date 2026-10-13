@@ -20,3 +20,23 @@ action needed. See docs/pca_differences.md items 5, 6.]
      (mission, telescope, scan) group rather than falling back to the full window
    - only use line_window as a last resort if no group neighbour has a detection
    - leave --force-line-window as an explicit opt-in, do not make it the default
+
+2. Telluric-feature checker that writes the per-mission telluric file  (added 2026-10-12)
+   - problem: telluric_line_center in mission_id_parameters.yml was hand-entered and
+     wrong for 10 M51 flights (Jun-2017 F401-F407 real ~565, YAML 590-600; 2018
+     F528-F535 real ~600, YAML 550-575). The centre drives post_process
+     --refill-telluric-noise AND the pca_decompose baseline/fit exclusion window,
+     so a wrong value leaves 0.3-1.2 K spikes in the cube and masks clean channels.
+   - want: a CLI (e.g. `find_telluric`) that, per mission, stacks the science
+     (and/or SKYCHOPDIFF, which shows the feature with opposite sign) spectra from
+     reduced data, locates the telluric feature(s) outside the science line window,
+     measures centre + width (core FWHM plus wings), and writes/merges a per-mission
+     YAML like mission_id_parameters.yml (comment-preserving, like
+     determine_pca_parameters --write).
+   - open questions (discuss before implementing): own file vs merging into
+     mission_id_parameters.yml; one feature or several per mission (e.g. F296 ~685,
+     F368/F373/F377 ~650); width = core only or include wings (broad 560-700 km/s
+     bowl); per-flight vs per-scan centre (LSR shift during a flight); diagnostic
+     plots (reduced vs refilled median, chosen window).
+   - prototype measurement (median stack, local linear continuum 530-545/655-670,
+     half-amplitude extent) is in the 2026-10-12 session notes.
