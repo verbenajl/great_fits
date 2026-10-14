@@ -1540,7 +1540,7 @@ class PCACorrector:
     def correct_fits_file(self, input_fits, output_fits, cutoff_variance=None,
                          cutoff_noise_ratio=None, hdu_index=1, spectrum_col='SPECTRUM',
                          object_filter=None, overwrite=False, generate_plots=False,
-                         generate_kde_plots=True,
+                         generate_kde_plots=True, max_plots_per_flight=None,
                          output_dir='output/pca_corrected', config_window=None,
                          detect_science_lines=True, scan_filter=None, subscan_filter=None,
                          telescope_filter=None, mission_id_filter=None, aor_id_filter=None,
@@ -1571,6 +1571,9 @@ class PCACorrector:
             Overwrite output file if exists
         generate_plots : bool
             Generate diagnostic plots per scan/telescope
+        max_plots_per_flight : int, optional
+            Cap on diagnostic plots per MISSION_ID (flight), spread evenly over its
+            (telescope, scan) groups. None = one plot per group (no cap).
         output_dir : str
             Output directory for plots
         config_window : tuple, optional
@@ -2841,14 +2844,15 @@ class PCACorrector:
                                    group_thresholds=group_thresholds,
                                    global_indices=indices,
                                    mission_decompositions=mission_decompositions,
-                                   kde_data=kde_data if generate_kde_plots else {})
+                                   kde_data=kde_data if generate_kde_plots else {},
+                                   max_plots_per_flight=max_plots_per_flight)
             
             return stats
     
     def _generate_plots(self, data, original_spectra, corrected_spectra, correction_details,
                        velocity_axis, mission_id, output_dir, science_line_mask=None, telluric_line_mask=None,
                        input_fits=None, group_thresholds=None, global_indices=None, mission_decompositions=None,
-                       kde_data=None):
+                       kde_data=None, max_plots_per_flight=None):
         """
         Generate diagnostic plots matching pca_correct.py structure.
         
@@ -2923,6 +2927,21 @@ class PCACorrector:
         
         logger.info(f"_generate_plots received {len(data)} spectra")
         logger.info(f"Grouping by (mission_id, telescope, scan): {len(unique_mission_tel_scan)} groups")
+        
+        # Optional per-flight cap: visit each flight's groups evenly-spaced first
+        # (so the kept plots span pixels and scans), then the rest as backfill in
+        # case some of the evenly-spaced groups get skipped below.
+        plots_per_flight = {}
+        if max_plots_per_flight is not None and max_plots_per_flight > 0:
+            ordered = []
+            for mid in sorted(set(missions)):
+                groups = [g for g in unique_mission_tel_scan if g[0] == mid]
+                first = np.unique(np.round(np.linspace(0, len(groups) - 1,
+                                  min(max_plots_per_flight, len(groups)))).astype(int))
+                rest = [i for i in range(len(groups)) if i not in set(first)]
+                ordered.extend(groups[i] for i in list(first) + rest)
+            unique_mission_tel_scan = ordered
+            logger.info(f"Limiting to {max_plots_per_flight} plots per flight (MISSION_ID)")
         logger.info(f"correction_details contains {len(correction_details)} entries")
         logger.info(f"group_thresholds passed to _generate_plots: {len(group_thresholds) if group_thresholds else 0} groups")
         if group_thresholds:
@@ -2930,6 +2949,9 @@ class PCACorrector:
         
         total_plots = 0
         for mission_id, telescope, scan in unique_mission_tel_scan:
+            if (max_plots_per_flight is not None and max_plots_per_flight > 0
+                    and plots_per_flight.get(mission_id, 0) >= max_plots_per_flight):
+                continue
             # Get all spectra for this (mission_id, telescope, scan) combination
             # This includes ALL subscans for this scan
             group_mask = (missions == mission_id) & (telescopes == telescope) & (scans == scan)
@@ -2980,6 +3002,7 @@ class PCACorrector:
             
             logger.info(f"Creating plot {total_plots + 1} for mission_id={mission_id}, telescope={telescope}, scan={scan}: {len(usable_indices_in_group)} usable spectra out of {len(group_indices_in_filtered)}")
             total_plots += 1
+            plots_per_flight[mission_id] = plots_per_flight.get(mission_id, 0) + 1
             
             # Setup x_axis
             if velocity_axis is not None and len(velocity_axis) > 0:
@@ -4092,6 +4115,14 @@ Examples:
         help='Skip KDE noise ratio plots even when --plot and --global-noise-ratio-cutoff are set'
     )
     parser.add_argument(
+        '--max-plots-per-flight',
+        type=int,
+        default=None,
+        help='With --plot: at most N diagnostic plots per flight (MISSION_ID), spread evenly '
+             'over its telescope/scan groups (default: from config '
+             '[output][max_plots_per_flight], else no limit). 0 = no limit.'
+    )
+    parser.add_argument(
         '--plot-dir',
         default=None,  # Will be set from config below
         help='Directory for output plots (default: from config [output][pca_plots_dir])'
@@ -4124,6 +4155,7 @@ Examples:
     
     # Load config to get defaults
     config_plot_dir = 'output/pca_corrected'  # Fallback default
+    config_max_plots_per_flight = None
     config_components_dir = './output/pca_components'  # Fallback default
     config_input_file = None
     config_object = None
@@ -4148,6 +4180,7 @@ Examples:
             config = ConfigLoader(args.config)
             output_config = config.get('output', {})
             config_plot_dir = output_config.get('pca_plots_dir', 'output/pca_corrected')
+            config_max_plots_per_flight = output_config.get('max_plots_per_flight')
             config_components_dir = output_config.get('components_dir', './output/pca_components')
             # Try prepared_for_pca first, then fall back to reduced_fits
             config_input_file = output_config.get('prepared_for_pca') or output_config.get('reduced_fits')
@@ -4370,6 +4403,8 @@ Examples:
     # Set plot directory: explicit CLI arg > config > fallback
     if args.plot_dir is None:
         args.plot_dir = config_plot_dir
+    if args.max_plots_per_flight is None:
+        args.max_plots_per_flight = config_max_plots_per_flight
     
     # Set logging level
     if args.debug:
@@ -4521,6 +4556,7 @@ Examples:
                 overwrite=not args.no_overwrite,
                 generate_plots=args.plot,
                 generate_kde_plots=not args.no_kde_plots,
+                max_plots_per_flight=args.max_plots_per_flight,
                 output_dir=args.plot_dir,
                 config_window=config_line_window if config_line_window else (tuple(args.config_window) if args.config_window else None),
                 detect_science_lines=args.detect_science_lines,
